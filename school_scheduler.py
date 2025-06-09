@@ -1,6 +1,5 @@
 from pulp import LpProblem, LpMinimize, LpVariable, lpSum, LpBinary, value, LpStatus
 import pandas as pd
-import json
 from ortools.sat.python import cp_model
 import plotly.graph_objects as go
 
