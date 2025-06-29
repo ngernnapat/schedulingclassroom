@@ -1,0 +1,10 @@
+firebase-functions==0.1.0
+firebase-admin==6.2.0
+pandas==2.0.3
+pulp==2.7.0
+ortools==9.12.4544
+plotly==5.15.0
+numpy==1.24.3
+requests==2.31.0
+setuptools>=65,<81
+psutil==5.9.5
