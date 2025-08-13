@@ -1,87 +1,99 @@
 #!/bin/bash
 
-set -e
+# Firebase Functions Deployment Script
+# This script helps deploy the functions with proper dependency management
 
-echo "🚀 Starting deployment of School Schedule Optimization Functions..."
+set -e  # Exit on any error
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+echo "🚀 Starting Firebase Functions Deployment..."
 
-print_status() {
-    echo -e "${BLUE}[INFO]${NC} $1"
-}
-print_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
-}
-print_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
-}
-print_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
-
+# Check if we're in the functions directory
 if [ ! -f "main.py" ]; then
-    print_error "main.py not found. Please run this script from the functions directory."
+    echo "❌ Error: Please run this script from the functions directory"
     exit 1
 fi
 
-
-print_status "Cleaning up previous deployment artifacts..."
-rm -rf __pycache__ *.pyc .pytest_cache
-rm -f firebase-debug.log firebase-debug.*.log
-
-if [ -d "venv" ]; then
-    print_status "Removing existing virtual environment..."
-    rm -rf venv
+# Check if firebase CLI is installed
+if ! command -v firebase &> /dev/null; then
+    echo "❌ Error: Firebase CLI is not installed. Please install it first:"
+    echo "npm install -g firebase-tools"
+    exit 1
 fi
 
-print_status "Creating new virtual environment..."
-python3.11 -m venv venv
+# Check if we're logged in to Firebase
+if ! firebase projects:list &> /dev/null; then
+    echo "❌ Error: Not logged in to Firebase. Please run:"
+    echo "firebase login"
+    exit 1
+fi
 
-print_status "Activating virtual environment..."
+echo "📦 Installing/updating dependencies..."
+
+# Create virtual environment if it doesn't exist
+if [ ! -d "venv" ]; then
+    echo "Creating virtual environment..."
+    python3 -m venv venv
+fi
+
+# Activate virtual environment
 source venv/bin/activate
 
-print_status "Upgrading pip..."
+# Upgrade pip
 pip install --upgrade pip
 
-print_status "Installing dependencies..."
+# Install dependencies with updated setuptools
+echo "Installing dependencies..."
 pip install -r requirements.txt
 
-print_status "Verifying common dependencies (excluding firebase_functions)..."
+# Check for pkg_resources deprecation warning
+echo "🔍 Checking for deprecation warnings..."
 python -c "
-import firebase_admin
-import pandas
-import pulp
-import ortools
-import plotly
-import numpy
-import requests
-print('✅ Common dependencies installed successfully')
+import warnings
+import sys
+from contextlib import redirect_stderr
+from io import StringIO
+
+# Capture warnings
+stderr = StringIO()
+with redirect_stderr(stderr):
+    import google
+    import firebase_admin
+    import openai
+
+warnings_output = stderr.getvalue()
+if 'pkg_resources is deprecated' in warnings_output:
+    print('⚠️  pkg_resources deprecation warning detected')
+    print('This is expected and will be resolved in future updates')
+else:
+    print('✅ No deprecation warnings detected')
 "
-find . -name "*.pyc" -delete && find . -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
 
-print_warning "⚠️ Skipping firebase_functions check (only works in Firebase runtime)"
+echo "🧪 Running tests..."
+if [ -f "test_planner_fix.py" ]; then
+    python test_planner_fix.py
+    if [ $? -eq 0 ]; then
+        echo "✅ Tests passed!"
+    else
+        echo "❌ Tests failed! Please fix the issues before deploying."
+        exit 1
+    fi
+else
+    echo "⚠️  No test file found, skipping tests"
+fi
 
-print_status "Testing local import of health_check and get_schedule_info..."
-python -c "
-from main import health_check, get_schedule_info
-print('✅ Functions imported successfully')
-"
+echo "🚀 Deploying to Firebase Functions..."
 
-print_status "Deploying to Firebase..."
+# Deploy with specific configuration
 firebase deploy --only functions
 
-print_success "Deployment completed successfully!"
-nvm use 20
-print_status "Retrieving function URLs..."
-firebase functions:list
+echo "✅ Deployment completed successfully!"
 
-print_success "🎉 Deployment finished! Your functions are now live."
-print_status "You can test the endpoints using:"
-echo "  - Health check: curl https://school-schedule-optimization-functions.cloudfunctions.net/health_check"
-echo "  - Schedule info: curl https://school-schedule-optimization-functions.cloudfunctions.net/get_schedule_info"
-echo "  - Generate schedule: POST to https://school-schedule-optimization-functions.cloudfunctions.net/generate_schedule"
+# Clean up
+deactivate
+
+echo "🎉 All done! Your Firebase Functions are now deployed."
+echo ""
+echo "📝 Notes:"
+echo "- The pkg_resources deprecation warning is expected and harmless"
+echo "- It will be resolved in future updates of the Google Cloud libraries"
+echo "- Your functions should work correctly despite the warning"

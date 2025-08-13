@@ -1,21 +1,34 @@
 # Google Cloud Function for School Schedule Optimization
 # This function provides HTTP endpoints for generating and managing school schedules
 
+import json
+import logging
+import os
+import sys
+import time
+import traceback
+from typing import Dict, Any, Optional, Tuple, List
+
+# Add current directory to Python path to ensure local modules can be imported
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
+
 from firebase_functions import https_fn
 from firebase_functions.options import set_global_options
 from firebase_admin import initialize_app
-import json
-import logging
-from typing import Dict, Any, Optional
-import sys
-import os
-import traceback
-import time
+from fastapi import HTTPException
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
+# Import local modules
+from planner_utils import summarize_plan, motivate_user, track_progress, respond_to_user_input, message_in_the_morning
+
+# Load environment variables
+load_dotenv()
 
 # Import school_scheduler from the same directory
 try:
-    #from school_scheduler import SchoolScheduler
-    
     from school_scheduler import SchoolScheduler
     SCHEDULER_AVAILABLE = True
     logging.info("SchoolScheduler imported successfully")
@@ -25,12 +38,102 @@ except ImportError as e:
     SchoolScheduler = None
     SCHEDULER_AVAILABLE = False
 
-# For cost control, you can set the maximum number of containers that can be
-# running at the same time. This helps mitigate the impact of unexpected
-# traffic spikes by instead downgrading performance. This limit is a per-function
-# limit. You can override the limit for each function using the max_instances
-# parameter in the decorator, e.g. @https_fn.on_request(max_instances=5).
-set_global_options(max_instances=5)
+# Constants
+MAX_INSTANCES = 5
+MAX_TEACHERS = 50
+MAX_GRADES = 20
+MAX_HOURS_PER_DAY = 12
+MAX_DAYS_PER_WEEK = 7
+DEFAULT_TIMEOUT = 300  # 5 minutes
+
+# Default values for schedule parameters
+DEFAULT_SCHEDULE_PARAMS = {
+    'pe_teacher': 'T13',
+    'pe_grades': ['P4', 'P5', 'P6', 'M1', 'M2', 'M3'],
+    'pe_day': 3,
+    'n_pe_periods': 6,
+    'start_hour': 8,
+    'n_hours': 8,
+    'lunch_hour': 5,
+    'days_per_week': 5,
+    'enable_pe_constraints': False,
+    'homeroom_mode': 1
+}
+
+# CORS headers
+CORS_HEADERS = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, PUT, DELETE',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With, Accept, Origin',
+    'Access-Control-Max-Age': '3600',
+    'Access-Control-Allow-Credentials': 'true',
+    'Content-Type': 'application/json'
+}
+
+# Pydantic Models for request validation
+class ScheduleRequest(BaseModel):
+    """Model for schedule generation requests"""
+    n_teachers: int = Field(..., gt=0, le=MAX_TEACHERS, description="Number of teachers")
+    grades: List[str] = Field(..., min_items=1, max_items=MAX_GRADES, description="List of grade levels")
+    pe_teacher: str = Field(default=DEFAULT_SCHEDULE_PARAMS['pe_teacher'], description="PE teacher ID")
+    pe_grades: List[str] = Field(default=DEFAULT_SCHEDULE_PARAMS['pe_grades'], description="Grades with PE")
+    pe_day: int = Field(default=DEFAULT_SCHEDULE_PARAMS['pe_day'], ge=1, le=7, description="Day for PE classes")
+    n_pe_periods: int = Field(default=DEFAULT_SCHEDULE_PARAMS['n_pe_periods'], ge=0, description="Number of PE periods")
+    start_hour: int = Field(default=DEFAULT_SCHEDULE_PARAMS['start_hour'], ge=0, le=23, description="Starting hour")
+    n_hours: int = Field(default=DEFAULT_SCHEDULE_PARAMS['n_hours'], ge=1, le=MAX_HOURS_PER_DAY, description="Hours per day")
+    lunch_hour: int = Field(default=DEFAULT_SCHEDULE_PARAMS['lunch_hour'], ge=1, description="Lunch hour")
+    days_per_week: int = Field(default=DEFAULT_SCHEDULE_PARAMS['days_per_week'], ge=1, le=MAX_DAYS_PER_WEEK, description="Days per week")
+    enable_pe_constraints: bool = Field(default=DEFAULT_SCHEDULE_PARAMS['enable_pe_constraints'], description="Enable PE constraints")
+    homeroom_mode: int = Field(default=DEFAULT_SCHEDULE_PARAMS['homeroom_mode'], ge=0, le=2, description="Homeroom mode")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "n_teachers": 13,
+                "grades": ["P1", "P2", "P3", "P4", "P5", "P6", "M1", "M2", "M3"],
+                "pe_teacher": "T13",
+                "pe_grades": ["P4", "P5", "P6", "M1", "M2", "M3"],
+                "pe_day": 3,
+                "n_pe_periods": 6,
+                "start_hour": 8,
+                "n_hours": 8,
+                "lunch_hour": 5,
+                "days_per_week": 5,
+                "enable_pe_constraints": False,
+                "homeroom_mode": 1
+            }
+        }
+
+class PlannerDataRequest(BaseModel):
+    """Model for planner data requests"""
+    planner_data: Dict[str, Any] = Field(..., description="Planner data")
+    language: str = Field(default="thai", description="Response language")
+
+class ProgressUpdateRequest(BaseModel):
+    """Model for progress update requests"""
+    user_update: Optional[str] = Field(default=None, description="User update")
+    summary: Optional[str] = Field(default=None, description="Summary")
+    todo_data: Optional[Dict[str, Any]] = Field(default=None, description="Todo data")
+
+class UserInputRequest(BaseModel):
+    """Model for user input requests"""
+    user_input: str = Field(..., description="User input")
+    summary: str = Field(..., description="Summary")
+
+# Response Models
+class ApiResponse(BaseModel):
+    """Base API response model"""
+    success: bool
+    message: str
+    data: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+class ScheduleResponse(ApiResponse):
+    """Schedule generation response model"""
+    schedule: Optional[List[Dict[str, Any]]] = None
+    homeroom: Optional[List[Dict[str, Any]]] = None
+    parameters: Optional[Dict[str, Any]] = None
 
 # Initialize Firebase app
 try:
@@ -46,87 +149,75 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def validate_schedule_request(data: Dict[str, Any]) -> tuple[bool, str]:
+# Set global options for cost control
+set_global_options(max_instances=MAX_INSTANCES)
+
+def create_response(
+    data: Optional[Dict[str, Any]] = None,
+    success: bool = True,
+    message: str = "Success",
+    error: Optional[str] = None,
+    status_code: int = 200,
+    metadata: Optional[Dict[str, Any]] = None
+) -> https_fn.Response:
+    """Create a standardized HTTP response"""
+    response_data = {
+        'success': success,
+        'message': message,
+        'data': data,
+        'error': error,
+        'metadata': metadata
+    }
+    
+    return https_fn.Response(
+        json.dumps(response_data, default=str),
+        status=status_code,
+        headers=CORS_HEADERS
+    )
+
+def handle_preflight_request() -> https_fn.Response:
+    """Handle CORS preflight requests"""
+    return https_fn.Response('', status=200, headers=CORS_HEADERS)
+
+def validate_schedule_request(data: Dict[str, Any]) -> Tuple[bool, str]:
     """Validate the incoming schedule request data"""
     try:
+        # Validate required fields
         required_fields = ['n_teachers', 'grades']
-        optional_fields = {
-            'pe_teacher': 'T13',
-            'pe_grades': ['P4', 'P5', 'P6', 'M1', 'M2', 'M3'],
-            'pe_day': 3,
-            'n_pe_periods': 6,
-            'start_hour': 8,
-            'n_hours': 8,
-            'lunch_hour': 5,
-            'days_per_week': 5,
-            'enable_pe_constraints': False,
-            'homeroom_mode': 1
-        }
-        
-        # Check required fields
         for field in required_fields:
             if field not in data:
                 return False, f"Missing required field: {field}"
         
-        # Convert and validate n_teachers
+        # Validate n_teachers
         try:
-            data['n_teachers'] = int(data['n_teachers'])
+            n_teachers = int(data['n_teachers'])
+            if n_teachers <= 0 or n_teachers > MAX_TEACHERS:
+                return False, f"n_teachers must be between 1 and {MAX_TEACHERS}"
         except (ValueError, TypeError):
             return False, "n_teachers must be a valid integer"
         
-        if data['n_teachers'] <= 0:
-            return False, "n_teachers must be a positive integer"
-        
-        if data['n_teachers'] > 50:
-            return False, "n_teachers cannot exceed 50"
-        
         # Validate grades
-        if not isinstance(data['grades'], list) or len(data['grades']) == 0:
+        grades = data['grades']
+        if not isinstance(grades, list) or len(grades) == 0:
             return False, "grades must be a non-empty list"
         
-        if len(data['grades']) > 20:
-            return False, "grades list cannot exceed 20 items"
+        if len(grades) > MAX_GRADES:
+            return False, f"grades list cannot exceed {MAX_GRADES} items"
         
         # Validate individual grades
-        for grade in data['grades']:
+        for grade in grades:
             if not isinstance(grade, str) or len(grade) == 0:
                 return False, f"Invalid grade format: {grade}"
         
         # Set default values for optional fields
-        for field, default_value in optional_fields.items():
+        for field, default_value in DEFAULT_SCHEDULE_PARAMS.items():
             if field not in data:
                 data[field] = default_value
         
-        # Convert and validate optional numeric fields
-        numeric_fields = ['pe_day', 'n_pe_periods', 'start_hour', 'n_hours', 'lunch_hour', 'days_per_week', 'homeroom_mode']
-        for field in numeric_fields:
-            if field in data:
-                try:
-                    data[field] = int(data[field])
-                except (ValueError, TypeError):
-                    return False, f"{field} must be a valid integer"
-        
-        # Validate ranges for optional fields
-        if data['pe_day'] < 1 or data['pe_day'] > 7:
-            return False, "pe_day must be between 1 and 7"
-        
-        if data['n_pe_periods'] < 0:
-            return False, "n_pe_periods must be a non-negative integer"
-        
-        if data['start_hour'] < 0 or data['start_hour'] > 23:
-            return False, "start_hour must be between 0 and 23"
-        
-        if data['n_hours'] < 1 or data['n_hours'] > 12:
-            return False, "n_hours must be between 1 and 12"
-        
-        if data['lunch_hour'] < 1 or data['lunch_hour'] > data['n_hours']:
-            return False, "lunch_hour must be between 1 and n_hours"
-        
-        if data['days_per_week'] < 1 or data['days_per_week'] > 7:
-            return False, "days_per_week must be between 1 and 7"
-        
-        if data['homeroom_mode'] not in [0, 1, 2]:
-            return False, "homeroom_mode must be 0, 1, or 2"
+        # Validate lunch_hour against n_hours
+        if 'lunch_hour' in data and 'n_hours' in data:
+            if data['lunch_hour'] > data['n_hours']:
+                return False, "lunch_hour must be between 1 and n_hours"
         
         return True, ""
         
@@ -134,100 +225,99 @@ def validate_schedule_request(data: Dict[str, Any]) -> tuple[bool, str]:
         logger.error(f"Error in validate_schedule_request: {e}")
         return False, f"Validation error: {str(e)}"
 
-def create_cors_headers() -> Dict[str, str]:
-    """Create CORS headers for responses"""
-    return {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, PUT, DELETE',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With, Accept, Origin',
-        'Access-Control-Max-Age': '3600',
-        'Access-Control-Allow-Credentials': 'true',
-        'Content-Type': 'application/json'
-    }
+def format_schedule_data(schedule_df, homeroom_df) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Format schedule data for response"""
+    schedule_data = []
+    if schedule_df is not None:
+        schedule_data = schedule_df.to_dict('records')
+    
+    homeroom_data = []
+    if homeroom_df is not None:
+        homeroom_data = homeroom_df.to_dict('records')
+    
+    # Reformat schedule data
+    reformatted_schedule = []
+    for item in schedule_data:
+        converted_start_time = item["TimeSlot"].split("-")[0]
+        reformatted_schedule.append({
+            "subject": item["Grade"],
+            "grade": item["Grade"],
+            "teacher": item["Teacher"],
+            "day": item["DayName"],
+            "period": item["Hour"],
+            "time": converted_start_time,
+            "timeslot": item["TimeSlot"],
+            "duration": 1
+        })
+    
+    return reformatted_schedule, homeroom_data
 
-@https_fn.on_request(
-    max_instances=3,
-  
-    #timeout_seconds=300  # 5 minutes timeout
-)
+@https_fn.on_request(max_instances=3)
 def generate_schedule(req: https_fn.Request) -> https_fn.Response:
     """Generate a school schedule based on provided parameters"""
-    
     start_time = time.time()
-    headers = create_cors_headers()
     
     try:
         # Handle preflight requests
         if req.method == 'OPTIONS':
-            return https_fn.Response(
-                '',
-                status=200,
-                headers=headers
-            )
+            return handle_preflight_request()
         
+        # Validate HTTP method
         if req.method != 'POST':
-            logger.warning(f"Invalid method {req.method} for generate_schedule")
-            return https_fn.Response(
-                json.dumps({
-                    'error': f'Method {req.method} not allowed',
-                    'message': 'This endpoint only accepts POST requests with JSON data',
+            return create_response(
+                success=False,
+                message=f'Method {req.method} not allowed',
+                error='This endpoint only accepts POST requests with JSON data',
+                status_code=405,
+                data={
                     'endpoints': {
                         'POST /generate_schedule': 'Generate a school schedule (requires JSON data)',
                         'GET /health_check': 'Check service health',
                         'GET /get_schedule_info': 'Get API information and examples',
                         'GET /debug': 'Get debug information'
                     }
-                }),
-                status=405,
-                headers=headers
+                }
             )
         
         # Parse request data
         try:
             data = req.get_json()
             if data is None:
-                logger.warning("No JSON data provided in request")
-                return https_fn.Response(
-                    json.dumps({
-                        'error': 'No JSON data provided',
-                        'message': 'This endpoint requires a POST request with JSON data in the body',
-                        'example': {
-                            'n_teachers': 13,
-                            'grades': ['P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'M1', 'M2', 'M3']
-                        }
-                    }),
-                    status=400,
-                    headers=headers
+                return create_response(
+                    success=False,
+                    message='No JSON data provided',
+                    error='This endpoint requires a POST request with JSON data in the body',
+                    status_code=400,
+                    data={'example': ScheduleRequest.Config.json_schema_extra['example']}
                 )
         except Exception as e:
             logger.error(f"JSON parsing error: {e}")
-            return https_fn.Response(
-                json.dumps({
-                    'error': f'Invalid JSON: {str(e)}',
-                    'message': 'This endpoint requires a POST request with valid JSON data in the body',
-                    'content_type': 'Make sure to set Content-Type: application/json header'
-                }),
-                status=400,
-                headers=headers
+            return create_response(
+                success=False,
+                message='Invalid JSON',
+                error=f'This endpoint requires a POST request with valid JSON data in the body. Error: {str(e)}',
+                status_code=400
             )
         
         # Validate request data
         is_valid, error_message = validate_schedule_request(data)
         if not is_valid:
             logger.warning(f"Invalid request data: {error_message}")
-            return https_fn.Response(
-                json.dumps({'error': error_message}),
-                status=400,
-                headers=headers
+            return create_response(
+                success=False,
+                message='Validation failed',
+                error=error_message,
+                status_code=400
             )
         
         # Check if SchoolScheduler is available
         if not SCHEDULER_AVAILABLE:
             logger.error("SchoolScheduler module not available")
-            return https_fn.Response(
-                json.dumps({'error': 'SchoolScheduler module not available'}),
-                status=500,
-                headers=headers
+            return create_response(
+                success=False,
+                message='Service unavailable',
+                error='SchoolScheduler module not available',
+                status_code=500
             )
         
         # Generate schedule
@@ -238,7 +328,7 @@ def generate_schedule(req: https_fn.Request) -> https_fn.Response:
             scheduler.set_pe_constraints_enabled(data.get('enable_pe_constraints', False))
             scheduler.set_homeroom_mode(data.get('homeroom_mode', 1))
             
-            # Get inputs
+            # Initialize scheduler inputs
             logger.info("Initializing scheduler inputs...")
             if not scheduler.get_inputs(
                 n_teachers=data['n_teachers'],
@@ -255,134 +345,84 @@ def generate_schedule(req: https_fn.Request) -> https_fn.Response:
                 homeroom_mode=data.get('homeroom_mode', 1)
             ):
                 logger.error("Failed to initialize scheduler inputs")
-                return https_fn.Response(
-                    json.dumps({'error': 'Failed to initialize scheduler inputs'}),
-                    status=500,
-                    headers=headers
+                return create_response(
+                    success=False,
+                    message='Initialization failed',
+                    error='Failed to initialize scheduler inputs',
+                    status_code=500
                 )
             
-            # Get model and solution
+            # Build optimization model
             logger.info("Building optimization model...")
             scheduler.get_model()
             
+            # Solve optimization problem
             logger.info("Solving optimization problem...")
             if not scheduler.get_solution():
                 logger.warning("No feasible solution found for the given constraints")
-                return https_fn.Response(
-                    json.dumps({'error': 'No feasible solution found for the given constraints'}),
-                    status=422,
-                    headers=headers
+                return create_response(
+                    success=False,
+                    message='No solution found',
+                    error='No feasible solution found for the given constraints',
+                    status_code=422
                 )
             
-            # Prepare response data
+            # Format response data
             logger.info("Preparing response data...")
-            schedule_df = scheduler.schedule_df
-            homeroom_df = scheduler.homeroom_df
+            schedule_data, homeroom_data = format_schedule_data(scheduler.schedule_df, scheduler.homeroom_df)
             
-            # Convert DataFrames to JSON-serializable format
-            schedule_data = []
-            if schedule_df is not None:
-                schedule_data = schedule_df.to_dict('records')
+            processing_time = round(time.time() - start_time, 2)
+            logger.info(f"Schedule generated successfully in {processing_time} seconds")
             
-            homeroom_data = []
-            if homeroom_df is not None:
-                homeroom_data = homeroom_df.to_dict('records')
-                
-            reformated_schedule_data = []
-            for item in schedule_data:
-                converted_start_time = item["TimeSlot"].split("-")[0]
-                reformated_schedule_data.append({
-                    "subject": item["Grade"],
-                    "grade": item["Grade"],
-                    "teacher": item["Teacher"],
-                    "day": item["DayName"],
-                    "period": item["Hour"],
-                    "time": converted_start_time,
-                    "timeslot": item["TimeSlot"],
-                    "duration": 1  
-                })
-            response_data = {
-                'success': True,
-                'message': 'Schedule generated successfully',
-                'schedule': reformated_schedule_data,
-                'homeroom': homeroom_data,
-                'parameters': data,
-                'metadata': {
-                    'total_assignments': len(schedule_data) if schedule_data else 0,
-                    'homeroom_assignments': len(homeroom_data) if homeroom_data else 0,
-                    'processing_time_seconds': round(time.time() - start_time, 2)
+            return create_response(
+                data={
+                    'schedule': schedule_data,
+                    'homeroom': homeroom_data,
+                    'parameters': data
+                },
+                success=True,
+                message='Schedule generated successfully',
+                metadata={
+                    'total_assignments': len(schedule_data),
+                    'homeroom_assignments': len(homeroom_data),
+                    'processing_time_seconds': processing_time
                 }
-            }
-            
-            logger.info(f"Schedule generated successfully in {time.time() - start_time:.2f} seconds")
-            return https_fn.Response(
-                json.dumps(response_data, default=str),
-                status=200,
-                headers=headers
             )
             
         except Exception as e:
             logger.error(f"Error in schedule generation: {str(e)}")
             logger.error(f"Traceback: {traceback.format_exc()}")
-            return https_fn.Response(
-                json.dumps({'error': f'Schedule generation failed: {str(e)}'}),
-                status=500,
-                headers=headers
+            return create_response(
+                success=False,
+                message='Schedule generation failed',
+                error=f'Schedule generation failed: {str(e)}',
+                status_code=500
             )
         
     except Exception as e:
         logger.error(f"Unexpected error in generate_schedule: {str(e)}")
         logger.error(f"Traceback: {traceback.format_exc()}")
-        return https_fn.Response(
-            json.dumps({'error': f'Internal server error: {str(e)}'}),
-            status=500,
-            headers=headers
+        return create_response(
+            success=False,
+            message='Internal server error',
+            error=f'Internal server error: {str(e)}',
+            status_code=500
         )
 
-@https_fn.on_request()
-def health_check(req: https_fn.Request) -> https_fn.Response:
-    """Health check endpoint"""
-    
-    headers = create_cors_headers()
-    if req.method == 'OPTIONS':
-            return https_fn.Response(
-                '',
-                status=200,
-                headers=headers
-            )
-    if req.method != 'GET':
-        return https_fn.Response(
-            json.dumps({'error': 'Only GET method is allowed'}),
-            status=405,
-            headers=headers
-        )
-    
-    health_data = {
-        'status': 'healthy',
-        'service': 'school-schedule-optimizer',
-        'version': '1.0.0',
-        'scheduler_available': SCHEDULER_AVAILABLE,
-        'python_version': sys.version,
-        'environment': 'production'
-    }
-    
-    return https_fn.Response(
-        json.dumps(health_data),
-        status=200,
-        headers=headers
-    )
+
 
 @https_fn.on_request()
 def get_schedule_info(req: https_fn.Request) -> https_fn.Response:
     """Get information about available schedule parameters and constraints"""
-    
-    headers = create_cors_headers()
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
     
     if req.method != 'GET':
-        return https_fn.Response(
-            json.dumps({'error': 'Only GET method is allowed'}),
-            status=405,
-            headers=headers
+        return create_response(
+            success=False,
+            message='Method not allowed',
+            error='Only GET method is allowed',
+            status_code=405
         )
     
     info_data = {
@@ -394,8 +434,8 @@ def get_schedule_info(req: https_fn.Request) -> https_fn.Response:
             'GET /debug': 'Get debug information'
         },
         'required_parameters': {
-            'n_teachers': 'Number of teachers (integer, 1-50)',
-            'grades': 'List of grade levels (e.g., ["P1", "P2", "P3"], max 20 items)'
+            'n_teachers': f'Number of teachers (integer, 1-{MAX_TEACHERS})',
+            'grades': f'List of grade levels (e.g., ["P1", "P2", "P3"], max {MAX_GRADES} items)'
         },
         'optional_parameters': {
             'pe_teacher': 'Physical education teacher ID (default: "T13")',
@@ -403,159 +443,222 @@ def get_schedule_info(req: https_fn.Request) -> https_fn.Response:
             'pe_day': 'Day for PE classes (default: 3)',
             'n_pe_periods': 'Number of PE periods (default: 6)',
             'start_hour': 'Starting hour (default: 8)',
-            'n_hours': 'Number of hours per day (default: 8)',
+            'n_hours': f'Number of hours per day (default: 8, max: {MAX_HOURS_PER_DAY})',
             'lunch_hour': 'Lunch hour (default: 5)',
-            'days_per_week': 'Days per week (default: 5)',
+            'days_per_week': f'Days per week (default: 5, max: {MAX_DAYS_PER_WEEK})',
             'enable_pe_constraints': 'Enable PE constraints (default: false)',
             'homeroom_mode': 'Homeroom mode: 0=none, 1=basic, 2=advanced (default: 1)'
         },
-        'example_request': {
-            'n_teachers': 13,
-            'grades': ['P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'M1', 'M2', 'M3'],
-            'pe_teacher': 'T13',
-            'pe_grades': ['P4', 'P5', 'P6', 'M1', 'M2', 'M3'],
-            'pe_day': 3,
-            'n_pe_periods': 6,
-            'start_hour': 8,
-            'n_hours': 8,
-            'lunch_hour': 5,
-            'days_per_week': 5,
-            'enable_pe_constraints': False,
-            'homeroom_mode': 1
-        },
+        'example_request': ScheduleRequest.Config.json_schema_extra['example'],
         'constraints': {
-            'max_teachers': 50,
-            'max_grades': 20,
-            'max_hours_per_day': 10,
-            'max_days_per_week': 7
+            'max_teachers': MAX_TEACHERS,
+            'max_grades': MAX_GRADES,
+            'max_hours_per_day': MAX_HOURS_PER_DAY,
+            'max_days_per_week': MAX_DAYS_PER_WEEK
         }
     }
     
-    return https_fn.Response(
-        json.dumps(info_data, indent=2),
-        status=200,
-        headers=headers
-    )
+    return create_response(data=info_data, message='API information retrieved successfully')
 
-@https_fn.on_request()
-def debug(req: https_fn.Request) -> https_fn.Response:
-    """Debug endpoint to check system status and diagnose issues"""
+
+#################### ChatGPT API Endpoints ######################
+@https_fn.on_request(memory=1024, max_instances=3)
+def summarize_planner(req: https_fn.Request) -> https_fn.Response:
+    """Summarize planner data using ChatGPT"""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
     
-    headers = create_cors_headers()
-    
-    if req.method != 'GET':
-        return https_fn.Response(
-            json.dumps({'error': 'Only GET method is allowed'}),
-            status=405,
-            headers=headers
+    if req.method != 'POST':
+        return create_response(
+            success=False,
+            message='Method not allowed',
+            error='Only POST method is allowed',
+            status_code=405
         )
     
     try:
-        # Test imports
-        import_status = {}
-        try:
-            import pandas as pd
-            import_status['pandas'] = {'available': True, 'version': pd.__version__}
-        except ImportError as e:
-            import_status['pandas'] = {'available': False, 'error': str(e)}
+        data = req.get_json()
+        if not data:
+            return create_response(
+                success=False,
+                message='No data provided',
+                error='Request body is required',
+                status_code=400
+            )
         
-        try:
-            import pulp
-            import_status['pulp'] = {'available': True, 'version': pulp.__version__}
-        except ImportError as e:
-            import_status['pulp'] = {'available': False, 'error': str(e)}
+        # Validate required fields
+        if 'planner_data' not in data:
+            return create_response(
+                success=False,
+                message='Missing required field',
+                error='planner_data is required',
+                status_code=400
+            )
         
-        try:
-            import ortools
-            import_status['ortools'] = {'available': True, 'version': ortools.__version__}
-        except ImportError as e:
-            import_status['ortools'] = {'available': False, 'error': str(e)}
+        language = data.get('language', 'thai')
+        logger.info(f"Summarizing planner data in language: {language}")
         
-        try:
-            import plotly
-            import_status['plotly'] = {'available': True, 'version': plotly.__version__}
-        except ImportError as e:
-            import_status['plotly'] = {'available': False, 'error': str(e)}
-        
-        # Test SchoolScheduler
-        scheduler_status = {}
-        if SCHEDULER_AVAILABLE:
-            try:
-                scheduler = SchoolScheduler()
-                scheduler_status['import'] = True
-                scheduler_status['instantiation'] = True
-                
-                # Test basic functionality
-                test_result = scheduler.get_inputs(
-                    n_teachers=3,
-                    grades=["P1", "P2"],
-                    pe_teacher="T3",
-                    pe_grades=["P2"],
-                    pe_day=3,
-                    n_pe_periods=1,
-                    start_hour=8,
-                    n_hours=4,
-                    lunch_hour=3,
-                    days_per_week=3,
-                    enable_pe_constraints=False,
-                    homeroom_mode=1
-                )
-                scheduler_status['get_inputs'] = test_result
-                
-                if test_result:
-                    scheduler.get_model()
-                    scheduler_status['get_model'] = True
-                    
-                    # Don't test get_solution as it might timeout
-                    scheduler_status['get_solution'] = 'not_tested'
-                
-            except Exception as e:
-                scheduler_status['error'] = str(e)
-                scheduler_status['traceback'] = traceback.format_exc()
-        else:
-            scheduler_status['import'] = False
-        
-        debug_data = {
-            'timestamp': time.time(),
-            'python_version': sys.version,
-            'platform': sys.platform,
-            'environment_variables': {
-                'FUNCTION_TARGET': os.environ.get('FUNCTION_TARGET', 'not_set'),
-                'FUNCTION_REGION': os.environ.get('FUNCTION_REGION', 'not_set'),
-                'GOOGLE_CLOUD_PROJECT': os.environ.get('GOOGLE_CLOUD_PROJECT', 'not_set')
-            },
-            'import_status': import_status,
-            'scheduler_status': scheduler_status,
-            'scheduler_available': SCHEDULER_AVAILABLE,
-            'memory_info': {
-                'available': 'check_psutil_import'
-            }
-        }
-        
-        # Try to get memory info if psutil is available
-        try:
-            import psutil
-            debug_data['memory_info'] = {
-                'available': True,
-                'memory_percent': psutil.virtual_memory().percent,
-                'memory_available_mb': psutil.virtual_memory().available // (1024 * 1024)
-            }
-        except ImportError:
-            debug_data['memory_info'] = {'available': False, 'error': 'psutil not available'}
-        
-        return https_fn.Response(
-            json.dumps(debug_data, indent=2, default=str),
-            status=200,
-            headers=headers
+        summary = summarize_plan(data['planner_data'], language)
+        return create_response(
+            data={'summary': summary},
+            message='Planner summarized successfully'
         )
         
     except Exception as e:
-        logger.error(f"Error in debug endpoint: {e}")
-        return https_fn.Response(
-            json.dumps({
-                'error': f'Debug endpoint failed: {str(e)}',
-                'traceback': traceback.format_exc()
-            }),
-            status=500,
-            headers=headers
+        logger.error(f"Error in summarize_planner: {str(e)}")
+        return create_response(
+            success=False,
+            message='Summarization failed',
+            error=f'Failed to summarize planner: {str(e)}',
+            status_code=500
+        )
+
+@https_fn.on_request(memory=1024, max_instances=3)
+def progress(req: https_fn.Request) -> https_fn.Response:
+    """Track user progress using ChatGPT"""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+    
+    if req.method != 'POST':
+        return create_response(
+            success=False,
+            message='Method not allowed',
+            error='Only POST method is allowed',
+            status_code=405
+        )
+    
+    try:
+        data = req.get_json()
+        if not data:
+            return create_response(
+                success=False,
+                message='No data provided',
+                error='Request body is required',
+                status_code=400
+            )
+        
+        # Validate required fields
+        required_fields = ['user_update', 'todo_data']
+        for field in required_fields:
+            if field not in data:
+                return create_response(
+                    success=False,
+                    message='Missing required field',
+                    error=f'{field} is required',
+                    status_code=400
+                )
+        
+        feedback = track_progress(data['user_update'], data['todo_data'], data['language'])
+        return create_response(
+            data={'feedback': feedback},
+            message='Progress tracked successfully'
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in progress: {str(e)}")
+        return create_response(
+            success=False,
+            message='Progress tracking failed',
+            error=f'Failed to track progress: {str(e)}',
+            status_code=500
+        )
+
+@https_fn.on_request(memory=1024, max_instances=3)
+def coach(req: https_fn.Request) -> https_fn.Response:
+    """Respond to user input using ChatGPT"""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+    
+    if req.method != 'POST':
+        return create_response(
+            success=False,
+            message='Method not allowed',
+            error='Only POST method is allowed',
+            status_code=405
+        )
+    
+    try:
+        data = req.get_json()
+        if not data:
+            return create_response(
+                success=False,
+                message='No data provided',
+                error='Request body is required',
+                status_code=400
+            )
+        
+        # Validate required fields
+        required_fields = ['user_input', 'summary']
+        for field in required_fields:
+            if field not in data:
+                return create_response(
+                    success=False,
+                    message='Missing required field',
+                    error=f'{field} is required',
+                    status_code=400
+                )
+        
+        response = respond_to_user_input(data['user_input'], data['summary'])
+        return create_response(
+            data={'response': response},
+            message='Response generated successfully'
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in coach: {str(e)}")
+        return create_response(
+            success=False,
+            message='Response generation failed',
+            error=f'Failed to generate response: {str(e)}',
+            status_code=500
+        )
+
+@https_fn.on_request(memory=1024, max_instances=3)
+def encourage_in_the_morning(req: https_fn.Request) -> https_fn.Response:
+    """encourage the user to start the day using ChatGPT"""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+    
+    if req.method != 'POST':
+        return create_response(
+            success=False,
+            message='Method not allowed',
+            error='Only POST method is allowed',
+            status_code=405
+        )
+    
+    try:
+        data = req.get_json()
+        if not data:
+            return create_response(
+                success=False,
+                message='No data provided',
+                error='Request body is required',
+                status_code=400
+            )
+        
+        # Validate required fields
+        required_fields = ['today_todo_list_data']
+        for field in required_fields:
+            if field not in data:
+                return create_response(
+                    success=False,
+                    message='Missing required field',
+                    error=f'{field} is required',
+                    status_code=400
+                )
+        
+        response = message_in_the_morning(today_todo_list_data=data['today_todo_list_data'], language=data['languageSelected'])
+        return create_response(
+            data={'response': response},
+            message='Response generated successfully'
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in encourage_in_the_morning: {str(e)}")
+        return create_response(
+            success=False,
+            message='Response generation failed',
+            error=f'Failed to generate response: {str(e)}',
+            status_code=500
         )
