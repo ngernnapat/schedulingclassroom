@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 # Import local modules
-from planner_utils import summarize_plan, motivate_user, track_progress, respond_to_user_input, message_in_the_morning
+from planner_utils import summarize_plan, motivate_user, track_progress, respond_to_user_input, message_in_the_morning, summarize_end_of_the_week_at_friday, summarize_next_week_at_sunday
 
 # Load environment variables
 load_dotenv()
@@ -656,6 +656,118 @@ def encourage_in_the_morning(req: https_fn.Request) -> https_fn.Response:
         
     except Exception as e:
         logger.error(f"Error in encourage_in_the_morning: {str(e)}")
+        return create_response(
+            success=False,
+            message='Response generation failed',
+            error=f'Failed to generate response: {str(e)}',
+            status_code=500
+        )
+
+@https_fn.on_request(memory=1024, max_instances=3)
+def summarize_end_of_the_week(req: https_fn.Request) -> https_fn.Response:
+    """Summarize the end of the week using ChatGPT and suggest rest to recharge energy"""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+    
+    if req.method != 'POST':
+        return create_response(
+            success=False,
+            message='Method not allowed',
+            error='Only POST method is allowed',
+            status_code=405
+        )
+    
+    try:
+        data = req.get_json()
+        if not data:
+            return create_response(
+                success=False,
+                message='No data provided',
+                error='Request body is required',
+                status_code=400
+            )
+        
+        # Validate required fields
+        if 'week_data' not in data:
+            return create_response(
+                success=False,
+                message='Missing required field',
+                error='week_data is required',
+                status_code=400
+            )
+        
+        language = data.get('language', 'thai')
+        logger.info(f"Summarizing end of week data in language: {language}")
+        
+        # Get week summary using planner utilities
+        #week_summary = summarize_plan(data['week_data'], 'week_summary', language)
+        
+        # Generate rest and recharge suggestions
+        rest_suggestions = summarize_end_of_the_week_at_friday(week_data=data['week_data'], language=language)
+        
+        return create_response(
+            data={'response': rest_suggestions},
+            message='Response generated successfully'
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in summarize_end_of_the_week: {str(e)}")
+        return create_response(
+            success=False,
+            message='Response generation failed',
+            error=f'Failed to generate response: {str(e)}',
+            status_code=500
+        )
+        
+@https_fn.on_request(memory=1024, max_instances=3)
+def summarize_next_week(req: https_fn.Request) -> https_fn.Response:
+    """Summarize next week's plan and provide encouraging preparation suggestions"""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+    
+    if req.method != 'POST':
+        return create_response(
+            success=False,
+            message='Method not allowed',
+            error='Only POST method is allowed',
+            status_code=405
+        )
+    
+    try:
+        data = req.get_json()
+        if not data:
+            return create_response(
+                success=False,
+                message='No data provided',
+                error='Request body is required',
+                status_code=400
+            )
+        
+        # Validate required fields
+        if 'week_data' not in data:
+            return create_response(
+                success=False,
+                message='Missing required field',
+                error='week_data is required',
+                status_code=400
+            )
+        
+        language = data.get('language', 'thai')
+        logger.info(f"Summarizing next week data in language: {language}")
+        
+        # Get week summary using planner utilities
+        #week_summary = summarize_plan(data['week_data'], 'week_summary', language)
+        
+        # Generate preparation suggestions and encouragement
+        preparation_suggestions = summarize_next_week_at_sunday(week_data=data['week_data'], language = language)
+        
+        return create_response(
+            data={'response': preparation_suggestions},
+            message='Next week summary and preparation suggestions generated successfully'
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in summarize_next_week: {str(e)}")
         return create_response(
             success=False,
             message='Response generation failed',

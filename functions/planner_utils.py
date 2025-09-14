@@ -414,6 +414,143 @@ class PlannerUtils:
             logger.error(f"Failed to generate morning message: {str(e)}")
             return None
 
+
+    def summarize_end_of_the_week_message(self, week_summary: List[Dict[str, Any]], language: str = 'thai') -> str:
+        """
+        Generate rest and recharge suggestions based on week summary.
+        
+        Args:
+            week_summary: List of completed tasks/activities from the week
+            language: Language for the response
+            
+        Returns:
+            Personalized rest and recharge suggestions, or None if no data
+        """
+        try:
+            # Validate inputs
+            if not week_summary:
+                logger.info("No week summary data found for end-of-week message")
+                return None
+            
+            #normalized_language = self.validator.validate_language(language)
+            total_activities = len(week_summary)
+            
+            # Build prompt with better structure
+            system_prompt = (
+                "You are Evo, a caring AI lifestyle coach creating weekend rest suggestions. "
+                "Keep responses concise, personalized, and actionable. "
+                "Focus on specific rest activities that match the user's week."
+            )
+            
+            # Format week activities with essential info only
+            activities_info = "\n".join([
+                f"• {activity.get('title', 'Activity')} - {activity.get('typeOfTodo', '')}"
+                for activity in week_summary[:7]  # Show top 5 activities
+            ])
+            
+            if total_activities > 7:
+                activities_info += f"\n• ...and {total_activities - 7} more activities"
+            
+            user_prompt = (
+                f"Create personalized rest suggestions (max 150 chars) for someone who completed {total_activities} activities this week:\n{activities_info}\n\n"
+                f"Suggest 2-3 specific rest activities in {language} that match their week. "
+                "Include 1-2 relevant emojis. Be encouraging but concise."
+            )
+            
+            # Make API call with optimized parameters
+            response = self._safe_chat_call(
+                system_prompt, 
+                user_prompt, 
+                max_tokens=100,
+                temperature=0.7,  # Balance creativity with consistency
+                language=language
+            )
+
+            
+            
+            logger.info(f"End-of-week rest suggestions generated successfully for {total_activities} activities")
+            return response
+            
+        except Exception as e:
+            logger.error(f"Failed to generate end-of-week rest suggestions: {str(e)}")
+            # Enhanced fallback suggestions with better formatting
+            fallback_suggestions = {
+                'thai': "สัปดาห์นี้คุณทำได้ดีมาก! พักผ่อนให้เต็มที่ นอนหลับให้เพียงพอ และทำกิจกรรมที่ชอบ 🌙✨",
+                'english': "Great week! Take time to rest, sleep well, and do activities you enjoy 🌙✨",
+                'chinese': "这周做得很好！好好休息，充足睡眠，做你喜欢的事情 🌙✨",
+                'japanese': "今週はお疲れ様でした！十分に休んで、よく眠り、好きなことをしてください 🌙✨",
+                'korean': "이번 주 정말 잘하셨어요! 충분히 휴식하고, 잘 자고, 좋아하는 활동을 하세요 🌙✨"
+            }
+            return fallback_suggestions.get(language, fallback_suggestions['english'])
+    
+    def summarize_next_week_message(self, week_data: List[Dict[str, Any]], language: str = "thai") -> str:
+        """
+        Generate next week summary based on week data.
+        
+        Args:
+            week_data: List of upcoming tasks/events for next week
+            language: Language for the response
+            
+        Returns:
+            Personalized next week summary, or None if no data
+        """
+        try:
+            # Validate inputs
+            if not week_data:
+                logger.info("No week data found for next week message")
+                return None
+            
+            #normalized_language = self.validator.validate_language(language)
+            total_tasks = len(week_data)
+            
+            # Build prompt with better structure
+            system_prompt = (
+                "You are Evo, a concise AI assistant creating brief next week previews. "
+                "Keep responses short, motivating and actionable. "
+                "Focus on the most important upcoming priorities."
+            )
+            
+            # Format upcoming tasks with essential info only
+            tasks_info = "\n".join([
+                f"• {task.get('title', 'Task')} - {task.get('date', '')} - {task.get('typeOfTodo', '')}" +
+                (f" ({task.get('priority', 'normal')})" if task.get('priority') else "")
+                for task in week_data[:7]  # Show top 7 tasks
+            ])
+            
+            remaining = total_tasks - 7 if total_tasks > 7 else 0
+            if remaining:
+                tasks_info += f"\n• ...and {remaining} more tasks"
+            
+            user_prompt = (
+                f"Create an energizing next week preview (max 120 chars) for {total_tasks} upcoming tasks:\n{tasks_info}\n\n"
+                f"Highlight 2-3 key priorities in {language} and end with motivation. "
+                "Include 1-2 relevant emojis. Be concise but encouraging."
+            )
+            
+            # Make API call with optimized parameters
+            response = self._safe_chat_call(
+                system_prompt, 
+                user_prompt, 
+                max_tokens=80,
+                temperature=0.7,  # Balance creativity with consistency
+                language=language
+            )
+            
+            logger.info(f"Next week summary generated successfully for {total_tasks} tasks")
+            return response
+            
+        except Exception as e:
+            logger.error(f"Failed to generate next week summary: {str(e)}")
+            # Enhanced fallback messages with better formatting
+            fallback_messages = {
+                'thai': "สัปดาห์หน้ามีงานสำคัญรออยู่ เตรียมพร้อมและวางแผนให้ดีนะคะ 📅✨",
+                'english': "Important tasks await next week. Stay prepared and plan well! 📅✨",
+                'chinese': "下周有重要的任务等着你。请做好准备，好好规划！📅✨",
+                'japanese': "来週は重要な仕事が待っています。準備を整え、計画を立てましょう！📅✨",
+                'korean': "다음 주에 중요한 일이 기다리고 있습니다. 준비하고 계획을 잘 세우세요! 📅✨"
+            }
+            return fallback_messages.get(language, fallback_messages['english'])
+
 # Global instance for backward compatibility
 _default_planner = None
 
@@ -455,3 +592,13 @@ def message_in_the_morning(today_todo_list_data: List[Dict[str, Any]], language:
     """Backward compatibility function for message in the morning"""
     planner = get_default_planner()
     return planner.morning_message(today_todo_list_data, language)
+
+def summarize_end_of_the_week_at_friday(week_data: List[Dict[str, Any]], language: str = "thai") -> str:
+    """Backward compatibility function for summarize end of the week"""
+    planner = get_default_planner()
+    return planner.summarize_end_of_the_week_message(week_data, language)
+
+def summarize_next_week_at_sunday(week_data: List[Dict[str, Any]], language: str = "thai") -> str:
+    """Backward compatibility function for summarize next week"""
+    planner = get_default_planner()
+    return planner.summarize_next_week_message(week_data, language)
