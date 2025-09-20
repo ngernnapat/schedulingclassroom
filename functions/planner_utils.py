@@ -176,7 +176,7 @@ class PlannerUtils:
         logger.info("PlannerUtils initialized")
     
     def _safe_chat_call(self, system_prompt: str, user_prompt: str, language: str = "thai", **kwargs) -> str:
-        """Make a safe chat call with error handling"""
+        """Make a safe chat call with error handling and graceful degradation"""
         try:
             # Extract specific parameters from kwargs to avoid conflicts
             max_tokens = kwargs.pop('max_tokens', self.config.max_tokens)
@@ -194,7 +194,15 @@ class PlannerUtils:
             )
         except Exception as e:
             logger.error(f"Chat call failed: {str(e)}")
-            return f"I'm having trouble processing your request right now. Please try again later. (Error: {str(e)})"
+            # Return graceful fallback based on language
+            fallback_responses = {
+                'thai': "ขออภัยครับ ระบบกำลังมีปัญหาเล็กน้อย กรุณาลองใหม่อีกครั้งในสักครู่ 😊",
+                'english': "Sorry, I'm having a small issue right now. Please try again in a moment! 😊",
+                'chinese': "抱歉，我现在有点小问题。请稍后再试！😊",
+                'japanese': "申し訳ありませんが、少し問題があります。もう一度お試しください！😊",
+                'korean': "죄송합니다. 지금 작은 문제가 있습니다. 잠시 후 다시 시도해주세요! 😊"
+            }
+            return fallback_responses.get(language, fallback_responses['english'])
     
     def summarize_plan(self, planner_data: Dict[str, Any], plan_type: str = "general", language: str = "thai") -> str:
         """
@@ -375,27 +383,25 @@ class PlannerUtils:
 
             total_tasks = len(today_todo_list_data)
             
-            # Build prompt
+            # Build concise prompt
             system_prompt = (
-                "You are Evo, a concise AI assistant creating brief morning notifications. "
-                "Keep responses very short, motivating and actionable. "
-                "Focus on the most important information."
+                "You are Evo, creating brief morning notifications. "
+                "Keep responses under 100 characters, motivating and actionable."
             )
             
-            # Format tasks with better structure and only essential info
+            # Format tasks with minimal info
             tasks_info = "\n".join([
-                f"• {task.get('title', 'Untitled')} - {task.get('start', '')}" +
-                (f" ({task.get('location')})" if task.get('location') else "")
-                for task in today_todo_list_data[:3]
+                f"• {task.get('title', 'Task')[:30]} - {task.get('start', '')}"
+                for task in today_todo_list_data[:2]  # Show only 2 tasks
             ])
 
-            remaining = total_tasks - 3 if total_tasks > 3 else 0
+            remaining = total_tasks - 2 if total_tasks > 2 else 0
             if remaining:
-                tasks_info += f"\n• ...and {remaining} more tasks"
+                tasks_info += f"\n• +{remaining} more"
             
             user_prompt = (
-                f"Create an energizing morning notification (max 100 chars) for {total_tasks} tasks:\n{tasks_info}\n\n"
-                "Include task count and 1-2 relevant emojis. Be motivating but extremely concise."
+                f"Morning notification for {total_tasks} tasks:\n{tasks_info}\n"
+                "Max 100 chars, include count and 1-2 emojis."
             )
             
             # Make API call with optimized parameters
@@ -435,26 +441,28 @@ class PlannerUtils:
             #normalized_language = self.validator.validate_language(language)
             total_activities = len(week_summary)
             
-            # Build prompt with better structure
+            # Build concise prompt
             system_prompt = (
-                "You are Evo, a caring AI lifestyle coach creating weekend rest suggestions. "
-                "Keep responses concise, personalized, and actionable. "
-                "Focus on specific rest activities that match the user's week."
+                "You are Evo, a supportive AI assistant. "
+                "Provide an encouraging weekly summary and suggest rest to recharge the user. "
+                "Review the user's weekly accomplishments and provide personalized recharge suggestions. "
+                "Keep responses under 150 characters, uplifting and motivational."
             )
             
-            # Format week activities with essential info only
+            # Format week activities with minimal info
             activities_info = "\n".join([
-                f"• {activity.get('title', 'Activity')} - {activity.get('typeOfTodo', '')}"
-                for activity in week_summary[:7]  # Show top 5 activities
+                f"• {activity.get('title', 'Activity')[:25]} - {activity.get('typeOfTodo', '')}"
+                for activity in week_summary[:4]  # Show only 4 activities
             ])
             
-            if total_activities > 7:
-                activities_info += f"\n• ...and {total_activities - 7} more activities"
+            if total_activities > 4:
+                activities_info += f"\n• +{total_activities - 4} more"
             
             user_prompt = (
-                f"Create personalized rest suggestions (max 150 chars) for someone who completed {total_activities} activities this week:\n{activities_info}\n\n"
-                f"Suggest 2-3 specific rest activities in {language} that match their week. "
-                "Include 1-2 relevant emojis. Be encouraging but concise."
+                f"Weekly summary of {total_activities} completed activities:\n{activities_info}\n"
+                f"Summarize this week and suggest rest to recharge in {language}. "
+                f"Include specific rest activities. Max 150 chars with encouraging emojis."
+                f"Max 150 chars, include positive emojis."
             )
             
             # Make API call with optimized parameters
@@ -503,28 +511,25 @@ class PlannerUtils:
             #normalized_language = self.validator.validate_language(language)
             total_tasks = len(week_data)
             
-            # Build prompt with better structure
+            # Build concise prompt
             system_prompt = (
-                "You are Evo, a concise AI assistant creating brief next week previews. "
-                "Keep responses short, motivating and actionable. "
-                "Focus on the most important upcoming priorities."
+                "You are Evo, creating next week previews. "
+                "Keep responses under 120 characters, motivating and actionable."
             )
             
-            # Format upcoming tasks with essential info only
+            # Format upcoming tasks with minimal info
             tasks_info = "\n".join([
-                f"• {task.get('title', 'Task')} - {task.get('date', '')} - {task.get('typeOfTodo', '')}" +
-                (f" ({task.get('priority', 'normal')})" if task.get('priority') else "")
-                for task in week_data[:7]  # Show top 7 tasks
+                f"• {task.get('title', 'Task')[:20]} - {task.get('typeOfTodo', '')}"
+                for task in week_data[:5]  # Show only 5 tasks
             ])
             
-            remaining = total_tasks - 7 if total_tasks > 7 else 0
+            remaining = total_tasks - 5 if total_tasks > 5 else 0
             if remaining:
-                tasks_info += f"\n• ...and {remaining} more tasks"
+                tasks_info += f"\n• +{remaining} more"
             
             user_prompt = (
-                f"Create an energizing next week preview (max 120 chars) for {total_tasks} upcoming tasks:\n{tasks_info}\n\n"
-                f"Highlight 2-3 key priorities in {language} and end with motivation. "
-                "Include 1-2 relevant emojis. Be concise but encouraging."
+                f"Next week preview for {total_tasks} tasks:\n{tasks_info}\n"
+                f"Highlight 2-3 priorities in {language}. Max 120 chars, include emojis."
             )
             
             # Make API call with optimized parameters
@@ -596,6 +601,9 @@ def message_in_the_morning(today_todo_list_data: List[Dict[str, Any]], language:
 def summarize_end_of_the_week_at_friday(week_data: List[Dict[str, Any]], language: str = "thai") -> str:
     """Backward compatibility function for summarize end of the week"""
     planner = get_default_planner()
+    print(" == summarize_end_of_the_week_at_friday == ")
+    print(week_data)
+    print(language)
     return planner.summarize_end_of_the_week_message(week_data, language)
 
 def summarize_next_week_at_sunday(week_data: List[Dict[str, Any]], language: str = "thai") -> str:

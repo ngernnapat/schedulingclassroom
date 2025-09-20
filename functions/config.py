@@ -36,7 +36,7 @@ class OpenAIConfig:
     max_tokens: int = field(default_factory=lambda: int(os.getenv("OPENAI_MAX_TOKENS", "300")))
     temperature: float = field(default_factory=lambda: float(os.getenv("OPENAI_TEMPERATURE", "0.7")))
     top_p: float = field(default_factory=lambda: float(os.getenv("OPENAI_TOP_P", "0.9")))
-    timeout: int = field(default_factory=lambda: int(os.getenv("OPENAI_TIMEOUT", "30")))
+    timeout: int = field(default_factory=lambda: int(os.getenv("OPENAI_TIMEOUT", "60")))
     max_retries: int = field(default_factory=lambda: int(os.getenv("OPENAI_MAX_RETRIES", "3")))
     retry_delay: float = field(default_factory=lambda: float(os.getenv("OPENAI_RETRY_DELAY", "1.0")))
     rate_limit_calls: int = field(default_factory=lambda: int(os.getenv("OPENAI_RATE_LIMIT_CALLS", "10")))

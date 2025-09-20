@@ -8,9 +8,10 @@ from typing import Optional, Dict, Any, List
 from functools import lru_cache
 from dataclasses import dataclass
 from enum import Enum
+from threading import Lock
 
 import requests
-from openai import OpenAI
+from openai import OpenAI, APITimeoutError, APIConnectionError, RateLimitError, APIError
 from openai.types.chat import ChatCompletion
 from dotenv import load_dotenv
 from langdetect import detect, LangDetectException
@@ -34,9 +35,11 @@ class ChatConfig:
     temperature: float = 0.7
     top_p: float = 0.9
     max_tokens: int = 300
-    timeout: int = 30
+    timeout: int = 60  # Increased from 30 to 60 seconds
     max_retries: int = 3
     retry_delay: float = 1.0
+    connection_timeout: int = 10  # New: connection timeout
+    read_timeout: int = 60  # New: read timeout
 
 class LanguageDetector:
     """Language detection utility with caching"""
@@ -72,6 +75,45 @@ class LanguageDetector:
         """Get full language name from code"""
         return LanguageDetector.LANGUAGE_MAP.get(language_code.lower(), language_code)
 
+class CircuitBreaker:
+    """Circuit breaker to prevent cascading failures"""
+    
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 60.0):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.failure_count = 0
+        self.last_failure_time = 0
+        self.state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
+        self.lock = Lock()
+    
+    def can_proceed(self) -> bool:
+        """Check if requests can proceed through the circuit breaker"""
+        with self.lock:
+            if self.state == "CLOSED":
+                return True
+            elif self.state == "OPEN":
+                if time.time() - self.last_failure_time > self.recovery_timeout:
+                    self.state = "HALF_OPEN"
+                    return True
+                return False
+            else:  # HALF_OPEN
+                return True
+    
+    def record_success(self):
+        """Record a successful request"""
+        with self.lock:
+            self.failure_count = 0
+            self.state = "CLOSED"
+    
+    def record_failure(self):
+        """Record a failed request"""
+        with self.lock:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            if self.failure_count >= self.failure_threshold:
+                self.state = "OPEN"
+                logger.warning(f"Circuit breaker opened after {self.failure_count} failures")
+
 class RateLimiter:
     """Simple rate limiter for API calls"""
     
@@ -101,8 +143,13 @@ class ChatGPTWrapper:
             raise EnvironmentError("OPENAI_API_KEY environment variable is not set.")
         
         self.config = config or ChatConfig()
-        self.client = OpenAI(api_key=self.api_key, timeout=self.config.timeout)
+        # Create client with more granular timeout control
+        self.client = OpenAI(
+            api_key=self.api_key,
+            timeout=(self.config.connection_timeout, self.config.read_timeout)
+        )
         self.rate_limiter = RateLimiter()
+        self.circuit_breaker = CircuitBreaker()
         self.language_detector = LanguageDetector()
         
         logger.info(f"ChatGPT wrapper initialized with model: {self.config.model}")
@@ -137,38 +184,64 @@ class ChatGPTWrapper:
         """Handle API errors with appropriate logging and fallback"""
         error_msg = str(error)
         
-        if "rate limit" in error_msg.lower():
-            logger.warning(f"Rate limit hit on attempt {attempt}")
+        # Handle specific OpenAI exceptions
+        if isinstance(error, APITimeoutError):
+            logger.warning(f"API timeout on attempt {attempt}: {error_msg}")
+            return "Request timed out. Please try again in a moment."
+        
+        elif isinstance(error, APIConnectionError):
+            logger.warning(f"API connection error on attempt {attempt}: {error_msg}")
+            return "Connection issue. Please check your internet connection and try again."
+        
+        elif isinstance(error, RateLimitError):
+            logger.warning(f"Rate limit exceeded on attempt {attempt}")
             return "I'm currently experiencing high demand. Please try again in a moment."
         
-        elif "quota" in error_msg.lower():
-            logger.error("OpenAI quota exceeded")
-            return "Service temporarily unavailable due to quota limits."
+        elif isinstance(error, APIError):
+            logger.error(f"OpenAI API error on attempt {attempt}: {error_msg}")
+            if "quota" in error_msg.lower():
+                return "Service temporarily unavailable due to quota limits."
+            elif "authentication" in error_msg.lower():
+                return "Service configuration error. Please contact support."
+            else:
+                return "Service temporarily unavailable. Please try again later."
         
-        elif "timeout" in error_msg.lower():
-            logger.warning(f"Timeout on attempt {attempt}")
+        # Handle general error patterns
+        elif "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+            logger.warning(f"Timeout on attempt {attempt}: {error_msg}")
             return "Request timed out. Please try again."
         
-        elif "authentication" in error_msg.lower():
-            logger.error("Authentication failed")
-            return "Service configuration error. Please contact support."
+        elif "connection" in error_msg.lower() or "network" in error_msg.lower():
+            logger.warning(f"Network error on attempt {attempt}: {error_msg}")
+            return "Network connection issue. Please try again."
+        
+        elif "rate limit" in error_msg.lower():
+            logger.warning(f"Rate limit hit on attempt {attempt}")
+            return "I'm currently experiencing high demand. Please try again in a moment."
         
         else:
             logger.error(f"Unexpected API error on attempt {attempt}: {error_msg}")
             return "I encountered an unexpected error. Please try again later."
     
     def _make_api_call(self, messages: List[Dict[str, str]], config: Optional[ChatConfig] = None, attempt: int = 1) -> str:
-        """Make API call with retry logic"""
+        """Make API call with retry logic and circuit breaker"""
         try:
+            # Check circuit breaker first
+            if not self.circuit_breaker.can_proceed():
+                logger.warning("Circuit breaker is OPEN, request blocked")
+                return "Service is temporarily unavailable due to recent failures. Please try again later."
+            
             # Use provided config or fall back to default
             current_config = config or self.config
             
+            # Check rate limiting
             if not self.rate_limiter.can_proceed():
                 logger.warning("Rate limit exceeded, waiting...")
                 time.sleep(current_config.retry_delay * 2)
             
             self.rate_limiter.record_call()
             
+            # Make the API call
             response: ChatCompletion = self.client.chat.completions.create(
                 model=current_config.model,
                 messages=messages,
@@ -181,13 +254,21 @@ class ChatGPTWrapper:
             if not content:
                 raise ValueError("Empty response from API")
             
+            # Record success in circuit breaker
+            self.circuit_breaker.record_success()
             logger.info(f"API call successful (attempt {attempt})")
             return content.strip()
             
         except Exception as e:
+            # Record failure in circuit breaker
+            self.circuit_breaker.record_failure()
+            
+            # Check if we should retry
             if attempt < current_config.max_retries:
-                logger.warning(f"API call failed on attempt {attempt}: {str(e)}")
-                time.sleep(current_config.retry_delay * attempt)  # Exponential backoff
+                # Calculate exponential backoff with jitter
+                backoff_time = current_config.retry_delay * (2 ** (attempt - 1)) + (time.time() % 1)
+                logger.warning(f"API call failed on attempt {attempt}: {str(e)}, retrying in {backoff_time:.1f}s")
+                time.sleep(backoff_time)
                 return self._make_api_call(messages, config, attempt + 1)
             else:
                 return self._handle_api_error(e, attempt)

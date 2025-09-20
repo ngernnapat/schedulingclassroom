@@ -7,7 +7,9 @@ import os
 import sys
 import time
 import traceback
+import signal
 from typing import Dict, Any, Optional, Tuple, List
+from functools import wraps
 
 # Add current directory to Python path to ensure local modules can be imported
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -45,6 +47,7 @@ MAX_GRADES = 20
 MAX_HOURS_PER_DAY = 12
 MAX_DAYS_PER_WEEK = 7
 DEFAULT_TIMEOUT = 300  # 5 minutes
+API_TIMEOUT = 90  # 90 seconds for API calls
 
 # Default values for schedule parameters
 DEFAULT_SCHEDULE_PARAMS = {
@@ -152,6 +155,42 @@ logger = logging.getLogger(__name__)
 # Set global options for cost control
 set_global_options(max_instances=MAX_INSTANCES)
 
+class TimeoutError(Exception):
+    """Custom timeout exception"""
+    pass
+
+def timeout_handler(signum, frame):
+    """Handle timeout signal"""
+    raise TimeoutError("Operation timed out")
+
+def with_timeout(seconds: int):
+    """Decorator to add timeout to functions"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            # Set up timeout handler
+            old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(seconds)
+            
+            try:
+                result = func(*args, **kwargs)
+                return result
+            except TimeoutError:
+                logger.error(f"Function {func.__name__} timed out after {seconds} seconds")
+                return create_response(
+                    success=False,
+                    message='Request timeout',
+                    error=f'Operation timed out after {seconds} seconds',
+                    status_code=408
+                )
+            finally:
+                # Restore original handler and cancel alarm
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
+        
+        return wrapper
+    return decorator
+
 def create_response(
     data: Optional[Dict[str, Any]] = None,
     success: bool = True,
@@ -252,6 +291,7 @@ def format_schedule_data(schedule_df, homeroom_df) -> Tuple[List[Dict[str, Any]]
     
     return reformatted_schedule, homeroom_data
 
+# Generate a school schedule based on provided parameters
 @https_fn.on_request(max_instances=3)
 def generate_schedule(req: https_fn.Request) -> https_fn.Response:
     """Generate a school schedule based on provided parameters"""
@@ -410,7 +450,7 @@ def generate_schedule(req: https_fn.Request) -> https_fn.Response:
         )
 
 
-
+# Get information about available schedule parameters and constraints
 @https_fn.on_request()
 def get_schedule_info(req: https_fn.Request) -> https_fn.Response:
     """Get information about available schedule parameters and constraints"""
@@ -462,6 +502,8 @@ def get_schedule_info(req: https_fn.Request) -> https_fn.Response:
 
 
 #################### ChatGPT API Endpoints ######################
+
+# Summarize planner data using ChatGPT
 @https_fn.on_request(memory=1024, max_instances=3)
 def summarize_planner(req: https_fn.Request) -> https_fn.Response:
     """Summarize planner data using ChatGPT"""
@@ -513,6 +555,7 @@ def summarize_planner(req: https_fn.Request) -> https_fn.Response:
             status_code=500
         )
 
+# Track user progress using ChatGPT
 @https_fn.on_request(memory=1024, max_instances=3)
 def progress(req: https_fn.Request) -> https_fn.Response:
     """Track user progress using ChatGPT"""
@@ -563,6 +606,7 @@ def progress(req: https_fn.Request) -> https_fn.Response:
             status_code=500
         )
 
+# Respond to user input using ChatGPT
 @https_fn.on_request(memory=1024, max_instances=3)
 def coach(req: https_fn.Request) -> https_fn.Response:
     """Respond to user input using ChatGPT"""
@@ -613,6 +657,7 @@ def coach(req: https_fn.Request) -> https_fn.Response:
             status_code=500
         )
 
+# Encourage the user to start the day using ChatGPT
 @https_fn.on_request(memory=1024, max_instances=3)
 def encourage_in_the_morning(req: https_fn.Request) -> https_fn.Response:
     """encourage the user to start the day using ChatGPT"""
@@ -663,6 +708,7 @@ def encourage_in_the_morning(req: https_fn.Request) -> https_fn.Response:
             status_code=500
         )
 
+# Summarize the end of the week using ChatGPT and suggest rest to recharge energy
 @https_fn.on_request(memory=1024, max_instances=3)
 def summarize_end_of_the_week(req: https_fn.Request) -> https_fn.Response:
     """Summarize the end of the week using ChatGPT and suggest rest to recharge energy"""
@@ -707,7 +753,8 @@ def summarize_end_of_the_week(req: https_fn.Request) -> https_fn.Response:
         
         return create_response(
             data={'response': rest_suggestions},
-            message='Response generated successfully'
+            message='Response generated successfully',
+            status_code=200
         )
         
     except Exception as e:
@@ -719,6 +766,7 @@ def summarize_end_of_the_week(req: https_fn.Request) -> https_fn.Response:
             status_code=500
         )
         
+# Summarize next week's plan and provide encouraging preparation suggestions
 @https_fn.on_request(memory=1024, max_instances=3)
 def summarize_next_week(req: https_fn.Request) -> https_fn.Response:
     """Summarize next week's plan and provide encouraging preparation suggestions"""
@@ -774,3 +822,6 @@ def summarize_next_week(req: https_fn.Request) -> https_fn.Response:
             error=f'Failed to generate response: {str(e)}',
             status_code=500
         )
+
+
+# Create contents for the planner using ChatGPT
