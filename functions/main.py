@@ -20,12 +20,14 @@ from firebase_functions import https_fn
 from firebase_functions.options import set_global_options
 from firebase_admin import initialize_app
 from fastapi import HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from dotenv import load_dotenv
 
 # Import local modules
 from planner_utils import summarize_plan, motivate_user, track_progress, respond_to_user_input, message_in_the_morning, summarize_end_of_the_week_at_friday, summarize_next_week_at_sunday
 
+# import the same models + chat wrapper from main.py
+from generate_planner_content import GeneratePlannerRequest, chat
 # Load environment variables
 load_dotenv()
 
@@ -500,8 +502,32 @@ def get_schedule_info(req: https_fn.Request) -> https_fn.Response:
     
     return create_response(data=info_data, message='API information retrieved successfully')
 
+########### Generate Planner Content API Endpoints #############
+@https_fn.on_request(memory=1024, max_instances=3)
+def generate_planner_content(req: https_fn.Request) -> https_fn.Response:
+    """Generate planner content using ChatGPT"""
+    try:
+        payload = req.get_json()
+        print(f"Received payload: {payload}")
+        
+        parsed = GeneratePlannerRequest(**payload)
+        print(f"Parsed request: {parsed}")
+        
+        content = chat.generate(parsed)
+        print(f"Generated content: {content.planName} with {len(content.days)} days")
+        
+        return content.model_dump()
+    except ValidationError as ve:
+        print(f"Validation error: {ve.errors()}")
+        raise HTTPException(status_code=400, detail=ve.errors())
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
 
-#################### ChatGPT API Endpoints ######################
+
+#################### EVO ChatGPT API Endpoints ######################
 
 # Summarize planner data using ChatGPT
 @https_fn.on_request(memory=1024, max_instances=3)
