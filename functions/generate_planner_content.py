@@ -40,6 +40,7 @@ class Task(BaseModel):
     done: bool = False
     duration_min: Optional[conint(ge=0, le=600)] = None   # optional per-task duration
     note: Optional[str] = None
+    link: Optional[constr(strip_whitespace=True, min_length=1)] = Field(None, description="Optional helpful link or resource for this task")
 
 class DayPlan(BaseModel):
     id: constr(strip_whitespace=True, min_length=1) = Field(default_factory=lambda: uuid.uuid4().hex[:8])
@@ -113,27 +114,51 @@ class GeneratePlannerRequest(BaseModel):
     
     @model_validator(mode='after')
     def validate_plan_consistency(self) -> 'GeneratePlannerRequest':
-        """Validate business logic constraints."""
-        # Validate minutesPerDay makes sense for the category
+        """Validate business logic constraints with user-friendly suggestions."""
+        # Validate minutesPerDay makes sense for the category - use warnings instead of errors
         if self.minutesPerDay and self.category == "exercise":
             if self.minutesPerDay < 15:
-                raise ValueError("Exercise plans require at least 15 minutes per day for safety")
+                # Auto-adjust to minimum safe duration instead of raising error
+                print(f"Warning: Exercise plans should be at least 15 minutes for safety. Adjusting from {self.minutesPerDay} to 15 minutes.")
+                self.minutesPerDay = 15
             if self.minutesPerDay > 480:
-                raise ValueError("Exercise plans should not exceed 8 hours per day for safety")
+                # Auto-adjust to maximum safe duration instead of raising error
+                print(f"Warning: Exercise plans should not exceed 8 hours for safety. Adjusting from {self.minutesPerDay} to 480 minutes.")
+                self.minutesPerDay = 480
         
-        # Validate totalDays vs minutesPerDay for reasonable workload
+        # Validate totalDays vs minutesPerDay for reasonable workload - use warnings instead of errors
         if self.minutesPerDay and self.totalDays:
             total_hours = (self.minutesPerDay * self.totalDays) / 60
             if total_hours > 200:  # More than 200 total hours seems excessive
-                raise ValueError(f"Plan would require {total_hours:.1f} total hours, which may be too intensive")
+                # Suggest reducing intensity instead of failing
+                print(f"Warning: Plan would require {total_hours:.1f} total hours, which may be intensive. Consider reducing daily time or total days.")
+                # Auto-adjust to more reasonable duration
+                suggested_minutes = int((200 * 60) / self.totalDays)
+                if suggested_minutes < self.minutesPerDay:
+                    print(f"Auto-adjusting daily time from {self.minutesPerDay} to {suggested_minutes} minutes for better balance.")
+                    self.minutesPerDay = suggested_minutes
         
-        # Validate startDate format if provided
+        # Validate startDate format if provided - be more flexible with date formats
         if self.startDate:
             try:
                 from datetime import datetime
-                datetime.strptime(self.startDate, "%Y-%m-%d")
-            except ValueError:
-                raise ValueError("startDate must be in YYYY-MM-DD format")
+                # Try multiple common date formats
+                date_formats = ["%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"]
+                parsed_date = None
+                for fmt in date_formats:
+                    try:
+                        parsed_date = datetime.strptime(self.startDate, fmt)
+                        break
+                    except ValueError:
+                        continue
+                
+                if parsed_date is None:
+                    print(f"Warning: Date format '{self.startDate}' not recognized. Please use YYYY-MM-DD format. Continuing without date validation.")
+                else:
+                    # Normalize to YYYY-MM-DD format
+                    self.startDate = parsed_date.strftime("%Y-%m-%d")
+            except Exception as e:
+                print(f"Warning: Could not parse start date '{self.startDate}': {e}. Continuing without date validation.")
         
         return self
 
@@ -200,6 +225,102 @@ class ChatWrapper:
         # If all else fails, raise the original error
         raise json.JSONDecodeError("Could not parse JSON from response", raw_response, 0)
 
+    def _validate_task_link(self, link: str, category: str) -> bool:
+        """Validate that a task link meets quality and source requirements"""
+        if not link or not isinstance(link, str):
+            return False
+        
+        link = link.strip()
+        
+        # Basic format validation
+        if not link.startswith(('http://', 'https://')):
+            return False
+        
+        # Check for placeholder or invalid URLs
+        invalid_patterns = [
+            'example.com', 'placeholder', 'test.com', 'dummy.com',
+            'bit.ly', 'tinyurl.com', 'short.link', 'goo.gl',
+            'localhost', '127.0.0.1', '0.0.0.0'
+        ]
+        
+        if any(pattern in link.lower() for pattern in invalid_patterns):
+            return False
+        
+        # Category-specific domain validation
+        approved_domains = {
+            "learning": [
+                "coursera.org", "khanacademy.org", "udemy.com", "edx.org", 
+                "codecademy.com", "skillshare.com", "linkedin.com", "youtube.com",
+                "mit.edu", "stanford.edu", "harvard.edu", "berkeley.edu"
+            ],
+            "exercise": [
+                "nike.com", "fitnessblender.com", "darebee.com", "myfitnesspal.com",
+                "bodybuilding.com", "menshealth.com", "womenshealthmag.com", 
+                "acefitness.org", "verywellfit.com", "youtube.com"
+            ],
+            "travel": [
+                "tripadvisor.com", "rome2rio.com", "booking.com", "wikitravel.org",
+                "lonelyplanet.com", "nationalgeographic.com", "travelandleisure.com",
+                "cntraveler.com", "airbnb.com", "expedia.com"
+            ],
+            "finance": [
+                "investopedia.com", "nerdwallet.com", "bankrate.com", "mint.com",
+                "yahoo.com", "marketwatch.com", "cnbc.com", "forbes.com",
+                "money.cnn.com", "fidelity.com", "vanguard.com"
+            ],
+            "health": [
+                "mayoclinic.org", "healthline.com", "webmd.com", "medlineplus.gov",
+                "cdc.gov", "who.int", "harvard.edu", "clevelandclinic.org",
+                "hopkinsmedicine.org", "nih.gov"
+            ],
+            "personal_development": [
+                "mindtools.com", "ted.com", "psychologytoday.com", "hbr.org",
+                "lifehack.org", "zenhabits.net", "jamesclear.com", "charlesduhigg.com",
+                "gretchenrubin.com", "youtube.com"
+            ],
+            "other": [
+                "wikipedia.org", "youtube.com", "reddit.com", "medium.com",
+                "quora.com", "stackoverflow.com", "github.com"
+            ]
+        }
+        
+        # Check if link contains an approved domain for the category
+        category_domains = approved_domains.get(category, approved_domains["other"])
+        
+        # Extract domain from URL
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(link)
+            domain = parsed.netloc.lower()
+            
+            # Remove 'www.' prefix if present
+            if domain.startswith('www.'):
+                domain = domain[4:]
+            
+            # Check if domain is in approved list
+            return any(approved_domain in domain for approved_domain in category_domains)
+            
+        except Exception:
+            return False
+
+    def _check_duplicate_links(self, days: List[Dict]) -> List[str]:
+        """Check for duplicate links within the plan and return list of duplicates"""
+        all_links = []
+        duplicates = []
+        
+        for day in days:
+            for task in day.get("tasks", []):
+                link = task.get("link")
+                if link and isinstance(link, str):
+                    link = link.strip()
+                    if link:
+                        if link in all_links:
+                            duplicates.append(link)
+                        else:
+                            all_links.append(link)
+        
+        return duplicates
+
     @staticmethod
     def _system_prompt() -> str:
         return (
@@ -221,6 +342,30 @@ class ChatWrapper:
             "7) The 'days' field MUST be an array with exactly the requested number of days.\n"
             "8) TIME ALLOCATION: If minutesPerDay is specified, you MUST ensure that the sum of all task durations (duration_min) for each day equals exactly the specified minutesPerDay. Each task must have a duration_min value when minutesPerDay is provided."
             "9) You MUST generate exactly the requested number of days - no more, no less. The number of days in the generated plan MUST match totalDays."
+            "10) MANDATORY LINK REQUIREMENT: EVERY single task MUST include a meaningful, helpful link or resource in the 'link' field. This field is ABSOLUTELY REQUIRED and cannot be empty, null, or contain placeholder text.\n"
+            "   LINK VALIDATION RULES:\n"
+            "   ✓ Must be a real, accessible URL from trusted, reputable sources\n"
+            "   ✓ Must point to a specific page/article/video that directly helps with the task\n"
+            "   ✓ Each task requires a unique link - no duplicates within the plan\n"
+            "   ✓ Links must be current and from authoritative sources\n"
+            "   ✓ No shortened URLs, placeholder links, or generic homepage links\n"
+            "   ✓ Must include the full URL with https:// protocol\n"
+            "   \n"
+            "   APPROVED SOURCE DOMAINS BY CATEGORY:\n"
+            "   📚 Learning: coursera.org, khanacademy.org, udemy.com, edx.org, codecademy.com, skillshare.com, linkedin.com/learning, youtube.com/education, youtube.com, mit.edu, stanford.edu\n"
+            "   💪 Exercise: nike.com/training, fitnessblender.com, darebee.com, myfitnesspal.com, bodybuilding.com, menshealth.com, womenshealthmag.com, acefitness.org, verywellfit.com, youtube.com\n"
+            "   ✈️ Travel: tripadvisor.com, rome2rio.com, booking.com, wikitravel.org, lonelyplanet.com, nationalgeographic.com/travel, travelandleisure.com, cntraveler.com, youtube.com\n"
+            "   💰 Finance: investopedia.com, nerdwallet.com, bankrate.com, mint.com, yahoo.com/finance, marketwatch.com, cnbc.com, forbes.com/finance, money.cnn.com, youtube.com\n"
+            "   🏥 Health: mayoclinic.org, healthline.com, webmd.com, medlineplus.gov, cdc.gov, who.int, harvard.edu/health, clevelandclinic.org, hopkinsmedicine.org, youtube.com\n"
+            "   🧠 Personal Development: mindtools.com, ted.com, psychologytoday.com, hbr.org, lifehack.org, zenhabits.net, jamesclear.com, charlesduhigg.com, gretchenrubin.com, youtube.com\n"
+            "   \n"
+            "   LINK QUALITY EXAMPLES:\n"
+            "   ✅ GOOD: 'https://www.coursera.org/learn/python-programming' (specific course)\n"
+            "   ✅ GOOD: 'https://www.nike.com/training/guides/beginner-workout-plan' (specific guide)\n"
+            "   ❌ BAD: 'https://www.coursera.org' (homepage only)\n"
+            "   ❌ BAD: 'https://bit.ly/abc123' (shortened URL)\n"
+            "   ❌ BAD: 'https://example.com' (placeholder)\n"
+           
         )
 
     def generate_chunked(self, req: GeneratePlannerRequest) -> PlannerContent:
@@ -374,8 +519,9 @@ class ChatWrapper:
                                             "done": {"type": "boolean"},
                                             "duration_min": {"type": ["integer", "null"], "minimum": 0, "maximum": 600},
                                             "note": {"type": ["string", "null"]},
+                                            "link": {"type": "string"},
                                         },
-                                        "required": ["id", "text", "done"]
+                                        "required": ["id", "text", "done", "link"]
                                     }
                                 },
                                 "tips": {"type": ["string", "null"]}
@@ -597,6 +743,16 @@ class ChatWrapper:
                 if warning_message:
                     data["warning"] = warning_message
             
+            # Check for duplicate links across the entire plan
+            duplicate_links = self._check_duplicate_links(data.get("days", []))
+            if duplicate_links:
+                print(f"Warning: Found duplicate links in the plan: {duplicate_links}")
+                # Add warning about duplicates but don't fail the generation
+                if "warning" in data:
+                    data["warning"] += f" Note: Some tasks share the same resource links."
+                else:
+                    data["warning"] = "Some tasks share the same resource links."
+            
             for i, d in enumerate(data.get("days", []), start=1):
                 if not isinstance(d, dict):
                     raise PlannerGenerationError(
@@ -626,8 +782,22 @@ class ChatWrapper:
                         )
                     t.setdefault("id", uuid.uuid4().hex[:8])
                     t.setdefault("done", False)
+                    
+                    # Validate link field - if invalid, set to None
+                    link = t.get("link", "")
+                    if not link or not isinstance(link, str):
+                        # If link is missing or invalid, set to None
+                        t["link"] = None
+                    else:
+                        # Validate link format and quality
+                        link = link.strip()
+                        if not self._validate_task_link(link, req.category):
+                            # If link doesn't meet quality requirements, set to None
+                            t["link"] = None
+                        else:
+                            t["link"] = link
                 
-                # Validate minutesPerDay constraint if specified
+                # Validate minutesPerDay constraint if specified - be more flexible
                 if req.minutesPerDay:
                     total_duration = 0
                     tasks_without_duration = []
@@ -638,18 +808,42 @@ class ChatWrapper:
                         else:
                             total_duration += task["duration_min"]
                     
+                    # Auto-assign durations to tasks that don't have them
                     if tasks_without_duration:
-                        raise PlannerGenerationError(
-                            f"Day {i} has tasks without duration_min values: tasks {tasks_without_duration}",
-                            f"All tasks must have duration_min values when minutesPerDay is specified. Please try again."
-                        )
+                        remaining_minutes = req.minutesPerDay - total_duration
+                        tasks_needing_duration = len(tasks_without_duration)
+                        if tasks_needing_duration > 0 and remaining_minutes > 0:
+                            # Distribute remaining time evenly among tasks without duration
+                            avg_duration = remaining_minutes // tasks_needing_duration
+                            remainder = remaining_minutes % tasks_needing_duration
+                            
+                            for idx, task_idx in enumerate(tasks_without_duration):
+                                duration = avg_duration + (1 if idx < remainder else 0)
+                                d["tasks"][task_idx - 1]["duration_min"] = max(1, duration)  # At least 1 minute
+                            
+                            print(f"Warning: Day {i} had tasks without duration. Auto-assigned durations to complete {req.minutesPerDay} minutes.")
+                            # Recalculate total
+                            total_duration = sum(task.get("duration_min", 0) for task in d.get("tasks", []))
                     
-                    if total_duration != req.minutesPerDay:
-                        raise PlannerGenerationError(
-                            f"Day {i} total task duration is {total_duration} minutes, but {req.minutesPerDay} minutes was requested",
-                            f"Task durations must add up to exactly {req.minutesPerDay} minutes per day. Please try again."
-                        )
-                    
+                    # Allow some flexibility in duration matching (±5 minutes)
+                    duration_diff = abs(total_duration - req.minutesPerDay)
+                    if duration_diff > 5:
+                        # Auto-adjust to match requested duration
+                        if total_duration < req.minutesPerDay:
+                            # Add time to the longest task
+                            longest_task_idx = max(range(len(d.get("tasks", []))), 
+                                                 key=lambda x: d["tasks"][x].get("duration_min", 0))
+                            d["tasks"][longest_task_idx]["duration_min"] += (req.minutesPerDay - total_duration)
+                        elif total_duration > req.minutesPerDay:
+                            # Reduce time from the longest task
+                            longest_task_idx = max(range(len(d.get("tasks", []))), 
+                                                 key=lambda x: d["tasks"][x].get("duration_min", 0))
+                            reduction = min(total_duration - req.minutesPerDay, 
+                                          d["tasks"][longest_task_idx].get("duration_min", 1) - 1)
+                            d["tasks"][longest_task_idx]["duration_min"] -= reduction
+                        
+                        print(f"Warning: Day {i} task durations adjusted from {total_duration} to {req.minutesPerDay} minutes for consistency.")
+        
         except PlannerGenerationError:
             raise  # Re-raise our custom errors
         except Exception as e:

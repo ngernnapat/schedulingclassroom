@@ -519,12 +519,41 @@ def generate_planner_content(req: https_fn.Request) -> https_fn.Response:
         return content.model_dump()
     except ValidationError as ve:
         print(f"Validation error: {ve.errors()}")
-        raise HTTPException(status_code=400, detail=ve.errors())
+        # Format validation errors in a user-friendly way
+        errors = []
+        for error in ve.errors():
+            field = " → ".join(str(loc) for loc in error["loc"])
+            message = error["msg"]
+            # Make error messages more user-friendly
+            if "type_error" in message:
+                message = "Please provide a valid value"
+            elif "value_error" in message:
+                message = "The value provided is not valid"
+            errors.append(f"{field}: {message}")
+        
+        user_friendly_detail = {
+            "error": "Invalid request parameters",
+            "message": "Please check the following fields and try again:",
+            "details": errors
+        }
+        raise HTTPException(status_code=400, detail=user_friendly_detail)
     except Exception as e:
         print(f"Unexpected error: {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+        
+        # Provide user-friendly error message without exposing internals
+        error_str = str(e).lower()
+        if "api" in error_str or "openai" in error_str:
+            user_message = "We're having trouble generating your planner right now. Please try again in a moment."
+        elif "timeout" in error_str:
+            user_message = "The request took too long to process. Please try with fewer days or simpler requirements."
+        elif "rate" in error_str or "quota" in error_str:
+            user_message = "We've reached our service limit. Please try again in a few minutes."
+        else:
+            user_message = "We couldn't generate your planner. Please check your inputs and try again."
+        
+        raise HTTPException(status_code=500, detail={"error": "Generation failed", "message": user_message})
 
 
 #################### EVO ChatGPT API Endpoints ######################
