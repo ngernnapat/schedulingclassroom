@@ -388,6 +388,88 @@ class ChatWrapper:
         # Since we're not using links anymore, return empty list
         return []
 
+    def _generate_fallback_plan(self, req: GeneratePlannerRequest) -> dict:
+        """Generate a basic fallback plan when AI response fails"""
+        print(f"Generating fallback plan for {req.totalDays} days, category: {req.category}")
+        
+        fallback_days = []
+        for day_num in range(1, req.totalDays + 1):
+            # Create category-specific content
+            if req.category == "learning":
+                title = f"Day {day_num} - Learning Session"
+                summary = "Continue your learning journey with focused study and practice."
+                task1_text = "Study session: Review previous material and learn new concepts. Take notes and practice with examples."
+                task2_text = "Practice and apply: Work on exercises or projects to reinforce your learning."
+            elif req.category == "exercise":
+                title = f"Day {day_num} - Workout Session"
+                summary = "Maintain your fitness routine with a balanced workout."
+                task1_text = "Warm-up and main exercise: Start with 5-10 minutes of light activity, then perform your main workout."
+                task2_text = "Cool-down and recovery: Finish with stretching and light movement to aid recovery."
+            elif req.category == "finance":
+                title = f"Day {day_num} - Financial Planning"
+                summary = "Continue building your financial knowledge and habits."
+                task1_text = "Financial review: Check your accounts, review recent transactions, and update your budget."
+                task2_text = "Learning and planning: Study financial concepts or plan your next financial goals."
+            elif req.category == "health":
+                title = f"Day {day_num} - Wellness Focus"
+                summary = "Prioritize your health and well-being today."
+                task1_text = "Health check: Monitor your vital signs, review your nutrition, and plan healthy meals."
+                task2_text = "Wellness activity: Engage in stress management, meditation, or other wellness practices."
+            elif req.category == "personal_development":
+                title = f"Day {day_num} - Growth Session"
+                summary = "Focus on personal growth and self-improvement."
+                task1_text = "Self-reflection: Journal about your goals, progress, and areas for improvement."
+                task2_text = "Skill development: Work on a specific skill or habit that contributes to your growth."
+            elif req.category == "travel":
+                title = f"Day {day_num} - Travel Planning"
+                summary = "Continue planning and preparing for your travel goals."
+                task1_text = "Research and planning: Research destinations, activities, or logistics for your trip."
+                task2_text = "Preparation: Work on bookings, packing lists, or other travel preparations."
+            else:
+                title = f"Day {day_num} - Practice Session"
+                summary = "Continue working on your goals with focused practice."
+                task1_text = "Main activity: Spend time on your primary goal or skill development."
+                task2_text = "Review and plan: Reflect on your progress and plan your next steps."
+            
+            fallback_day = {
+                "id": uuid.uuid4().hex[:8],
+                "dayNumber": day_num,
+                "title": title,
+                "summary": summary,
+                "tasks": [
+                    {
+                        "id": uuid.uuid4().hex[:8],
+                        "text": task1_text,
+                        "done": False,
+                        "duration_min": req.minutesPerDay // 2 if req.minutesPerDay else None,
+                        "note": "Customize this task based on your specific needs and progress",
+                        "link": None
+                    },
+                    {
+                        "id": uuid.uuid4().hex[:8],
+                        "text": task2_text,
+                        "done": False,
+                        "duration_min": req.minutesPerDay // 2 if req.minutesPerDay else None,
+                        "note": "Adapt this task to your current level and goals",
+                        "link": None
+                    }
+                ],
+                "tips": "Stay consistent with your practice and adjust your approach based on what works best for you."
+            }
+            fallback_days.append(fallback_day)
+        
+        return {
+            "planName": req.planName,
+            "category": req.category,
+            "totalDays": req.totalDays,
+            "minutesPerDay": req.minutesPerDay,
+            "coverImage": None,
+            "coverImageUrl": None,
+            "createdAt": {"seconds": int(time.time()), "nanoseconds": 0},
+            "days": fallback_days,
+            "warning": "Generated a basic plan structure due to AI response issues. You can customize the tasks as needed."
+        }
+
     @staticmethod
     def _system_prompt() -> str:
         return (
@@ -406,9 +488,9 @@ class ChatWrapper:
             "4) Never invent unsafe or extreme advice; prefer safe defaults.\n"
             "5) CRITICAL: Output MUST be valid JSON matching the exact schema provided.\n"
             "6) Include ALL required fields: planName, category, totalDays, createdAt, days.\n"
-            "7) The 'days' field MUST be an array with exactly the requested number of days.\n"
-            "8) TIME ALLOCATION: If minutesPerDay is specified, you MUST ensure that the sum of all task durations (duration_min) for each day equals exactly the specified minutesPerDay. Each task must have a duration_min value when minutesPerDay is provided."
-            "9) You MUST generate exactly the requested number of days - no more, no less. The number of days in the generated plan MUST match totalDays."
+            "7) ABSOLUTE REQUIREMENT: The 'days' array MUST contain EXACTLY the number of days specified in totalDays. If totalDays=30, you MUST generate exactly 30 days. If totalDays=7, you MUST generate exactly 7 days. NO MORE, NO LESS.\n"
+            "8) TIME ALLOCATION: If minutesPerDay is specified, you MUST ensure that the sum of all task durations (duration_min) for each day equals exactly the specified minutesPerDay. Each task must have a duration_min value when minutesPerDay is provided.\n"
+            "9) DAY NUMBERING: Each day must have a dayNumber field starting from 1 and incrementing sequentially (1, 2, 3, ..., totalDays).\n"
             "10) DETAILED TASK INSTRUCTIONS: Each task MUST include comprehensive, actionable instructions that users can follow without external links. Focus on providing clear, step-by-step guidance within the task description itself.\n"
             "   TASK QUALITY REQUIREMENTS:\n"
             "   ✓ Provide specific, actionable steps for each task\n"
@@ -488,12 +570,29 @@ class ChatWrapper:
             
             # Adjust day numbers and add to all_days
             for day in chunk_content.days:
-                day.dayNumber = chunk_start + day.dayNumber - 1
+                # Fix the day numbering: chunk_start is the correct starting day number
+                # day.dayNumber from the chunk should be 1, 2, 3, etc. for the chunk
+                # We need to map it to the global day number
+                day.dayNumber = chunk_start + (day.dayNumber - 1)
                 all_days.append(day)
             
             # Add small delay between chunks to avoid rate limits
             if chunk_end < req.totalDays:
                 time.sleep(1)
+        
+        # Validate that we have the correct number of days
+        if len(all_days) != req.totalDays:
+            raise PlannerGenerationError(
+                f"Chunked generation failed: Expected {req.totalDays} days but got {len(all_days)}",
+                f"Could not generate the complete {req.totalDays}-day plan. Please try again with fewer days or simpler requirements."
+            )
+        
+        # Validate day numbering is sequential
+        for i, day in enumerate(all_days):
+            expected_day_num = i + 1
+            if day.dayNumber != expected_day_num:
+                print(f"Warning: Day {i+1} has incorrect dayNumber {day.dayNumber}, correcting to {expected_day_num}")
+                day.dayNumber = expected_day_num
         
         # Create the final content
         final_content = PlannerContent(
@@ -557,6 +656,7 @@ class ChatWrapper:
                     "days": {
                         "type": "array",
                         "minItems": 1,
+                        "maxItems": 90,
                         "items": {
                             "type": "object",
                             "additionalProperties": False,
@@ -728,39 +828,32 @@ class ChatWrapper:
         # Extract JSON
         try:
             if not response.choices or not response.choices[0].message.content:
-                raise PlannerGenerationError(
-                    "Empty response from OpenAI",
-                    "The AI service returned an empty response. Please try again."
-                )
-            
-            raw = response.choices[0].message.content
-            print(f"DEBUG: Raw AI response: {raw[:500]}...")  # Log first 500 chars
-            
-            # Try to clean and parse the JSON response
-            data = self._parse_json_response(raw)
-            
-            if not isinstance(data, dict):
-                raise PlannerGenerationError(
-                    f"Invalid response type: {type(data)}",
-                    "The AI service returned an unexpected format. Please try again."
-                )
+                print("Warning: Empty response from OpenAI, generating fallback plan...")
+                # Generate fallback plan instead of raising error
+                data = self._generate_fallback_plan(req)
+            else:
+                raw = response.choices[0].message.content
+                print(f"DEBUG: Raw AI response: {raw[:500]}...")  # Log first 500 chars
                 
-            print(f"DEBUG: Parsed data keys: {list(data.keys())}")  # Log available keys
+                # Try to clean and parse the JSON response
+                data = self._parse_json_response(raw)
                 
+                if not isinstance(data, dict):
+                    print(f"Warning: Invalid response type: {type(data)}, generating fallback plan...")
+                    data = self._generate_fallback_plan(req)
+                else:
+                    print(f"DEBUG: Parsed data keys: {list(data.keys())}")  # Log available keys
+                    
         except json.JSONDecodeError as e:
             print(f"DEBUG: JSON decode error: {e}")
             print(f"DEBUG: Raw response that failed to parse: {raw}")
-            raise PlannerGenerationError(
-                f"JSON decode error from OpenAI response: {e}",
-                "The AI service returned malformed data. Please try again."
-            )
+            print("Generating fallback plan due to JSON parsing error...")
+            data = self._generate_fallback_plan(req)
         except Exception as e:
             print(f"DEBUG: Unexpected error parsing response: {e}")
             print(f"DEBUG: Raw response: {raw}")
-            raise PlannerGenerationError(
-                f"Error processing AI response: {e}",
-                "The AI service returned unexpected data. Please try again."
-            )
+            print("Generating fallback plan due to parsing error...")
+            data = self._generate_fallback_plan(req)
 
         # Fill in createdAt if model left null, and ensure ids
         try:
@@ -773,33 +866,99 @@ class ChatWrapper:
             
             if "days" not in data or not isinstance(data.get("days"), list):
                 available_keys = list(data.keys()) if isinstance(data, dict) else "not a dict"
-                raise PlannerGenerationError(
-                    f"Missing or invalid 'days' field in response. Available keys: {available_keys}",
-                    "The generated plan is missing daily schedules. Please try again."
-                )
+                print(f"Warning: AI response missing 'days' field. Available keys: {available_keys}")
+                print("Generating fallback plan with basic structure...")
+                
+                # Generate a fallback plan with the requested number of days
+                fallback_days = []
+                for day_num in range(1, req.totalDays + 1):
+                    fallback_day = {
+                        "id": uuid.uuid4().hex[:8],
+                        "dayNumber": day_num,
+                        "title": f"Day {day_num} - {req.category.title()} Practice",
+                        "summary": f"Continue your {req.category} journey with focused practice and learning.",
+                        "tasks": [
+                            {
+                                "id": uuid.uuid4().hex[:8],
+                                "text": f"Practice session: Spend time working on your {req.category} skills. Focus on consistency and gradual improvement.",
+                                "done": False,
+                                "duration_min": req.minutesPerDay // 2 if req.minutesPerDay else None,
+                                "note": "Adapt this task based on your specific needs and progress",
+                                "link": None
+                            },
+                            {
+                                "id": uuid.uuid4().hex[:8],
+                                "text": f"Review and reflect: Take time to review your progress, identify areas for improvement, and plan your next steps.",
+                                "done": False,
+                                "duration_min": req.minutesPerDay // 2 if req.minutesPerDay else None,
+                                "note": "Use this time to assess your learning and adjust your approach",
+                                "link": None
+                            }
+                        ],
+                        "tips": "Stay consistent with your practice and don't be afraid to adjust your approach based on what you've learned."
+                    }
+                    fallback_days.append(fallback_day)
+                
+                # Update the data with fallback content
+                data["days"] = fallback_days
+                data["planName"] = data.get("planName", req.planName)
+                data["category"] = data.get("category", req.category)
+                data["totalDays"] = req.totalDays
+                data["warning"] = "Generated a basic plan structure due to AI response format issues. You can customize the tasks as needed."
+                
+                print(f"Generated fallback plan with {len(fallback_days)} days")
             
             current_days = len(data.get("days", []))
             if current_days != req.totalDays:
-                # Handle day count mismatch gracefully
-                warning_message = None
+                # Day count mismatch - this should not happen with proper AI generation
+                # Try to fix it by generating additional days or trimming excess
                 if current_days < req.totalDays:
-                    # Use available days but add a warning
-                    warning_message = f"Generated only {current_days} days instead of the requested {req.totalDays}. Using available days."
-                    print(f"Warning: {warning_message}")
-                    # Keep all available days
-                    data["days"] = data["days"][:current_days]
-                else:
-                    # Trim extra days if more than requested
-                    warning_message = f"Generated {current_days} days instead of the requested {req.totalDays}. Trimming to requested amount."
-                    print(f"Warning: {warning_message}")
+                    # Generate additional days to match the request
+                    missing_days = req.totalDays - current_days
+                    print(f"Warning: Generated only {current_days} days instead of {req.totalDays}. Attempting to generate {missing_days} additional days.")
+                    
+                    # Create additional days with generic content
+                    for day_num in range(current_days + 1, req.totalDays + 1):
+                        additional_day = {
+                            "id": uuid.uuid4().hex[:8],
+                            "dayNumber": day_num,
+                            "title": f"Day {day_num} - Continued Progress",
+                            "summary": f"Continue your {req.category} journey with focused practice and reflection.",
+                            "tasks": [
+                                {
+                                    "id": uuid.uuid4().hex[:8],
+                                    "text": f"Review and practice: Spend time reviewing previous days' progress and continue building your skills. Focus on consistency and gradual improvement.",
+                                    "done": False,
+                                    "duration_min": req.minutesPerDay // 2 if req.minutesPerDay else None,
+                                    "note": "Adapt this task based on your specific needs and progress",
+                                    "link": None
+                                },
+                                {
+                                    "id": uuid.uuid4().hex[:8],
+                                    "text": f"Reflection and planning: Take time to reflect on your progress, identify areas for improvement, and plan your next steps.",
+                                    "done": False,
+                                    "duration_min": req.minutesPerDay // 2 if req.minutesPerDay else None,
+                                    "note": "Use this time to assess your learning and adjust your approach",
+                                    "link": None
+                                }
+                            ],
+                            "tips": "Stay consistent with your practice and don't be afraid to adjust your approach based on what you've learned."
+                        }
+                        data["days"].append(additional_day)
+                    
+                    print(f"Generated {missing_days} additional days to complete the {req.totalDays}-day plan.")
+                    
+                elif current_days > req.totalDays:
+                    # Trim excess days
+                    excess_days = current_days - req.totalDays
+                    print(f"Warning: Generated {current_days} days instead of {req.totalDays}. Trimming {excess_days} excess days.")
                     data["days"] = data["days"][:req.totalDays]
                 
-                # Update the totalDays in the data to reflect actual days
+                # Ensure totalDays matches the actual number of days
                 data["totalDays"] = len(data["days"])
                 
-                # Add warning to the response data if it exists
-                if warning_message:
-                    data["warning"] = warning_message
+                # Add warning to the response data
+                data["warning"] = f"Day count was adjusted from {current_days} to {req.totalDays} to match your request."
             
             # No need to check for duplicate links since we're not using external links
             
@@ -810,7 +969,13 @@ class ChatWrapper:
                         "The generated plan has invalid day data. Please try again."
                     )
                 d.setdefault("id", uuid.uuid4().hex[:8])
-                d.setdefault("dayNumber", i)
+                # Ensure dayNumber is correct and sequential
+                expected_day_num = i
+                if d.get("dayNumber") != expected_day_num:
+                    print(f"Warning: Day {i} has incorrect dayNumber {d.get('dayNumber')}, correcting to {expected_day_num}")
+                    d["dayNumber"] = expected_day_num
+                else:
+                    d.setdefault("dayNumber", expected_day_num)
                 
                 if "tasks" not in d or not isinstance(d.get("tasks"), list):
                     raise PlannerGenerationError(
@@ -904,10 +1069,33 @@ class ChatWrapper:
         except ValidationError as ve:
             # Format validation errors
             errors = "; ".join([f"{'.'.join(str(loc) for loc in err['loc'])}: {err['msg']}" for err in ve.errors()])
-            raise PlannerGenerationError(
-                f"Pydantic validation error: {errors}",
-                "The generated plan doesn't meet quality standards. Please try again with different parameters."
-            )
+            print(f"Warning: Pydantic validation error: {errors}")
+            print("Attempting to fix validation issues and generate fallback plan...")
+            
+            # Try to fix common validation issues
+            try:
+                # Ensure all required fields are present
+                data.setdefault("planName", req.planName)
+                data.setdefault("category", req.category)
+                data.setdefault("totalDays", req.totalDays)
+                data.setdefault("createdAt", {"seconds": int(time.time()), "nanoseconds": 0})
+                
+                # If days is still missing or invalid, use fallback
+                if "days" not in data or not isinstance(data.get("days"), list) or len(data["days"]) == 0:
+                    print("Days field is missing or invalid, using fallback generation...")
+                    fallback_data = self._generate_fallback_plan(req)
+                    data.update(fallback_data)
+                
+                # Try validation again
+                validated = PlannerContent(**data)
+                return validated
+                
+            except Exception as fix_error:
+                print(f"Could not fix validation issues: {fix_error}")
+                # Last resort: return a basic fallback plan
+                fallback_data = self._generate_fallback_plan(req)
+                validated = PlannerContent(**fallback_data)
+                return validated
 
 
 # =========================
