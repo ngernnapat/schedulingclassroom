@@ -240,52 +240,12 @@ class ChatWrapper:
         invalid_patterns = [
             'example.com', 'placeholder', 'test.com', 'dummy.com',
             'bit.ly', 'tinyurl.com', 'short.link', 'goo.gl',
-            'localhost', '127.0.0.1', '0.0.0.0'
+            'localhost', '127.0.0.1', '0.0.0.0', 'example.org',
+            'test.org', 'dummy.org', 'sample.com', 'demo.com'
         ]
         
         if any(pattern in link.lower() for pattern in invalid_patterns):
             return False
-        
-        # Category-specific domain validation
-        approved_domains = {
-            "learning": [
-                "coursera.org", "khanacademy.org", "udemy.com", "edx.org", 
-                "codecademy.com", "skillshare.com", "linkedin.com", "youtube.com",
-                "mit.edu", "stanford.edu", "harvard.edu", "berkeley.edu"
-            ],
-            "exercise": [
-                "nike.com", "fitnessblender.com", "darebee.com", "myfitnesspal.com",
-                "bodybuilding.com", "menshealth.com", "womenshealthmag.com", 
-                "acefitness.org", "verywellfit.com", "youtube.com"
-            ],
-            "travel": [
-                "tripadvisor.com", "rome2rio.com", "booking.com", "wikitravel.org",
-                "lonelyplanet.com", "nationalgeographic.com", "travelandleisure.com",
-                "cntraveler.com", "airbnb.com", "expedia.com"
-            ],
-            "finance": [
-                "investopedia.com", "nerdwallet.com", "bankrate.com", "mint.com",
-                "yahoo.com", "marketwatch.com", "cnbc.com", "forbes.com",
-                "money.cnn.com", "fidelity.com", "vanguard.com"
-            ],
-            "health": [
-                "mayoclinic.org", "healthline.com", "webmd.com", "medlineplus.gov",
-                "cdc.gov", "who.int", "harvard.edu", "clevelandclinic.org",
-                "hopkinsmedicine.org", "nih.gov"
-            ],
-            "personal_development": [
-                "mindtools.com", "ted.com", "psychologytoday.com", "hbr.org",
-                "lifehack.org", "zenhabits.net", "jamesclear.com", "charlesduhigg.com",
-                "gretchenrubin.com", "youtube.com"
-            ],
-            "other": [
-                "wikipedia.org", "youtube.com", "reddit.com", "medium.com",
-                "quora.com", "stackoverflow.com", "github.com"
-            ]
-        }
-        
-        # Check if link contains an approved domain for the category
-        category_domains = approved_domains.get(category, approved_domains["other"])
         
         # Extract domain from URL
         try:
@@ -297,29 +257,136 @@ class ChatWrapper:
             if domain.startswith('www.'):
                 domain = domain[4:]
             
-            # Check if domain is in approved list
-            return any(approved_domain in domain for approved_domain in category_domains)
+            # More comprehensive and flexible domain validation
+            # Allow common educational, government, and reputable domains
+            trusted_domains = [
+                # Educational institutions
+                '.edu', '.ac.uk', '.ac.jp', '.ac.kr', '.ac.in',
+                # Government domains
+                '.gov', '.gov.uk', '.gov.au', '.gov.ca', '.gov.in',
+                # International organizations
+                '.org', '.int', '.un.org', '.who.int', '.unicef.org',
+                # Major platforms
+                'youtube.com', 'vimeo.com', 'ted.com', 'khanacademy.org',
+                'coursera.org', 'edx.org', 'udemy.com', 'skillshare.com',
+                'codecademy.com', 'freecodecamp.org', 'w3schools.com',
+                'stackoverflow.com', 'github.com', 'gitlab.com',
+                # News and reference
+                'wikipedia.org', 'britannica.com', 'merriam-webster.com',
+                'dictionary.com', 'thesaurus.com', 'oxford.com',
+                # Health and medical
+                'mayoclinic.org', 'healthline.com', 'webmd.com',
+                'medlineplus.gov', 'cdc.gov', 'nih.gov', 'who.int',
+                'clevelandclinic.org', 'hopkinsmedicine.org',
+                # Finance
+                'investopedia.com', 'nerdwallet.com', 'bankrate.com',
+                'mint.com', 'yahoo.com', 'marketwatch.com', 'cnbc.com',
+                'forbes.com', 'bloomberg.com', 'reuters.com',
+                # Fitness and wellness
+                'nike.com', 'adidas.com', 'fitnessblender.com', 'darebee.com',
+                'myfitnesspal.com', 'bodybuilding.com', 'acefitness.org',
+                'verywellfit.com', 'menshealth.com', 'womenshealthmag.com',
+                # Travel
+                'tripadvisor.com', 'booking.com', 'expedia.com', 'airbnb.com',
+                'lonelyplanet.com', 'nationalgeographic.com', 'rome2rio.com',
+                # Personal development
+                'mindtools.com', 'psychologytoday.com', 'hbr.org',
+                'lifehack.org', 'zenhabits.net', 'jamesclear.com',
+                'charlesduhigg.com', 'gretchenrubin.com',
+                # General platforms
+                'medium.com', 'quora.com', 'reddit.com', 'linkedin.com',
+                'twitter.com', 'facebook.com', 'instagram.com',
+                # Technology
+                'mozilla.org', 'w3.org', 'ietf.org', 'apache.org',
+                'python.org', 'nodejs.org', 'reactjs.org', 'vuejs.org',
+                'angular.io', 'typescript.org', 'developer.mozilla.org'
+            ]
+            
+            # Check if domain matches any trusted domain pattern
+            for trusted_domain in trusted_domains:
+                if trusted_domain.startswith('.'):
+                    # TLD or subdomain pattern (e.g., .edu, .gov)
+                    if domain.endswith(trusted_domain):
+                        return True
+                else:
+                    # Exact domain match (e.g., youtube.com)
+                    if domain == trusted_domain or domain.endswith('.' + trusted_domain):
+                        return True
+            
+            # Additional category-specific validation for more targeted domains
+            category_specific_domains = {
+                "learning": [
+                    'udacity.com', 'pluralsight.com', 'lynda.com', 'treehouse.com',
+                    'datacamp.com', 'kaggle.com', 'leetcode.com', 'hackerrank.com',
+                    'codewars.com', 'exercism.io', 'scrimba.com', 'egghead.io'
+                ],
+                "exercise": [
+                    'peloton.com', 'strava.com', 'runtastic.com', 'mapmyrun.com',
+                    'myfitnesspal.com', 'cronometer.com', 'fitbit.com', 'garmin.com'
+                ],
+                "finance": [
+                    'mint.com', 'ynab.com', 'personalcapital.com', 'wealthfront.com',
+                    'betterment.com', 'robinhood.com', 'etrade.com', 'schwab.com'
+                ],
+                "health": [
+                    'myfitnesspal.com', 'cronometer.com', 'loseit.com', 'sparkpeople.com',
+                    'fitbit.com', 'garmin.com', 'apple.com/health', 'google.com/fit'
+                ]
+            }
+            
+            # Check category-specific domains
+            if category in category_specific_domains:
+                for cat_domain in category_specific_domains[category]:
+                    if domain == cat_domain or domain.endswith('.' + cat_domain):
+                        return True
+            
+            # Fallback: If no trusted domain matches, use more permissive validation
+            # Allow any domain that doesn't match invalid patterns and has a reasonable structure
+            if len(domain) > 3 and '.' in domain and not any(bad in domain for bad in ['localhost', '127.0.0.1', 'test', 'dummy', 'example', 'placeholder']):
+                # Additional check: ensure it's not a suspicious domain
+                suspicious_patterns = ['bit.ly', 'tinyurl', 'short.link', 'goo.gl', 't.co']
+                if not any(pattern in domain for pattern in suspicious_patterns):
+                    return True
+            
+            return False
             
         except Exception:
             return False
 
+    def _enhance_task_description(self, task_text: str, category: str) -> str:
+        """Enhance task description to be more detailed and actionable"""
+        if not task_text or len(task_text.strip()) < 10:
+            # Provide category-specific default detailed tasks
+            enhanced_tasks = {
+                "learning": "Study session: Review previous material for 15 minutes, then practice new concepts with hands-on exercises. Take notes on key points and create a summary of what you learned.",
+                "exercise": "Physical activity: Start with 5-minute warm-up (light stretching or walking), perform main exercise for 20 minutes, finish with 5-minute cool-down. Focus on proper form and breathing.",
+                "travel": "Travel planning: Research your destination, check weather conditions, create a packing list, and plan your daily itinerary. Consider transportation options and local customs.",
+                "finance": "Financial review: Check your bank account balance, review recent transactions, update your budget spreadsheet, and set financial goals for the week ahead.",
+                "health": "Wellness check: Take your vital signs (if applicable), review your nutrition for the day, plan healthy meals, and schedule any necessary medical appointments.",
+                "personal_development": "Self-reflection: Spend 10 minutes journaling about your goals, review your progress, identify areas for improvement, and plan your next steps.",
+                "other": "Task completion: Break down the task into smaller steps, set a timer for focused work, take breaks as needed, and track your progress throughout the session."
+            }
+            return enhanced_tasks.get(category, enhanced_tasks["other"])
+        
+        # If task exists but is too short, enhance it
+        enhanced_text = task_text.strip()
+        
+        # Add category-specific enhancements
+        if category == "learning" and len(enhanced_text) < 30:
+            enhanced_text += " Focus on understanding the concepts, practice with examples, and take notes on key points."
+        elif category == "exercise" and len(enhanced_text) < 30:
+            enhanced_text += " Start with a warm-up, maintain proper form throughout, and finish with a cool-down. Stay hydrated and listen to your body."
+        elif category == "finance" and len(enhanced_text) < 30:
+            enhanced_text += " Review your current financial situation, track your progress, and make adjustments as needed."
+        elif category == "health" and len(enhanced_text) < 30:
+            enhanced_text += " Pay attention to your body's signals, maintain proper nutrition, and consult healthcare professionals when needed."
+        
+        return enhanced_text
+
     def _check_duplicate_links(self, days: List[Dict]) -> List[str]:
         """Check for duplicate links within the plan and return list of duplicates"""
-        all_links = []
-        duplicates = []
-        
-        for day in days:
-            for task in day.get("tasks", []):
-                link = task.get("link")
-                if link and isinstance(link, str):
-                    link = link.strip()
-                    if link:
-                        if link in all_links:
-                            duplicates.append(link)
-                        else:
-                            all_links.append(link)
-        
-        return duplicates
+        # Since we're not using links anymore, return empty list
+        return []
 
     @staticmethod
     def _system_prompt() -> str:
@@ -335,36 +402,27 @@ class ChatWrapper:
             "- personal_development: goal setting, productivity, mindfulness, self-reflection practices.\n"
             "- other: flexible structure based on user's specific needs and goals.\n"
             "Rules:\n"
-            "1) Keep each day practical (3-6 tasks). 2) Add brief tips when helpful. 3) Titles are short and motivating.\n"
+            "1) Keep each day practical (2-4 tasks, which may include details from the detailPrompt). 2) Add brief tips when helpful. 3) Titles are short and motivating.\n"
             "4) Never invent unsafe or extreme advice; prefer safe defaults.\n"
             "5) CRITICAL: Output MUST be valid JSON matching the exact schema provided.\n"
             "6) Include ALL required fields: planName, category, totalDays, createdAt, days.\n"
             "7) The 'days' field MUST be an array with exactly the requested number of days.\n"
             "8) TIME ALLOCATION: If minutesPerDay is specified, you MUST ensure that the sum of all task durations (duration_min) for each day equals exactly the specified minutesPerDay. Each task must have a duration_min value when minutesPerDay is provided."
             "9) You MUST generate exactly the requested number of days - no more, no less. The number of days in the generated plan MUST match totalDays."
-            "10) MANDATORY LINK REQUIREMENT: EVERY single task MUST include a meaningful, helpful link or resource in the 'link' field. This field is ABSOLUTELY REQUIRED and cannot be empty, null, or contain placeholder text.\n"
-            "   LINK VALIDATION RULES:\n"
-            "   ✓ Must be a real, accessible URL from trusted, reputable sources\n"
-            "   ✓ Must point to a specific page/article/video that directly helps with the task\n"
-            "   ✓ Each task requires a unique link - no duplicates within the plan\n"
-            "   ✓ Links must be current and from authoritative sources\n"
-            "   ✓ No shortened URLs, placeholder links, or generic homepage links\n"
-            "   ✓ Must include the full URL with https:// protocol\n"
+            "10) DETAILED TASK INSTRUCTIONS: Each task MUST include comprehensive, actionable instructions that users can follow without external links. Focus on providing clear, step-by-step guidance within the task description itself.\n"
+            "   TASK QUALITY REQUIREMENTS:\n"
+            "   ✓ Provide specific, actionable steps for each task\n"
+            "   ✓ Include relevant tips, techniques, or methods\n"
+            "   ✓ Give clear success criteria or what to expect\n"
+            "   ✓ Include safety considerations where applicable\n"
+            "   ✓ Make tasks self-contained and complete\n"
+            "   ✓ Use the 'note' field for additional helpful details\n"
             "   \n"
-            "   APPROVED SOURCE DOMAINS BY CATEGORY:\n"
-            "   📚 Learning: coursera.org, khanacademy.org, udemy.com, edx.org, codecademy.com, skillshare.com, linkedin.com/learning, youtube.com/education, youtube.com, mit.edu, stanford.edu\n"
-            "   💪 Exercise: nike.com/training, fitnessblender.com, darebee.com, myfitnesspal.com, bodybuilding.com, menshealth.com, womenshealthmag.com, acefitness.org, verywellfit.com, youtube.com\n"
-            "   ✈️ Travel: tripadvisor.com, rome2rio.com, booking.com, wikitravel.org, lonelyplanet.com, nationalgeographic.com/travel, travelandleisure.com, cntraveler.com, youtube.com\n"
-            "   💰 Finance: investopedia.com, nerdwallet.com, bankrate.com, mint.com, yahoo.com/finance, marketwatch.com, cnbc.com, forbes.com/finance, money.cnn.com, youtube.com\n"
-            "   🏥 Health: mayoclinic.org, healthline.com, webmd.com, medlineplus.gov, cdc.gov, who.int, harvard.edu/health, clevelandclinic.org, hopkinsmedicine.org, youtube.com\n"
-            "   🧠 Personal Development: mindtools.com, ted.com, psychologytoday.com, hbr.org, lifehack.org, zenhabits.net, jamesclear.com, charlesduhigg.com, gretchenrubin.com, youtube.com\n"
-            "   \n"
-            "   LINK QUALITY EXAMPLES:\n"
-            "   ✅ GOOD: 'https://www.coursera.org/learn/python-programming' (specific course)\n"
-            "   ✅ GOOD: 'https://www.nike.com/training/guides/beginner-workout-plan' (specific guide)\n"
-            "   ❌ BAD: 'https://www.coursera.org' (homepage only)\n"
-            "   ❌ BAD: 'https://bit.ly/abc123' (shortened URL)\n"
-            "   ❌ BAD: 'https://example.com' (placeholder)\n"
+            "   TASK DESCRIPTION EXAMPLES:\n"
+            "   ✅ GOOD: 'Practice Python variables: Create 5 different variable types (string, integer, float, boolean, list). Write a simple program that uses each type and prints the results. Focus on proper naming conventions and data type understanding.'\n"
+            "   ✅ GOOD: 'Morning cardio workout: Do 20 minutes of moderate-intensity exercise (brisk walking, jogging, or cycling). Start with 5-minute warm-up, maintain steady pace for 15 minutes, finish with 5-minute cool-down. Monitor your heart rate and stay hydrated.'\n"
+            "   ❌ BAD: 'Learn Python' (too vague)\n"
+            "   ❌ BAD: 'Do some exercise' (not specific enough)\n"
            
         )
 
@@ -743,15 +801,7 @@ class ChatWrapper:
                 if warning_message:
                     data["warning"] = warning_message
             
-            # Check for duplicate links across the entire plan
-            duplicate_links = self._check_duplicate_links(data.get("days", []))
-            if duplicate_links:
-                print(f"Warning: Found duplicate links in the plan: {duplicate_links}")
-                # Add warning about duplicates but don't fail the generation
-                if "warning" in data:
-                    data["warning"] += f" Note: Some tasks share the same resource links."
-                else:
-                    data["warning"] = "Some tasks share the same resource links."
+            # No need to check for duplicate links since we're not using external links
             
             for i, d in enumerate(data.get("days", []), start=1):
                 if not isinstance(d, dict):
@@ -783,19 +833,14 @@ class ChatWrapper:
                     t.setdefault("id", uuid.uuid4().hex[:8])
                     t.setdefault("done", False)
                     
-                    # Validate link field - if invalid, set to None
-                    link = t.get("link", "")
-                    if not link or not isinstance(link, str):
-                        # If link is missing or invalid, set to None
-                        t["link"] = None
-                    else:
-                        # Validate link format and quality
-                        link = link.strip()
-                        if not self._validate_task_link(link, req.category):
-                            # If link doesn't meet quality requirements, set to None
-                            t["link"] = None
-                        else:
-                            t["link"] = link
+                    # Set link field to None since we're not using external links
+                    t["link"] = None
+                    
+                    # Validate task text quality - ensure it's detailed and actionable
+                    task_text = t.get("text", "")
+                    if not task_text or len(task_text.strip()) < 20:
+                        # If task is too short or vague, provide a more detailed version
+                        t["text"] = self._enhance_task_description(task_text, req.category)
                 
                 # Validate minutesPerDay constraint if specified - be more flexible
                 if req.minutesPerDay:
