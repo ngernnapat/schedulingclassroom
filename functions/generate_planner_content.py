@@ -175,6 +175,17 @@ class PlannerGenerationError(Exception):
         super().__init__(message)
 
 @dataclass
+class PlanChunk:
+    """Represents a logical segment of a larger plan"""
+    start_day: int
+    end_day: int
+    phase_name: str
+    focus_area: str
+    progression_level: str  # "beginner", "intermediate", "advanced", "mastery"
+    key_goals: List[str]
+    special_instructions: str
+
+@dataclass
 class ChatWrapperConfig:
     model: str = "gpt-4o"
     temperature: float = 0.7
@@ -188,9 +199,10 @@ class ChatWrapper:
     Enhanced wrapper around OpenAI Chat Completions API that:
     - Sets a strong system prompt for behavior
     - Enforces a JSON schema for our PlannerContent
-    - Supports chunked generation for large plans (60-90 days)
+    - Supports intelligent chunked generation for large plans (60-90 days)
     - Includes retry mechanisms and error handling
     - Handles rate limiting and exponential backoff
+    - Analyzes plan requirements and creates logical, progressive segments
     """
     def __init__(self, config: ChatWrapperConfig):
         self.config = config
@@ -388,87 +400,388 @@ class ChatWrapper:
         # Since we're not using links anymore, return empty list
         return []
 
-    def _generate_fallback_plan(self, req: GeneratePlannerRequest) -> dict:
-        """Generate a basic fallback plan when AI response fails"""
-        print(f"Generating fallback plan for {req.totalDays} days, category: {req.category}")
-        
-        fallback_days = []
-        for day_num in range(1, req.totalDays + 1):
-            # Create category-specific content
-            if req.category == "learning":
-                title = f"Day {day_num} - Learning Session"
-                summary = "Continue your learning journey with focused study and practice."
-                task1_text = "Study session: Review previous material and learn new concepts. Take notes and practice with examples."
-                task2_text = "Practice and apply: Work on exercises or projects to reinforce your learning."
-            elif req.category == "exercise":
-                title = f"Day {day_num} - Workout Session"
-                summary = "Maintain your fitness routine with a balanced workout."
-                task1_text = "Warm-up and main exercise: Start with 5-10 minutes of light activity, then perform your main workout."
-                task2_text = "Cool-down and recovery: Finish with stretching and light movement to aid recovery."
-            elif req.category == "finance":
-                title = f"Day {day_num} - Financial Planning"
-                summary = "Continue building your financial knowledge and habits."
-                task1_text = "Financial review: Check your accounts, review recent transactions, and update your budget."
-                task2_text = "Learning and planning: Study financial concepts or plan your next financial goals."
-            elif req.category == "health":
-                title = f"Day {day_num} - Wellness Focus"
-                summary = "Prioritize your health and well-being today."
-                task1_text = "Health check: Monitor your vital signs, review your nutrition, and plan healthy meals."
-                task2_text = "Wellness activity: Engage in stress management, meditation, or other wellness practices."
-            elif req.category == "personal_development":
-                title = f"Day {day_num} - Growth Session"
-                summary = "Focus on personal growth and self-improvement."
-                task1_text = "Self-reflection: Journal about your goals, progress, and areas for improvement."
-                task2_text = "Skill development: Work on a specific skill or habit that contributes to your growth."
-            elif req.category == "travel":
-                title = f"Day {day_num} - Travel Planning"
-                summary = "Continue planning and preparing for your travel goals."
-                task1_text = "Research and planning: Research destinations, activities, or logistics for your trip."
-                task2_text = "Preparation: Work on bookings, packing lists, or other travel preparations."
-            else:
-                title = f"Day {day_num} - Practice Session"
-                summary = "Continue working on your goals with focused practice."
-                task1_text = "Main activity: Spend time on your primary goal or skill development."
-                task2_text = "Review and plan: Reflect on your progress and plan your next steps."
-            
-            fallback_day = {
-                "id": uuid.uuid4().hex[:8],
-                "dayNumber": day_num,
-                "title": title,
-                "summary": summary,
-                "tasks": [
-                    {
-                        "id": uuid.uuid4().hex[:8],
-                        "text": task1_text,
-                        "done": False,
-                        "duration_min": req.minutesPerDay // 2 if req.minutesPerDay else None,
-                        "note": "Customize this task based on your specific needs and progress",
-                        "link": None
-                    },
-                    {
-                        "id": uuid.uuid4().hex[:8],
-                        "text": task2_text,
-                        "done": False,
-                        "duration_min": req.minutesPerDay // 2 if req.minutesPerDay else None,
-                        "note": "Adapt this task to your current level and goals",
-                        "link": None
-                    }
-                ],
-                "tips": "Stay consistent with your practice and adjust your approach based on what works best for you."
-            }
-            fallback_days.append(fallback_day)
-        
-        return {
-            "planName": req.planName,
-            "category": req.category,
-            "totalDays": req.totalDays,
-            "minutesPerDay": req.minutesPerDay,
-            "coverImage": None,
-            "coverImageUrl": None,
-            "createdAt": {"seconds": int(time.time()), "nanoseconds": 0},
-            "days": fallback_days,
-            "warning": "Generated a basic plan structure due to AI response issues. You can customize the tasks as needed."
+    def _analyze_plan_requirements(self, req: GeneratePlannerRequest) -> Dict[str, Any]:
+        """Analyze the plan requirements to determine optimal chunking strategy"""
+        analysis = {
+            "complexity": "simple",
+            "progression_type": "linear",
+            "optimal_chunk_size": 7,
+            "phases": [],
+            "special_considerations": []
         }
+        
+        # Analyze based on category and total days
+        if req.totalDays <= 7:
+            analysis["complexity"] = "simple"
+            analysis["optimal_chunk_size"] = req.totalDays
+        elif req.totalDays <= 14:
+            analysis["complexity"] = "moderate"
+            analysis["optimal_chunk_size"] = 7
+        elif req.totalDays <= 30:
+            analysis["complexity"] = "moderate"
+            analysis["optimal_chunk_size"] = 10
+        else:
+            analysis["complexity"] = "complex"
+            analysis["optimal_chunk_size"] = 15
+        
+        # Category-specific analysis
+        if req.category == "learning":
+            if req.totalDays >= 30:
+                analysis["progression_type"] = "spiral"
+                analysis["phases"] = [
+                    {"name": "Foundation", "focus": "Basic concepts and fundamentals"},
+                    {"name": "Practice", "focus": "Hands-on application and skill building"},
+                    {"name": "Mastery", "focus": "Advanced techniques and real-world projects"}
+                ]
+            else:
+                analysis["progression_type"] = "linear"
+                analysis["phases"] = [
+                    {"name": "Learning", "focus": "Progressive skill development"}
+                ]
+        
+        elif req.category == "exercise":
+            if req.totalDays >= 30:
+                analysis["progression_type"] = "periodized"
+                analysis["phases"] = [
+                    {"name": "Adaptation", "focus": "Building base fitness and movement patterns"},
+                    {"name": "Progression", "focus": "Increasing intensity and complexity"},
+                    {"name": "Peak", "focus": "Maximum performance and advanced techniques"}
+                ]
+            else:
+                analysis["progression_type"] = "linear"
+                analysis["phases"] = [
+                    {"name": "Fitness", "focus": "Progressive workout development"}
+                ]
+        
+        elif req.category == "travel":
+            analysis["progression_type"] = "thematic"
+            if req.totalDays >= 21:
+                analysis["phases"] = [
+                    {"name": "Planning", "focus": "Research, booking, and preparation"},
+                    {"name": "Preparation", "focus": "Final preparations and logistics"},
+                    {"name": "Execution", "focus": "Travel activities and experiences"}
+                ]
+            else:
+                analysis["phases"] = [
+                    {"name": "Travel", "focus": "Planning and preparation activities"}
+                ]
+        
+        elif req.category == "finance":
+            analysis["progression_type"] = "foundational"
+            if req.totalDays >= 30:
+                analysis["phases"] = [
+                    {"name": "Assessment", "focus": "Current financial situation analysis"},
+                    {"name": "Planning", "focus": "Budget creation and goal setting"},
+                    {"name": "Implementation", "focus": "Active financial management"}
+                ]
+            else:
+                analysis["phases"] = [
+                    {"name": "Finance", "focus": "Financial planning and management"}
+                ]
+        
+        elif req.category == "health":
+            analysis["progression_type"] = "holistic"
+            if req.totalDays >= 30:
+                analysis["phases"] = [
+                    {"name": "Awareness", "focus": "Health assessment and habit tracking"},
+                    {"name": "Implementation", "focus": "Building healthy routines"},
+                    {"name": "Optimization", "focus": "Fine-tuning and advanced wellness"}
+                ]
+            else:
+                analysis["phases"] = [
+                    {"name": "Wellness", "focus": "Health and wellness development"}
+                ]
+        
+        elif req.category == "personal_development":
+            analysis["progression_type"] = "transformational"
+            if req.totalDays >= 30:
+                analysis["phases"] = [
+                    {"name": "Self-Discovery", "focus": "Understanding yourself and your goals"},
+                    {"name": "Skill Building", "focus": "Developing new capabilities and habits"},
+                    {"name": "Integration", "focus": "Applying skills in real-world situations"}
+                ]
+            else:
+                analysis["phases"] = [
+                    {"name": "Growth", "focus": "Personal development and improvement"}
+                ]
+        
+        else:  # "other" category
+            analysis["progression_type"] = "custom"
+            analysis["phases"] = [
+                {"name": "Development", "focus": "Custom plan based on user requirements"}
+            ]
+        
+        # Analyze detail prompt for special considerations
+        if req.detailPrompt:
+            detail_lower = req.detailPrompt.lower()
+            if any(word in detail_lower for word in ["beginner", "basic", "intro"]):
+                analysis["special_considerations"].append("beginner_friendly")
+            if any(word in detail_lower for word in ["advanced", "expert", "professional"]):
+                analysis["special_considerations"].append("advanced_level")
+            if any(word in detail_lower for word in ["intensive", "challenging", "difficult"]):
+                analysis["special_considerations"].append("high_intensity")
+            if any(word in detail_lower for word in ["flexible", "adaptable", "customizable"]):
+                analysis["special_considerations"].append("flexible_approach")
+        
+        return analysis
+
+    def _create_intelligent_chunks(self, req: GeneratePlannerRequest, analysis: Dict[str, Any]) -> List[PlanChunk]:
+        """Create intelligent, progressive chunks based on plan analysis"""
+        chunks = []
+        total_days = req.totalDays
+        optimal_chunk_size = analysis["optimal_chunk_size"]
+        
+        # Calculate number of chunks needed
+        num_chunks = (total_days + optimal_chunk_size - 1) // optimal_chunk_size
+        
+        # Adjust chunk sizes to distribute days evenly
+        base_chunk_size = total_days // num_chunks
+        remainder = total_days % num_chunks
+        
+        current_day = 1
+        phases = analysis["phases"]
+        
+        for i in range(num_chunks):
+            # Calculate chunk size (distribute remainder across first chunks)
+            chunk_size = base_chunk_size + (1 if i < remainder else 0)
+            end_day = current_day + chunk_size - 1
+            
+            # Determine phase and progression level
+            if len(phases) > 0:
+                phase_idx = min(i, len(phases) - 1)
+                phase = phases[phase_idx]
+                phase_name = phase["name"]
+                focus_area = phase["focus"]
+            else:
+                phase_name = f"Phase {i + 1}"
+                focus_area = f"Continued development in {req.category}"
+            
+            # Determine progression level
+            if num_chunks == 1:
+                progression_level = "beginner"
+            elif i == 0:
+                progression_level = "beginner"
+            elif i == num_chunks - 1:
+                progression_level = "advanced"
+            else:
+                progression_level = "intermediate"
+            
+            # Create key goals for this chunk
+            key_goals = self._generate_chunk_goals(req, phase_name, progression_level, i + 1, num_chunks)
+            
+            # Create special instructions
+            special_instructions = self._generate_chunk_instructions(
+                req, phase_name, progression_level, current_day, end_day, i + 1, num_chunks
+            )
+            
+            chunk = PlanChunk(
+                start_day=current_day,
+                end_day=end_day,
+                phase_name=phase_name,
+                focus_area=focus_area,
+                progression_level=progression_level,
+                key_goals=key_goals,
+                special_instructions=special_instructions
+            )
+            
+            chunks.append(chunk)
+            current_day = end_day + 1
+        
+        return chunks
+
+    def _generate_chunk_goals(self, req: GeneratePlannerRequest, phase_name: str, 
+                            progression_level: str, chunk_num: int, total_chunks: int) -> List[str]:
+        """Generate specific goals for a chunk based on its phase and progression level"""
+        goals = []
+        
+        if req.category == "learning":
+            if progression_level == "beginner":
+                goals = [
+                    "Establish foundational knowledge and basic skills",
+                    "Build confidence through guided practice",
+                    "Develop consistent learning habits"
+                ]
+            elif progression_level == "intermediate":
+                goals = [
+                    "Apply knowledge in practical scenarios",
+                    "Build upon previous learning with new concepts",
+                    "Develop problem-solving skills"
+                ]
+            else:  # advanced
+                goals = [
+                    "Master advanced techniques and concepts",
+                    "Create original projects or applications",
+                    "Develop expertise and teaching ability"
+                ]
+        
+        elif req.category == "exercise":
+            if progression_level == "beginner":
+                goals = [
+                    "Build basic fitness foundation",
+                    "Learn proper form and technique",
+                    "Establish consistent workout routine"
+                ]
+            elif progression_level == "intermediate":
+                goals = [
+                    "Increase workout intensity and complexity",
+                    "Develop strength and endurance",
+                    "Master advanced movement patterns"
+                ]
+            else:  # advanced
+                goals = [
+                    "Achieve peak performance levels",
+                    "Master advanced training techniques",
+                    "Develop specialized skills"
+                ]
+        
+        elif req.category == "travel":
+            if progression_level == "beginner":
+                goals = [
+                    "Research destinations and create itinerary",
+                    "Plan logistics and make bookings",
+                    "Prepare travel documents and essentials"
+                ]
+            elif progression_level == "intermediate":
+                goals = [
+                    "Finalize travel arrangements",
+                    "Prepare for cultural experiences",
+                    "Plan activities and experiences"
+                ]
+            else:  # advanced
+                goals = [
+                    "Execute travel plans and activities",
+                    "Adapt to local conditions and culture",
+                    "Document and reflect on experiences"
+                ]
+        
+        elif req.category == "finance":
+            if progression_level == "beginner":
+                goals = [
+                    "Assess current financial situation",
+                    "Create basic budget and track expenses",
+                    "Establish financial goals and priorities"
+                ]
+            elif progression_level == "intermediate":
+                goals = [
+                    "Implement budgeting and saving strategies",
+                    "Learn about investment basics",
+                    "Optimize spending and reduce debt"
+                ]
+            else:  # advanced
+                goals = [
+                    "Advanced investment and wealth building",
+                    "Tax optimization and financial planning",
+                    "Long-term financial security planning"
+                ]
+        
+        elif req.category == "health":
+            if progression_level == "beginner":
+                goals = [
+                    "Assess current health and wellness",
+                    "Establish healthy daily routines",
+                    "Track nutrition and exercise habits"
+                ]
+            elif progression_level == "intermediate":
+                goals = [
+                    "Optimize nutrition and fitness routines",
+                    "Develop stress management techniques",
+                    "Improve sleep and recovery habits"
+                ]
+            else:  # advanced
+                goals = [
+                    "Fine-tune health and wellness systems",
+                    "Develop advanced wellness practices",
+                    "Maintain long-term health optimization"
+                ]
+        
+        elif req.category == "personal_development":
+            if progression_level == "beginner":
+                goals = [
+                    "Self-assessment and goal setting",
+                    "Develop self-awareness and reflection habits",
+                    "Build foundational personal skills"
+                ]
+            elif progression_level == "intermediate":
+                goals = [
+                    "Develop advanced personal skills",
+                    "Improve relationships and communication",
+                    "Build productivity and time management systems"
+                ]
+            else:  # advanced
+                goals = [
+                    "Master advanced personal development techniques",
+                    "Develop leadership and mentoring skills",
+                    "Create lasting positive change"
+                ]
+        
+        else:  # "other" category
+            goals = [
+                f"Progress in {req.category} development",
+                f"Build skills and knowledge in {req.category}",
+                f"Achieve specific goals in {req.category}"
+            ]
+        
+        return goals
+
+    def _generate_chunk_instructions(self, req: GeneratePlannerRequest, phase_name: str,
+                                   progression_level: str, start_day: int, end_day: int,
+                                   chunk_num: int, total_chunks: int) -> str:
+        """Generate specific instructions for a chunk to ensure continuity and progression"""
+        instructions = []
+        
+        # Base context
+        instructions.append(f"This is {phase_name} (Days {start_day}-{end_day}) of a {req.totalDays}-day {req.category} plan.")
+        
+        # Progression context
+        if chunk_num > 1:
+            instructions.append(f"This builds upon the previous {chunk_num - 1} phase(s) and should reference previous learning/progress.")
+        
+        if chunk_num < total_chunks:
+            instructions.append(f"This prepares for the upcoming {total_chunks - chunk_num} phase(s) and should set up future development.")
+        
+        # Progression level specific instructions
+        if progression_level == "beginner":
+            instructions.append("Focus on building strong foundations, clear explanations, and confidence-building activities.")
+            instructions.append("Include more detailed instructions and safety considerations.")
+        elif progression_level == "intermediate":
+            instructions.append("Build upon previous knowledge with increased complexity and practical applications.")
+            instructions.append("Include problem-solving and critical thinking elements.")
+        else:  # advanced
+            instructions.append("Focus on mastery, advanced techniques, and real-world applications.")
+            instructions.append("Include creative challenges and independent project work.")
+        
+        # Category-specific instructions
+        if req.category == "learning":
+            instructions.append("Ensure each day builds logically on the previous day's content.")
+            instructions.append("Include review and practice opportunities to reinforce learning.")
+        elif req.category == "exercise":
+            instructions.append("Include proper warm-up and cool-down for each day.")
+            instructions.append("Ensure progressive overload while maintaining safety.")
+        elif req.category == "travel":
+            instructions.append("Consider practical logistics and realistic timelines.")
+            instructions.append("Include cultural awareness and local customs.")
+        elif req.category == "finance":
+            instructions.append("Include practical, actionable financial tasks.")
+            instructions.append("Ensure tasks are relevant to the user's financial situation.")
+        elif req.category == "health":
+            instructions.append("Focus on sustainable, evidence-based health practices.")
+            instructions.append("Include both physical and mental wellness aspects.")
+        elif req.category == "personal_development":
+            instructions.append("Include self-reflection and journaling opportunities.")
+            instructions.append("Focus on practical application of personal development concepts.")
+        
+        # Special considerations from analysis
+        if req.detailPrompt:
+            instructions.append(f"Consider these specific requirements: {req.detailPrompt}")
+        
+        return " ".join(instructions)
+
+    def _handle_generation_failure(self, req: GeneratePlannerRequest, error_context: str) -> None:
+        """Handle generation failures with proper error reporting instead of fallback plans"""
+        error_message = f"Failed to generate {req.totalDays}-day {req.category} plan: {error_context}"
+        user_message = f"We couldn't generate your {req.totalDays}-day {req.category} plan. Please try again with fewer days or simpler requirements."
+        
+        raise PlannerGenerationError(error_message, user_message)
 
     @staticmethod
     def _system_prompt() -> str:
@@ -509,29 +822,33 @@ class ChatWrapper:
         )
 
     def generate_chunked(self, req: GeneratePlannerRequest) -> PlannerContent:
-        """Generate planner content using chunked approach for large plans (>30 days)"""
-        if req.totalDays <= self.config.chunk_size:
-            # Use single generation for plans <= chunk_size days
+        """Generate planner content using intelligent chunked approach for large plans (>7 days)"""
+        if req.totalDays <= 7:
+            # Use single generation for plans <= 7 days
             return self.generate_single(req)
         
         # Validate maximum days
-        max_days = self.config.chunk_size * self.config.max_chunks
+        max_days = 90
         if req.totalDays > max_days:
             raise PlannerGenerationError(
                 f"Plan too large: {req.totalDays} days exceeds maximum of {max_days}",
                 f"Plans cannot exceed {max_days} days. Please reduce the number of days and try again."
             )
         
-        # For plans > chunk_size days, use chunked generation
-        chunk_size = self.config.chunk_size
+        # Analyze plan requirements to determine optimal chunking strategy
+        analysis = self._analyze_plan_requirements(req)
+        print(f"Plan analysis: {analysis}")
+        
+        # Create intelligent chunks based on analysis
+        chunks = self._create_intelligent_chunks(req, analysis)
+        print(f"Created {len(chunks)} intelligent chunks")
+        
         all_days = []
         now_s = int(time.time())
-        total_chunks = (req.totalDays + chunk_size - 1) // chunk_size
         
-        # Generate chunks
-        for chunk_idx, chunk_start in enumerate(range(1, req.totalDays + 1, chunk_size), 1):
-            chunk_end = min(chunk_start + chunk_size - 1, req.totalDays)
-            chunk_days = chunk_end - chunk_start + 1
+        # Generate each chunk with context and progression
+        for chunk_idx, chunk in enumerate(chunks, 1):
+            chunk_days = chunk.end_day - chunk.start_day + 1
             
             # Retry mechanism for chunk generation
             max_retries = 2
@@ -539,13 +856,14 @@ class ChatWrapper:
             
             for retry in range(max_retries + 1):
                 try:
-                    # Create a modified request for this chunk
-                    progress_context = f" (This is chunk {chunk_idx}/{total_chunks}, days {chunk_start}-{chunk_end} of a {req.totalDays}-day plan. Build upon previous progress and maintain consistency.)"
+                    # Create enhanced request for this chunk with progression context
+                    enhanced_detail_prompt = self._build_chunk_prompt(req, chunk, chunk_idx, len(chunks))
+                    
                     chunk_req = GeneratePlannerRequest(
-                        planName=req.planName,
+                        planName=f"{req.planName} - {chunk.phase_name}",
                         category=req.category,
                         totalDays=chunk_days,
-                        detailPrompt=f"{req.detailPrompt or ''}{progress_context}",
+                        detailPrompt=enhanced_detail_prompt,
                         minutesPerDay=req.minutesPerDay,
                         intensity=req.intensity,
                         language=req.language,
@@ -561,8 +879,8 @@ class ChatWrapper:
                     if retry == max_retries:
                         # Final retry failed
                         raise PlannerGenerationError(
-                            f"Failed to generate chunk {chunk_idx}/{total_chunks} (days {chunk_start}-{chunk_end}) after {max_retries + 1} attempts: {str(e)}",
-                            f"Could not generate the complete plan. Failed at chunk {chunk_idx} of {total_chunks}. Please try again with fewer days or simpler requirements."
+                            f"Failed to generate chunk {chunk_idx}/{len(chunks)} ({chunk.phase_name}, days {chunk.start_day}-{chunk.end_day}) after {max_retries + 1} attempts: {str(e)}",
+                            f"Could not generate the complete plan. Failed at {chunk.phase_name} phase. Please try again with fewer days or simpler requirements."
                         )
                     else:
                         # Wait before retry
@@ -570,14 +888,12 @@ class ChatWrapper:
             
             # Adjust day numbers and add to all_days
             for day in chunk_content.days:
-                # Fix the day numbering: chunk_start is the correct starting day number
-                # day.dayNumber from the chunk should be 1, 2, 3, etc. for the chunk
-                # We need to map it to the global day number
-                day.dayNumber = chunk_start + (day.dayNumber - 1)
+                # Map chunk day numbers to global day numbers
+                day.dayNumber = chunk.start_day + (day.dayNumber - 1)
                 all_days.append(day)
             
             # Add small delay between chunks to avoid rate limits
-            if chunk_end < req.totalDays:
+            if chunk_idx < len(chunks):
                 time.sleep(1)
         
         # Validate that we have the correct number of days
@@ -608,10 +924,51 @@ class ChatWrapper:
         
         return final_content
 
+    def _build_chunk_prompt(self, req: GeneratePlannerRequest, chunk: PlanChunk, 
+                           chunk_idx: int, total_chunks: int) -> str:
+        """Build an enhanced prompt for a specific chunk with progression context"""
+        prompt_parts = []
+        
+        # Original user prompt (truncated if too long)
+        if req.detailPrompt:
+            original_prompt = req.detailPrompt[:200] + "..." if len(req.detailPrompt) > 200 else req.detailPrompt
+            prompt_parts.append(f"User requirements: {original_prompt}")
+        
+        # Chunk context (concise)
+        prompt_parts.append(f"Phase: {chunk.phase_name} (Days {chunk.start_day}-{chunk.end_day}/{req.totalDays})")
+        prompt_parts.append(f"Level: {chunk.progression_level} | Focus: {chunk.focus_area}")
+        
+        # Key goals (first 2 only to save space)
+        goals_text = ", ".join(chunk.key_goals[:2])
+        prompt_parts.append(f"Goals: {goals_text}")
+        
+        # Progression context (concise)
+        if chunk_idx > 1:
+            prompt_parts.append(f"Builds upon previous {chunk_idx - 1} phase(s) - ensure continuity")
+        
+        if chunk_idx < total_chunks:
+            prompt_parts.append(f"Prepares for {total_chunks - chunk_idx} upcoming phase(s) - set foundations")
+        
+        # Special instructions (truncated)
+        special_instructions = chunk.special_instructions[:300] + "..." if len(chunk.special_instructions) > 300 else chunk.special_instructions
+        prompt_parts.append(f"Instructions: {special_instructions}")
+        
+        # Quality requirements (concise)
+        prompt_parts.append("Requirements: Unique daily content, logical progression, specific actionable tasks, variety in activities")
+        
+        full_prompt = " | ".join(prompt_parts)
+        
+        # Ensure we stay within the 1000 character limit
+        if len(full_prompt) > 1000:
+            # Truncate further if needed
+            full_prompt = full_prompt[:997] + "..."
+        
+        return full_prompt
+
     def generate(self, req: GeneratePlannerRequest) -> PlannerContent:
         """Main generation method with intelligent routing"""
-        # Use chunked generation for large plans, single for small ones
-        if req.totalDays > self.config.chunk_size:
+        # Use intelligent chunked generation for plans > 7 days, single for smaller ones
+        if req.totalDays > 7:
             return self.generate_chunked(req)
         else:
             return self.generate_single(req)
@@ -828,9 +1185,7 @@ class ChatWrapper:
         # Extract JSON
         try:
             if not response.choices or not response.choices[0].message.content:
-                print("Warning: Empty response from OpenAI, generating fallback plan...")
-                # Generate fallback plan instead of raising error
-                data = self._generate_fallback_plan(req)
+                self._handle_generation_failure(req, "Empty response from OpenAI API")
             else:
                 raw = response.choices[0].message.content
                 print(f"DEBUG: Raw AI response: {raw[:500]}...")  # Log first 500 chars
@@ -839,21 +1194,18 @@ class ChatWrapper:
                 data = self._parse_json_response(raw)
                 
                 if not isinstance(data, dict):
-                    print(f"Warning: Invalid response type: {type(data)}, generating fallback plan...")
-                    data = self._generate_fallback_plan(req)
+                    self._handle_generation_failure(req, f"Invalid response type: {type(data)}")
                 else:
                     print(f"DEBUG: Parsed data keys: {list(data.keys())}")  # Log available keys
                     
         except json.JSONDecodeError as e:
             print(f"DEBUG: JSON decode error: {e}")
             print(f"DEBUG: Raw response that failed to parse: {raw}")
-            print("Generating fallback plan due to JSON parsing error...")
-            data = self._generate_fallback_plan(req)
+            self._handle_generation_failure(req, f"JSON parsing error: {str(e)}")
         except Exception as e:
             print(f"DEBUG: Unexpected error parsing response: {e}")
             print(f"DEBUG: Raw response: {raw}")
-            print("Generating fallback plan due to parsing error...")
-            data = self._generate_fallback_plan(req)
+            self._handle_generation_failure(req, f"Response parsing error: {str(e)}")
 
         # Fill in createdAt if model left null, and ensure ids
         try:
@@ -867,98 +1219,12 @@ class ChatWrapper:
             if "days" not in data or not isinstance(data.get("days"), list):
                 available_keys = list(data.keys()) if isinstance(data, dict) else "not a dict"
                 print(f"Warning: AI response missing 'days' field. Available keys: {available_keys}")
-                print("Generating fallback plan with basic structure...")
-                
-                # Generate a fallback plan with the requested number of days
-                fallback_days = []
-                for day_num in range(1, req.totalDays + 1):
-                    fallback_day = {
-                        "id": uuid.uuid4().hex[:8],
-                        "dayNumber": day_num,
-                        "title": f"Day {day_num} - {req.category.title()} Practice",
-                        "summary": f"Continue your {req.category} journey with focused practice and learning.",
-                        "tasks": [
-                            {
-                                "id": uuid.uuid4().hex[:8],
-                                "text": f"Practice session: Spend time working on your {req.category} skills. Focus on consistency and gradual improvement.",
-                                "done": False,
-                                "duration_min": req.minutesPerDay // 2 if req.minutesPerDay else None,
-                                "note": "Adapt this task based on your specific needs and progress",
-                                "link": None
-                            },
-                            {
-                                "id": uuid.uuid4().hex[:8],
-                                "text": f"Review and reflect: Take time to review your progress, identify areas for improvement, and plan your next steps.",
-                                "done": False,
-                                "duration_min": req.minutesPerDay // 2 if req.minutesPerDay else None,
-                                "note": "Use this time to assess your learning and adjust your approach",
-                                "link": None
-                            }
-                        ],
-                        "tips": "Stay consistent with your practice and don't be afraid to adjust your approach based on what you've learned."
-                    }
-                    fallback_days.append(fallback_day)
-                
-                # Update the data with fallback content
-                data["days"] = fallback_days
-                data["planName"] = data.get("planName", req.planName)
-                data["category"] = data.get("category", req.category)
-                data["totalDays"] = req.totalDays
-                data["warning"] = "Generated a basic plan structure due to AI response format issues. You can customize the tasks as needed."
-                
-                print(f"Generated fallback plan with {len(fallback_days)} days")
+                self._handle_generation_failure(req, f"Missing 'days' field in AI response. Available keys: {available_keys}")
             
             current_days = len(data.get("days", []))
             if current_days != req.totalDays:
                 # Day count mismatch - this should not happen with proper AI generation
-                # Try to fix it by generating additional days or trimming excess
-                if current_days < req.totalDays:
-                    # Generate additional days to match the request
-                    missing_days = req.totalDays - current_days
-                    print(f"Warning: Generated only {current_days} days instead of {req.totalDays}. Attempting to generate {missing_days} additional days.")
-                    
-                    # Create additional days with generic content
-                    for day_num in range(current_days + 1, req.totalDays + 1):
-                        additional_day = {
-                            "id": uuid.uuid4().hex[:8],
-                            "dayNumber": day_num,
-                            "title": f"Day {day_num} - Continued Progress",
-                            "summary": f"Continue your {req.category} journey with focused practice and reflection.",
-                            "tasks": [
-                                {
-                                    "id": uuid.uuid4().hex[:8],
-                                    "text": f"Review and practice: Spend time reviewing previous days' progress and continue building your skills. Focus on consistency and gradual improvement.",
-                                    "done": False,
-                                    "duration_min": req.minutesPerDay // 2 if req.minutesPerDay else None,
-                                    "note": "Adapt this task based on your specific needs and progress",
-                                    "link": None
-                                },
-                                {
-                                    "id": uuid.uuid4().hex[:8],
-                                    "text": f"Reflection and planning: Take time to reflect on your progress, identify areas for improvement, and plan your next steps.",
-                                    "done": False,
-                                    "duration_min": req.minutesPerDay // 2 if req.minutesPerDay else None,
-                                    "note": "Use this time to assess your learning and adjust your approach",
-                                    "link": None
-                                }
-                            ],
-                            "tips": "Stay consistent with your practice and don't be afraid to adjust your approach based on what you've learned."
-                        }
-                        data["days"].append(additional_day)
-                    
-                    print(f"Generated {missing_days} additional days to complete the {req.totalDays}-day plan.")
-                    
-                elif current_days > req.totalDays:
-                    # Trim excess days
-                    excess_days = current_days - req.totalDays
-                    print(f"Warning: Generated {current_days} days instead of {req.totalDays}. Trimming {excess_days} excess days.")
-                    data["days"] = data["days"][:req.totalDays]
-                
-                # Ensure totalDays matches the actual number of days
-                data["totalDays"] = len(data["days"])
-                
-                # Add warning to the response data
-                data["warning"] = f"Day count was adjusted from {current_days} to {req.totalDays} to match your request."
+                self._handle_generation_failure(req, f"Day count mismatch: generated {current_days} days instead of {req.totalDays}")
             
             # No need to check for duplicate links since we're not using external links
             
@@ -1080,11 +1346,9 @@ class ChatWrapper:
                 data.setdefault("totalDays", req.totalDays)
                 data.setdefault("createdAt", {"seconds": int(time.time()), "nanoseconds": 0})
                 
-                # If days is still missing or invalid, use fallback
+                # If days is still missing or invalid, fail with proper error
                 if "days" not in data or not isinstance(data.get("days"), list) or len(data["days"]) == 0:
-                    print("Days field is missing or invalid, using fallback generation...")
-                    fallback_data = self._generate_fallback_plan(req)
-                    data.update(fallback_data)
+                    self._handle_generation_failure(req, "Days field is missing or invalid after validation fixes")
                 
                 # Try validation again
                 validated = PlannerContent(**data)
@@ -1092,10 +1356,7 @@ class ChatWrapper:
                 
             except Exception as fix_error:
                 print(f"Could not fix validation issues: {fix_error}")
-                # Last resort: return a basic fallback plan
-                fallback_data = self._generate_fallback_plan(req)
-                validated = PlannerContent(**fallback_data)
-                return validated
+                self._handle_generation_failure(req, f"Validation fix failed: {str(fix_error)}")
 
 
 # =========================
