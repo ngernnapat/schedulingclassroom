@@ -1,0 +1,67 @@
+# Cloud Run Configuration for generate-planner-content service
+# This configuration optimizes the service to prevent 504 Gateway Timeout errors
+
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: generate-planner-content
+  annotations:
+    run.googleapis.com/ingress: all
+    run.googleapis.com/execution-environment: gen2
+spec:
+  template:
+    metadata:
+      annotations:
+        # Increase timeout to 9 minutes (540 seconds)
+        run.googleapis.com/timeout: "540s"
+        # Increase memory allocation
+        run.googleapis.com/memory: "2Gi"
+        # Increase CPU allocation
+        run.googleapis.com/cpu: "2"
+        # Enable CPU boost for faster cold starts
+        run.googleapis.com/cpu-throttling: "false"
+        # Set minimum instances to reduce cold starts
+        autoscaling.knative.dev/minScale: "1"
+        # Set maximum instances
+        autoscaling.knative.dev/maxScale: "5"
+        # Enable concurrency for better performance
+        autoscaling.knative.dev/target: "10"
+    spec:
+      containerConcurrency: 10
+      timeoutSeconds: 540
+      containers:
+      - image: gcr.io/PROJECT_ID/generate-planner-content
+        ports:
+        - containerPort: 8080
+        env:
+        - name: PORT
+          value: "8080"
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: openai-api-key
+              key: api-key
+        resources:
+          limits:
+            memory: "2Gi"
+            cpu: "2"
+          requests:
+            memory: "1Gi"
+            cpu: "1"
+        # Health check configuration
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3

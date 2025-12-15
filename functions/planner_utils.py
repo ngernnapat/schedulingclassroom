@@ -162,6 +162,31 @@ class PromptBuilder:
         )
         
         return system_prompt, user_prompt
+    
+    @staticmethod
+    def build_todo_info_prompt(user_query: str, todo_data: Dict[str, Any]) -> tuple[str, str]:
+        """Build prompt for providing information about todo_data"""
+        system_prompt = (
+            "You are Evo, a helpful AI assistant that provides practical information about todo lists. "
+            "Be honest, concise, and actionable. If something doesn't make sense, say so clearly and helpfully."
+        )
+        
+        # Format todo data for clarity
+        todo_info = "\n".join([f"• {key}: {value}" for key, value in todo_data.items()])
+        
+        user_prompt = (
+            f"User query: {user_query}\n\n"
+            f"Todo data:\n{todo_info}\n\n"
+            "Provide a CONCISE response (2-4 sentences maximum) focusing only on what matters:\n\n"
+            "- If user asks about a specific point, give focused details\n"
+            "- If user's query doesn't align with the todo data, point it out honestly\n"
+            "- When relevant, add 1 practical suggestion for improvement\n"
+            "- Only suggest links/resources if user explicitly asks\n\n"
+            "Be honest: cheer up only when deserved, but be straightforward when something doesn't make sense. "
+            "Use minimal emojis. Keep it short and practical."
+        )
+        
+        return system_prompt, user_prompt
 
 class PlannerUtils:
     """Enhanced planner utilities with better error handling and validation"""
@@ -365,6 +390,49 @@ class PlannerUtils:
         except Exception as e:
             logger.error(f"Failed to generate mood boost: {str(e)}")
             return "You're absolutely amazing! Keep shining bright! ✨🌟💫"
+    
+    def get_todo_information_generator_response(self, user_query: str, todo_data: Dict[str, Any], language: str = "thai") -> str:
+        """
+        Provide concise, honest, and practical information about todo_data.
+        
+        Features:
+        - Brief, focused responses (2-4 sentences)
+        - Honest feedback when queries don't align with todo data
+        - Practical suggestions when relevant
+        - Minimal emojis and cheering (only when deserved)
+        
+        Args:
+            user_query: User's question about the todo list
+            todo_data: Todo list data
+            language: Language for the response
+            
+        Returns:
+            Concise, honest information about the todo list
+        """
+        try:
+            # Validate inputs
+            if not user_query or not isinstance(user_query, str):
+                user_query = "Tell me about this todo list"
+            
+            self.validator.validate_planner_data(todo_data)
+            normalized_language = self.validator.validate_language(language)
+            
+            # Build prompt
+            system_prompt, user_prompt = self.prompt_builder.build_todo_info_prompt(
+                user_query, todo_data
+            )
+            
+            # Make API call with moderate max_tokens for concise responses
+            response = self._safe_chat_call(
+                system_prompt, user_prompt, language=normalized_language, max_tokens=200
+            )
+            
+            logger.info("Todo information generated successfully")
+            return response
+            
+        except Exception as e:
+            logger.error(f"Failed to get todo information: {str(e)}")
+            return "I'm here to help! Could you tell me more about what you'd like to know? 😊"
 
     def morning_message(self, today_todo_list_data: List[Dict[str, Any]], language: str = "thai") -> str:
         """
@@ -556,6 +624,109 @@ class PlannerUtils:
             }
             return fallback_messages.get(language, fallback_messages['english'])
 
+    def summarize_this_year_todos_message(self, this_year_todos_data: str, language: str = "thai") -> str:
+        """
+        Generate a summary of this year's todos.
+        
+        Args:
+            this_year_todos_data: List of todos for this year
+            language: Language for the response
+            
+        Returns:
+            Summary of this year's todos
+        """
+        try:
+            # Validate inputs
+            if not this_year_todos_data:
+                logger.info("No this year's todos data found for summary")
+                return None
+            
+            #normalized_language = self.validator.validate_language(language)
+            total_todos = len(this_year_todos_data)
+            
+            # Build concise prompt
+            system_prompt = (
+                "You are Evo, creating a summary of this year's todos. "
+                "Keep responses under 150 characters, motivating and actionable."
+            )
+            
+            # Format todos with minimal info
+            todos_info = "\n".join([
+                f"• {todo.get('title', 'Todo')[:20]} - {todo.get('typeOfTodo', '')}"
+                for todo in this_year_todos_data[:5]  # Show only 5 todos
+            ])
+            
+            remaining = total_todos - 5 if total_todos > 5 else 0
+            if remaining:
+                todos_info += f"\n• +{remaining} more"
+            
+            user_prompt = (
+                f"Summary of {total_todos} todos this year:\n{todos_info}\n"
+                f"Summarize this year's todos in {language}. Max 150 chars, include emojis."
+                f"Max 150 chars, include positive emojis."
+            )
+            
+            # Make API call with optimized parameters
+            response = self._safe_chat_call(
+                system_prompt, 
+                user_prompt, 
+                max_tokens=100,
+                temperature=0.7,  # Balance creativity with consistency
+                language=language
+            )
+            
+            logger.info(f"This year's todos summary generated successfully for {total_todos} todos")
+            return response
+            
+        except Exception as e:
+            logger.error(f"Failed to generate this year's todos summary: {str(e)}")
+
+    def summarize_this_year_todos_from_text(self, this_year_todos_text: str, language: str = "thai") -> str:
+        """
+        Generate a summary of this year's todos when the data is provided as a single string.
+        
+        Args:
+            this_year_todos_text: Raw text describing this year's todos (any format)
+            language: Language for the response (e.g. 'thai', 'english')
+            
+        Returns:
+            Short, motivating summary of this year's todos
+        """
+        try:
+            # Validate inputs
+            if not this_year_todos_text or not this_year_todos_text.strip():
+                logger.info("No this year's todos text provided for summary")
+                return None
+
+            # Build concise prompt
+            system_prompt = (
+                "You are Evo, a friendly and inspiring AI lifestyle coach helping users grow and evolve. "
+                "Create a motivating, and actionable summary. "
+                "Keep responses under 250 characters and include positive emojis."
+            )
+
+            # User prompt uses the raw text directly
+            user_prompt = (
+                f"Please summarize this year's todos (in any format):\n"
+                f"{this_year_todos_text}\n\n"
+                f"Max 250 characters. Include positive emojis. Use {language} language."
+            )
+
+            # Make API call with optimized parameters
+            response = self._safe_chat_call(
+                system_prompt,
+                user_prompt,
+                max_tokens=250,
+                temperature=0.7,  # Balance creativity with consistency
+                language=self.validator.validate_language(language),
+            )
+
+            logger.info("This year's todos summary (from text) generated successfully")
+            return response
+
+        except Exception as e:
+            logger.error(f"Failed to generate this year's todos summary from text: {str(e)}")
+            return None
 # Global instance for backward compatibility
 _default_planner = None
 
@@ -610,3 +781,13 @@ def summarize_next_week_at_sunday(week_data: List[Dict[str, Any]], language: str
     """Backward compatibility function for summarize next week"""
     planner = get_default_planner()
     return planner.summarize_next_week_message(week_data, language)
+
+def get_todo_information(user_query: str, todo_data: Dict[str, Any], language: str = "thai") -> str:
+    """Backward compatibility function for getting todo information generator response"""
+    planner = get_default_planner()
+    return planner.get_todo_information_generator_response(user_query, todo_data, language)
+
+def summarize_this_year_todos_message(this_year_todos_data: str, language: str = "thai") -> str:
+    """Backward compatibility function for summarizing this year's todos"""
+    planner = get_default_planner()
+    return planner.summarize_this_year_todos_from_text(this_year_todos_data, language)

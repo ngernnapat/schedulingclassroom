@@ -410,7 +410,7 @@ class ChatWrapper:
             "special_considerations": []
         }
         
-        # Analyze based on category and total days
+        # Analyze based on category and total days (optimized for faster processing)
         if req.totalDays <= 7:
             analysis["complexity"] = "simple"
             analysis["optimal_chunk_size"] = req.totalDays
@@ -419,10 +419,10 @@ class ChatWrapper:
             analysis["optimal_chunk_size"] = 7
         elif req.totalDays <= 30:
             analysis["complexity"] = "moderate"
-            analysis["optimal_chunk_size"] = 10
+            analysis["optimal_chunk_size"] = 15  # Increased from 10 to reduce API calls
         else:
             analysis["complexity"] = "complex"
-            analysis["optimal_chunk_size"] = 15
+            analysis["optimal_chunk_size"] = 20  # Increased from 15 to reduce API calls
         
         # Category-specific analysis
         if req.category == "learning":
@@ -802,7 +802,7 @@ class ChatWrapper:
             "5) CRITICAL: Output MUST be valid JSON matching the exact schema provided.\n"
             "6) Include ALL required fields: planName, category, totalDays, createdAt, days.\n"
             "7) ABSOLUTE REQUIREMENT: The 'days' array MUST contain EXACTLY the number of days specified in totalDays. If totalDays=30, you MUST generate exactly 30 days. If totalDays=7, you MUST generate exactly 7 days. NO MORE, NO LESS.\n"
-            "8) TIME ALLOCATION: If minutesPerDay is specified, you MUST ensure that the sum of all task durations (duration_min) for each day equals exactly the specified minutesPerDay. Each task must have a duration_min value when minutesPerDay is provided.\n"
+            "8) TIME ALLOCATION: If minutesPerDay is specified, use it as a flexible guideline. Allocate time to tasks based on their natural requirements and complexity. The total duration should approximate minutesPerDay (within ±20% is acceptable), but prioritize logical task durations over exact matching. Each task should have a duration_min value that reflects its actual time needs.\n"
             "9) DAY NUMBERING: Each day must have a dayNumber field starting from 1 and incrementing sequentially (1, 2, 3, ..., totalDays).\n"
             "10) DETAILED TASK INSTRUCTIONS: Each task MUST include comprehensive, actionable instructions that users can follow without external links. Focus on providing clear, step-by-step guidance within the task description itself.\n"
             "   TASK QUALITY REQUIREMENTS:\n"
@@ -827,8 +827,8 @@ class ChatWrapper:
             # Use single generation for plans <= 7 days
             return self.generate_single(req)
         
-        # Validate maximum days
-        max_days = 90
+        # Validate maximum days (reduced to prevent timeouts)
+        max_days = 60
         if req.totalDays > max_days:
             raise PlannerGenerationError(
                 f"Plan too large: {req.totalDays} days exceeds maximum of {max_days}",
@@ -845,14 +845,26 @@ class ChatWrapper:
         
         all_days = []
         now_s = int(time.time())
+        generation_start_time = time.time()
+        max_generation_time = 480  # 8 minutes max (leave 1 minute buffer for Cloud Run timeout)
         
         # Generate each chunk with context and progression
         for chunk_idx, chunk in enumerate(chunks, 1):
+            # Check if we're approaching timeout
+            elapsed_time = time.time() - generation_start_time
+            if elapsed_time > max_generation_time:
+                raise PlannerGenerationError(
+                    f"Generation timeout: Processed {chunk_idx - 1}/{len(chunks)} chunks in {elapsed_time:.2f} seconds",
+                    f"Plan generation is taking too long. Please try with fewer days or simpler requirements."
+                )
+            
             chunk_days = chunk.end_day - chunk.start_day + 1
+            print(f"Generating chunk {chunk_idx}/{len(chunks)}: {chunk.phase_name} (days {chunk.start_day}-{chunk.end_day}) - {elapsed_time:.2f}s elapsed")
             
             # Retry mechanism for chunk generation
             max_retries = 2
             chunk_content = None
+            chunk_start_time = time.time()
             
             for retry in range(max_retries + 1):
                 try:
@@ -873,6 +885,8 @@ class ChatWrapper:
                     
                     # Generate this chunk
                     chunk_content = self.generate_single(chunk_req)
+                    chunk_time = time.time() - chunk_start_time
+                    print(f"Completed chunk {chunk_idx}/{len(chunks)} in {chunk_time:.2f} seconds")
                     break  # Success, exit retry loop
                     
                 except Exception as e:
@@ -883,8 +897,8 @@ class ChatWrapper:
                             f"Could not generate the complete plan. Failed at {chunk.phase_name} phase. Please try again with fewer days or simpler requirements."
                         )
                     else:
-                        # Wait before retry
-                        time.sleep(2 ** retry)  # Exponential backoff
+                        # Wait before retry (reduced backoff for faster processing)
+                        time.sleep(1)  # Reduced from exponential backoff
             
             # Adjust day numbers and add to all_days
             for day in chunk_content.days:
@@ -892,9 +906,9 @@ class ChatWrapper:
                 day.dayNumber = chunk.start_day + (day.dayNumber - 1)
                 all_days.append(day)
             
-            # Add small delay between chunks to avoid rate limits
+            # Add minimal delay between chunks to avoid rate limits (reduced for faster processing)
             if chunk_idx < len(chunks):
-                time.sleep(1)
+                time.sleep(0.5)  # Reduced from 1 second to 0.5 seconds
         
         # Validate that we have the correct number of days
         if len(all_days) != req.totalDays:
@@ -1125,12 +1139,13 @@ class ChatWrapper:
         if req.minutesPerDay:
             user_msg_parts.extend([
                 "",
-                f"IMPORTANT: You must allocate exactly {req.minutesPerDay} minutes per day across all tasks. "
-                f"Each task must have a duration_min value, and the sum of all task durations for each day must equal {req.minutesPerDay} minutes. "
-                f"Distribute the time logically across tasks (e.g., if you have 4 tasks for 60 minutes, you might allocate 15, 20, 15, 10 minutes respectively)."
+                f"TIME ALLOCATION GUIDELINE: Aim for approximately {req.minutesPerDay} minutes per day total, but allocate time to each task based on its natural requirements and complexity. "
+                f"Each task should have a duration_min value that reflects how long it realistically takes to complete. "
+                f"The total duration can vary from {req.minutesPerDay} minutes - flexibility is preferred over rigid matching. "
+                f"Prioritize creating tasks with appropriate durations that make sense for the activity, even if the daily total is slightly different from {req.minutesPerDay} minutes."
             ])
         else:
-            user_msg_parts.append("Task durations are optional when minutesPerDay is not specified.")
+            user_msg_parts.append("Task durations are optional when minutesPerDay is not specified. If you include durations, base them on the natural time requirements of each task.")
         
         user_msg = "\n".join(user_msg_parts)
 
@@ -1273,7 +1288,7 @@ class ChatWrapper:
                         # If task is too short or vague, provide a more detailed version
                         t["text"] = self._enhance_task_description(task_text, req.category)
                 
-                # Validate minutesPerDay constraint if specified - be more flexible
+                # Validate and fill in missing durations - flexible approach
                 if req.minutesPerDay:
                     total_duration = 0
                     tasks_without_duration = []
@@ -1284,41 +1299,38 @@ class ChatWrapper:
                         else:
                             total_duration += task["duration_min"]
                     
-                    # Auto-assign durations to tasks that don't have them
+                    # Only auto-assign durations to tasks that are missing them
+                    # Use a flexible estimate based on remaining time and task count
                     if tasks_without_duration:
-                        remaining_minutes = req.minutesPerDay - total_duration
+                        # Calculate reasonable average duration based on remaining time
+                        # Use minutesPerDay as a rough guide, but don't force exact matching
+                        remaining_minutes = max(0, req.minutesPerDay - total_duration)
                         tasks_needing_duration = len(tasks_without_duration)
-                        if tasks_needing_duration > 0 and remaining_minutes > 0:
-                            # Distribute remaining time evenly among tasks without duration
-                            avg_duration = remaining_minutes // tasks_needing_duration
-                            remainder = remaining_minutes % tasks_needing_duration
-                            
-                            for idx, task_idx in enumerate(tasks_without_duration):
-                                duration = avg_duration + (1 if idx < remainder else 0)
-                                d["tasks"][task_idx - 1]["duration_min"] = max(1, duration)  # At least 1 minute
-                            
-                            print(f"Warning: Day {i} had tasks without duration. Auto-assigned durations to complete {req.minutesPerDay} minutes.")
-                            # Recalculate total
-                            total_duration = sum(task.get("duration_min", 0) for task in d.get("tasks", []))
-                    
-                    # Allow some flexibility in duration matching (±5 minutes)
-                    duration_diff = abs(total_duration - req.minutesPerDay)
-                    if duration_diff > 5:
-                        # Auto-adjust to match requested duration
-                        if total_duration < req.minutesPerDay:
-                            # Add time to the longest task
-                            longest_task_idx = max(range(len(d.get("tasks", []))), 
-                                                 key=lambda x: d["tasks"][x].get("duration_min", 0))
-                            d["tasks"][longest_task_idx]["duration_min"] += (req.minutesPerDay - total_duration)
-                        elif total_duration > req.minutesPerDay:
-                            # Reduce time from the longest task
-                            longest_task_idx = max(range(len(d.get("tasks", []))), 
-                                                 key=lambda x: d["tasks"][x].get("duration_min", 0))
-                            reduction = min(total_duration - req.minutesPerDay, 
-                                          d["tasks"][longest_task_idx].get("duration_min", 1) - 1)
-                            d["tasks"][longest_task_idx]["duration_min"] -= reduction
                         
-                        print(f"Warning: Day {i} task durations adjusted from {total_duration} to {req.minutesPerDay} minutes for consistency.")
+                        if tasks_needing_duration > 0:
+                            if remaining_minutes > 0:
+                                # Distribute remaining time proportionally
+                                avg_duration = max(5, remaining_minutes // tasks_needing_duration)  # At least 5 min per task
+                                remainder = remaining_minutes % tasks_needing_duration
+                                
+                                for idx, task_idx in enumerate(tasks_without_duration):
+                                    duration = avg_duration + (1 if idx < remainder else 0)
+                                    d["tasks"][task_idx - 1]["duration_min"] = duration
+                            else:
+                                # If we've exceeded the guideline, give minimum durations to tasks without them
+                                for task_idx in tasks_without_duration:
+                                    d["tasks"][task_idx - 1]["duration_min"] = 5  # Minimum 5 minutes
+                            
+                            print(f"Info: Day {i} had {len(tasks_without_duration)} task(s) without duration. Assigned reasonable durations.")
+                    
+                    # Calculate final total for logging only - don't force adjustment
+                    final_total = sum(task.get("duration_min", 0) for task in d.get("tasks", []))
+                    if final_total != req.minutesPerDay:
+                        variance_percent = abs(final_total - req.minutesPerDay) / req.minutesPerDay * 100
+                        if variance_percent <= 20:
+                            print(f"Info: Day {i} total duration is {final_total} minutes (target: {req.minutesPerDay}, variance: {variance_percent:.1f}%) - acceptable flexibility.")
+                        else:
+                            print(f"Note: Day {i} total duration is {final_total} minutes (target: {req.minutesPerDay}, variance: {variance_percent:.1f}%) - prioritizing task-appropriate durations over exact matching.")
         
         except PlannerGenerationError:
             raise  # Re-raise our custom errors
@@ -1375,7 +1387,7 @@ def _cors_headers(origin: Optional[str]) -> Dict[str, str]:
         "Access-Control-Max-Age": "3600"
     }
 
-@https_fn.on_request(memory=1024, max_instances=3)
+@https_fn.on_request(memory=2048, max_instances=5, timeout_sec=540)  # 9 minutes timeout
 def generate_planner_content(req: https_fn.Request) -> https_fn.Response:
     origin = req.headers.get("Origin")
     if req.method == "OPTIONS":
@@ -1390,8 +1402,39 @@ def generate_planner_content(req: https_fn.Request) -> https_fn.Response:
 
     try:
         payload = req.get_json(silent=True) or {}
+        
+        # Validate request size and complexity to prevent timeouts
+        if len(str(payload)) > 10000:  # 10KB limit for request payload
+            return https_fn.Response(
+                json.dumps({
+                    "error": "Request too large",
+                    "message": "Request payload is too large. Please simplify your requirements."
+                }),
+                status=400,
+                headers={**_cors_headers(origin), "Content-Type": "application/json"}
+            )
+        
         parsed = GeneratePlannerRequest(**payload)
+        
+        # Additional validation for large plans that might cause timeouts
+        if parsed.totalDays > 60:
+            return https_fn.Response(
+                json.dumps({
+                    "error": "Plan too large",
+                    "message": f"Plans with {parsed.totalDays} days may take too long to generate. Please try with 60 days or fewer."
+                }),
+                status=400,
+                headers={**_cors_headers(origin), "Content-Type": "application/json"}
+            )
+        
+        print(f"Processing {parsed.totalDays}-day {parsed.category} plan...")
+        start_time = time.time()
+        
         content = chat.generate(parsed)
+        
+        generation_time = time.time() - start_time
+        print(f"Generated {parsed.totalDays}-day plan in {generation_time:.2f} seconds")
+        
         body = content.model_dump()
         return https_fn.Response(
             json.dumps(body, ensure_ascii=False),

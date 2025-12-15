@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field, ValidationError
 from dotenv import load_dotenv
 
 # Import local modules
-from planner_utils import summarize_plan, motivate_user, track_progress, respond_to_user_input, message_in_the_morning, summarize_end_of_the_week_at_friday, summarize_next_week_at_sunday
+from planner_utils import summarize_plan, motivate_user, track_progress, respond_to_user_input, message_in_the_morning, summarize_end_of_the_week_at_friday, summarize_next_week_at_sunday, get_todo_information, summarize_this_year_todos_message
 
 # import the same models + chat wrapper from main.py
 from generate_planner_content import GeneratePlannerRequest, chat
@@ -503,7 +503,7 @@ def get_schedule_info(req: https_fn.Request) -> https_fn.Response:
     return create_response(data=info_data, message='API information retrieved successfully')
 
 ########### Generate Planner Content API Endpoints #############
-@https_fn.on_request(memory=1024, max_instances=3)
+@https_fn.on_request(memory=2048, max_instances=5, timeout_sec=540)  # 9 minutes timeout
 def generate_planner_content(req: https_fn.Request) -> https_fn.Response:
     """Generate planner content using ChatGPT"""
     try:
@@ -610,7 +610,7 @@ def summarize_planner(req: https_fn.Request) -> https_fn.Response:
             status_code=500
         )
 
-# Track user progress using ChatGPT
+# AI Assistant to provide information about todo_data
 @https_fn.on_request(memory=1024, max_instances=3)
 def progress(req: https_fn.Request) -> https_fn.Response:
     """Track user progress using ChatGPT"""
@@ -636,7 +636,7 @@ def progress(req: https_fn.Request) -> https_fn.Response:
             )
         
         # Validate required fields
-        required_fields = ['user_update', 'todo_data']
+        required_fields = ['todo_data']
         for field in required_fields:
             if field not in data:
                 return create_response(
@@ -646,18 +646,24 @@ def progress(req: https_fn.Request) -> https_fn.Response:
                     status_code=400
                 )
         
-        feedback = track_progress(data['user_update'], data['todo_data'], data['language'])
+        # Get optional user query about the todo_data
+        user_query = data.get('user_update', 'Tell me about this todo list')
+        language = data.get('language', 'thai')
+        todo_data = data['todo_data']
+        
+        # Get information about todo_data using AI assistant
+        information = get_todo_information(user_query, todo_data, language)
         return create_response(
-            data={'feedback': feedback},
-            message='Progress tracked successfully'
+            data={'feedback': information},
+            message='Todo information provided successfully'
         )
         
     except Exception as e:
-        logger.error(f"Error in progress: {str(e)}")
+        logger.error(f"Error in todo_assistant: {str(e)}")
         return create_response(
             success=False,
-            message='Progress tracking failed',
-            error=f'Failed to track progress: {str(e)}',
+            message='Todo assistant failed',
+            error=f'Failed to provide information: {str(e)}',
             status_code=500
         )
 
@@ -878,5 +884,56 @@ def summarize_next_week(req: https_fn.Request) -> https_fn.Response:
             status_code=500
         )
 
-
-# Create contents for the planner using ChatGPT
+@https_fn.on_request(memory=1024, max_instances=3)
+def summary_this_year_todos(req: https_fn.Request) -> https_fn.Response:
+    """Summarize this year's todos using ChatGPT"""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+    
+    if req.method != 'POST':
+        return create_response(
+            success=False,
+            message='Method not allowed',
+            error='Only POST method is allowed',
+            status_code=405
+        )
+    
+    try:
+        data = req.get_json()
+        if not data:
+            return create_response(
+                success=False,
+                message='No data provided',
+                error='Request body is required',
+                status_code=400
+            )
+        
+        # Validate required fields
+        if 'this_year_todos_data' not in data:
+            return create_response(
+                success=False,
+                message='Missing required field',
+                error='year_data is required',
+                status_code=400
+            )
+        
+        language = data.get('languageSelected', 'thai')
+        logger.info(f"Summarizing this year's todos in language: {language}")
+        
+        # Summarize this year's todos using ChatGPT
+        summary = summarize_this_year_todos_message(this_year_todos_data=data['this_year_todos_data'], language=language)
+        return create_response(
+            data={'response': summary},
+            message='This year\'s todos summary generated successfully',
+            status_code=200,
+            success=True
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in summarize_this_year_todos: {str(e)}")
+        return create_response(
+            success=False,
+            message='This year\'s todos summary generation failed',
+            error=f'Failed to generate this year\'s todos summary: {str(e)}',
+            status_code=500
+        )
