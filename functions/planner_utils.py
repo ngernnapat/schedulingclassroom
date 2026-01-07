@@ -2,6 +2,7 @@
 
 import logging
 import json
+import re
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 from enum import Enum
@@ -452,10 +453,20 @@ class PlannerUtils:
             total_tasks = len(today_todo_list_data)
             
             # Build concise prompt
-            system_prompt = (
-                "You are Evo, creating brief morning notifications. "
-                "Keep responses under 100 characters, motivating and actionable."
-            )
+            system_prompt = """You are Evo, creating brief morning notifications.
+                Keep responses motivating and actionable.
+
+                Format the output in a friendly, easy-to-read way:
+                - Use line breaks to separate key information
+                - Include 1-2 relevant emojis for visual appeal
+                - Use clear, concise language
+                - Make it scannable and engaging
+                - Start with a warm greeting or motivational phrase
+                
+                Include helpful suggestions:
+                - Brief preparation tips for the tasks (e.g., gather materials, set up workspace, review notes)
+                - Reminders about what to do after finishing tasks to maintain work-life balance (e.g., take breaks, hydrate, stretch, celebrate small wins, plan downtime)
+                - Keep suggestions practical and encouraging"""
             
             # Format tasks with minimal info
             tasks_info = "\n".join([
@@ -469,14 +480,14 @@ class PlannerUtils:
             
             user_prompt = (
                 f"Morning notification for {total_tasks} tasks:\n{tasks_info}\n"
-                "Max 100 chars, include count and 1-2 emojis."
+                "Include task summary, brief preparation tips, and post-task balance reminders. Keep it concise but helpful. Include count and 1-2 emojis."
             )
             
             # Make API call with optimized parameters
             response = self._safe_chat_call(
                 system_prompt, 
                 user_prompt,
-                max_tokens=50,
+                max_tokens=150,
                 temperature=0.7,  # Balance between creativity and consistency
                 language=language
             )
@@ -514,7 +525,9 @@ class PlannerUtils:
                 "You are Evo, a supportive AI assistant. "
                 "Provide an encouraging weekly summary and suggest rest to recharge the user. "
                 "Review the user's weekly accomplishments and provide personalized recharge suggestions. "
-                "Keep responses under 150 characters, uplifting and motivational."
+                "Include specific rest activities and preparation tips for the upcoming week. "
+                "Remind users about maintaining work-life balance and celebrating their achievements. "
+                "Keep responses uplifting, motivational, and actionable."
             )
             
             # Format week activities with minimal info
@@ -529,15 +542,15 @@ class PlannerUtils:
             user_prompt = (
                 f"Weekly summary of {total_activities} completed activities:\n{activities_info}\n"
                 f"Summarize this week and suggest rest to recharge in {language}. "
-                f"Include specific rest activities. Max 150 chars with encouraging emojis."
-                f"Max 150 chars, include positive emojis."
+                f"Include specific rest activities, preparation tips for next week, and work-life balance reminders. "
+                f"Keep it encouraging with positive emojis."
             )
             
             # Make API call with optimized parameters
             response = self._safe_chat_call(
                 system_prompt, 
                 user_prompt, 
-                max_tokens=100,
+                max_tokens=150,
                 temperature=0.7,  # Balance creativity with consistency
                 language=language
             )
@@ -582,7 +595,10 @@ class PlannerUtils:
             # Build concise prompt
             system_prompt = (
                 "You are Evo, creating next week previews. "
-                "Keep responses under 120 characters, motivating and actionable."
+                "Provide motivating and actionable previews of upcoming tasks. "
+                "Include brief preparation suggestions (e.g., gather resources, plan ahead, set priorities). "
+                "Remind users about maintaining balance throughout the week (e.g., schedule breaks, stay hydrated, celebrate progress). "
+                "Keep responses concise but helpful and encouraging."
             )
             
             # Format upcoming tasks with minimal info
@@ -597,14 +613,15 @@ class PlannerUtils:
             
             user_prompt = (
                 f"Next week preview for {total_tasks} tasks:\n{tasks_info}\n"
-                f"Highlight 2-3 priorities in {language}. Max 120 chars, include emojis."
+                f"Highlight 2-3 priorities in {language}. Include preparation suggestions and balance reminders. "
+                f"Keep it motivating with emojis."
             )
             
             # Make API call with optimized parameters
             response = self._safe_chat_call(
                 system_prompt, 
                 user_prompt, 
-                max_tokens=80,
+                max_tokens=120,
                 temperature=0.7,  # Balance creativity with consistency
                 language=language
             )
@@ -624,109 +641,240 @@ class PlannerUtils:
             }
             return fallback_messages.get(language, fallback_messages['english'])
 
-    def summarize_this_year_todos_message(self, this_year_todos_data: str, language: str = "thai") -> str:
+    def summarize_this_month_todos_from_text(self, this_month_todos_text: str, language: str = "thai") -> tuple[str, str]:
         """
-        Generate a summary of this year's todos.
+        Generate a title and summary of this month's todos when the data is provided as a single string.
         
         Args:
-            this_year_todos_data: List of todos for this year
-            language: Language for the response
+            this_month_todos_text: Raw text describing this month's todos (any format)
+            language: Language for the response (e.g. 'thai', 'english')
             
         Returns:
-            Summary of this year's todos
+            Tuple of (title, summary) where title is short and catchy, summary is motivating and actionable.
+            Returns (None, None) if input is invalid or generation fails.
         """
         try:
             # Validate inputs
-            if not this_year_todos_data:
-                logger.info("No this year's todos data found for summary")
-                return None
-            
-            #normalized_language = self.validator.validate_language(language)
-            total_todos = len(this_year_todos_data)
-            
-            # Build concise prompt
-            system_prompt = (
-                "You are Evo, creating a summary of this year's todos. "
-                "Keep responses under 150 characters, motivating and actionable."
-            )
-            
-            # Format todos with minimal info
-            todos_info = "\n".join([
-                f"• {todo.get('title', 'Todo')[:20]} - {todo.get('typeOfTodo', '')}"
-                for todo in this_year_todos_data[:5]  # Show only 5 todos
-            ])
-            
-            remaining = total_todos - 5 if total_todos > 5 else 0
-            if remaining:
-                todos_info += f"\n• +{remaining} more"
-            
-            user_prompt = (
-                f"Summary of {total_todos} todos this year:\n{todos_info}\n"
-                f"Summarize this year's todos in {language}. Max 150 chars, include emojis."
-                f"Max 150 chars, include positive emojis."
-            )
-            
-            # Make API call with optimized parameters
-            response = self._safe_chat_call(
-                system_prompt, 
-                user_prompt, 
-                max_tokens=100,
-                temperature=0.7,  # Balance creativity with consistency
-                language=language
-            )
-            
-            logger.info(f"This year's todos summary generated successfully for {total_todos} todos")
-            return response
-            
-        except Exception as e:
-            logger.error(f"Failed to generate this year's todos summary: {str(e)}")
+            if not this_month_todos_text or not this_month_todos_text.strip():
+                logger.info("No this month's todos text provided for summary")
+                return (None, None)
 
-    def summarize_this_year_todos_from_text(self, this_year_todos_text: str, language: str = "thai") -> str:
+            # Truncate very long input to prevent timeout (limit to 5000 characters)
+            original_length = len(this_month_todos_text)
+            if original_length > 5000:
+                logger.warning(f"Input text is very long ({original_length} chars), truncating to 5000 chars")
+                this_month_todos_text = this_month_todos_text[:5000] + "..."
+            
+            normalized_language = self.validator.validate_language(language)
+            
+            # Build concise prompt for both title and summary (single API call, optimized for speed)
+            system_prompt = """You are Evo, an inspiring AI coach.
+                Return TITLE and SUMMARY in this exact format:
+                TITLE: [5-10 words, 1-2 emojis]
+                SUMMARY: [max 400 chars, positive emojis]
+
+                Format the output in a friendly, easy-to-read way:
+                - TITLE: Use engaging, motivational language with appropriate emojis
+                - SUMMARY: Use line breaks to separate key points
+                - Include positive, encouraging emojis throughout
+                - Use clear, concise language that's easy to scan
+                - Make it inspiring and actionable
+                - Keep paragraphs short for better readability
+                
+                In the SUMMARY, include helpful guidance:
+                - Preparation tips for upcoming tasks (e.g., organize workspace, gather materials, review goals)
+                - Work-life balance reminders (e.g., schedule downtime, take breaks, celebrate milestones, maintain healthy habits)
+                - Encourage sustainable productivity and well-being"""
+
+            user_prompt = (
+                f"This month's todos:\n{this_month_todos_text}\n\n"
+                f"TITLE: [5-10 word catchy title with 1-2 emojis in {normalized_language}]\n"
+                f"SUMMARY: [motivating summary, max 400 chars with emojis in {normalized_language}]"
+            )
+
+            # Generate both title and summary in a single API call (reduced tokens for faster response)
+            response = self._safe_chat_call(
+                system_prompt,
+                user_prompt,
+                max_tokens=200,  # Reduced from 300 for faster generation
+                temperature=0.7,
+                language=normalized_language,
+            )
+
+            # Parse the response to extract title and summary
+            title = None
+            summary = None
+            
+            if response:
+                response_text = response.strip()
+                # Try to parse the structured response using regex for more robust parsing
+                # Look for TITLE: and SUMMARY: markers (case-insensitive, flexible spacing)
+                title_pattern = r'(?:^|\n)\s*TITLE\s*:\s*(.+?)(?=\n\s*SUMMARY\s*:|$)'
+                summary_pattern = r'(?:^|\n)\s*SUMMARY\s*:\s*(.+?)(?=\n\s*TITLE\s*:|$)'
+                
+                # Try to find title and summary using regex
+                title_match = re.search(title_pattern, response_text, re.IGNORECASE | re.DOTALL)
+                summary_match = re.search(summary_pattern, response_text, re.IGNORECASE | re.DOTALL)
+                
+                if title_match:
+                    title = title_match.group(1).strip()
+                if summary_match:
+                    summary = summary_match.group(1).strip()
+                
+                # If regex didn't work, try simpler line-by-line parsing
+                if not title or not summary:
+                    lines = response_text.split('\n')
+                    for i, line in enumerate(lines):
+                        line_upper = line.strip().upper()
+                        if line_upper.startswith('TITLE:'):
+                            title_text = line.split(':', 1)[1].strip() if ':' in line else ''
+                            # Check if there's more on the same line or next lines before SUMMARY
+                            if i + 1 < len(lines) and not lines[i + 1].strip().upper().startswith('SUMMARY:'):
+                                # Collect until SUMMARY or end
+                                j = i + 1
+                                while j < len(lines) and not lines[j].strip().upper().startswith('SUMMARY:'):
+                                    title_text += ' ' + lines[j].strip()
+                                    j += 1
+                            if title_text:
+                                title = title_text.strip()
+                        elif line_upper.startswith('SUMMARY:'):
+                            summary_text = line.split(':', 1)[1].strip() if ':' in line else ''
+                            # Collect remaining lines
+                            if i + 1 < len(lines):
+                                summary_text += ' ' + ' '.join([l.strip() for l in lines[i+1:]])
+                            if summary_text:
+                                summary = summary_text.strip()
+                                break
+                
+                # Final fallback: if parsing completely failed, treat entire response as summary
+                if not title or not summary:
+                    logger.warning("Failed to parse title and summary from structured response, using fallback")
+                    if not summary:
+                        summary = response_text
+                    # Use first few words as title if title parsing failed
+                    if not title:
+                        words = summary.split()[:8]  # First 8 words
+                        title = ' '.join(words)
+                        if len(title) > 60:
+                            title = title[:57] + '...'
+
+            logger.info("This month's todos title and summary (from text) generated successfully")
+            return (title, summary)
+
+        except Exception as e:
+            logger.error(f"Failed to generate this month's todos title and summary from text: {str(e)}")
+    def summarize_this_year_todos_from_text(self, this_year_todos_text: str, language: str = "thai") -> tuple[str, str]:
         """
-        Generate a summary of this year's todos when the data is provided as a single string.
+        Generate a title and summary of this year's todos when the data is provided as a single string.
         
         Args:
             this_year_todos_text: Raw text describing this year's todos (any format)
             language: Language for the response (e.g. 'thai', 'english')
             
         Returns:
-            Short, motivating summary of this year's todos
+            Tuple of (title, summary) where title is short and catchy, summary is motivating and actionable.
+            Returns (None, None) if input is invalid or generation fails.
         """
         try:
             # Validate inputs
             if not this_year_todos_text or not this_year_todos_text.strip():
                 logger.info("No this year's todos text provided for summary")
-                return None
+                return (None, None)
 
-            # Build concise prompt
+            # Truncate very long input to prevent timeout (limit to 5000 characters)
+            original_length = len(this_year_todos_text)
+            if original_length > 5000:
+                logger.warning(f"Input text is very long ({original_length} chars), truncating to 5000 chars")
+                this_year_todos_text = this_year_todos_text[:5000] + "..."
+            
+            normalized_language = self.validator.validate_language(language)
+            
+            # Build concise prompt for both title and summary (single API call, optimized for speed)
             system_prompt = (
-                "You are Evo, a friendly and inspiring AI lifestyle coach helping users grow and evolve. "
-                "Create a motivating, and actionable summary. "
-                "Keep responses under 250 characters and include positive emojis."
+                "You are Evo, an inspiring AI coach. "
+                "Return TITLE and SUMMARY in this exact format:\n"
+                "TITLE: [5-10 words, 1-2 emojis]\n"
+                "SUMMARY: [max 200 chars, positive emojis]"
             )
 
-            # User prompt uses the raw text directly
             user_prompt = (
-                f"Please summarize this year's todos (in any format):\n"
-                f"{this_year_todos_text}\n\n"
-                f"Max 250 characters. Include positive emojis. Use {language} language."
+                f"This year's todos:\n{this_year_todos_text}\n\n"
+                f"TITLE: [5-10 word catchy title with 1-2 emojis in {normalized_language}]\n"
+                f"SUMMARY: [motivating summary, max 200 chars with emojis in {normalized_language}]"
             )
 
-            # Make API call with optimized parameters
+            # Generate both title and summary in a single API call (reduced tokens for faster response)
             response = self._safe_chat_call(
                 system_prompt,
                 user_prompt,
-                max_tokens=250,
-                temperature=0.7,  # Balance creativity with consistency
-                language=self.validator.validate_language(language),
+                max_tokens=200,  # Reduced from 300 for faster generation
+                temperature=0.7,
+                language=normalized_language,
             )
 
-            logger.info("This year's todos summary (from text) generated successfully")
-            return response
+            # Parse the response to extract title and summary
+            title = None
+            summary = None
+            
+            if response:
+                response_text = response.strip()
+                # Try to parse the structured response using regex for more robust parsing
+                # Look for TITLE: and SUMMARY: markers (case-insensitive, flexible spacing)
+                title_pattern = r'(?:^|\n)\s*TITLE\s*:\s*(.+?)(?=\n\s*SUMMARY\s*:|$)'
+                summary_pattern = r'(?:^|\n)\s*SUMMARY\s*:\s*(.+?)(?=\n\s*TITLE\s*:|$)'
+                
+                # Try to find title and summary using regex
+                title_match = re.search(title_pattern, response_text, re.IGNORECASE | re.DOTALL)
+                summary_match = re.search(summary_pattern, response_text, re.IGNORECASE | re.DOTALL)
+                
+                if title_match:
+                    title = title_match.group(1).strip()
+                if summary_match:
+                    summary = summary_match.group(1).strip()
+                
+                # If regex didn't work, try simpler line-by-line parsing
+                if not title or not summary:
+                    lines = response_text.split('\n')
+                    for i, line in enumerate(lines):
+                        line_upper = line.strip().upper()
+                        if line_upper.startswith('TITLE:'):
+                            title_text = line.split(':', 1)[1].strip() if ':' in line else ''
+                            # Check if there's more on the same line or next lines before SUMMARY
+                            if i + 1 < len(lines) and not lines[i + 1].strip().upper().startswith('SUMMARY:'):
+                                # Collect until SUMMARY or end
+                                j = i + 1
+                                while j < len(lines) and not lines[j].strip().upper().startswith('SUMMARY:'):
+                                    title_text += ' ' + lines[j].strip()
+                                    j += 1
+                            if title_text:
+                                title = title_text.strip()
+                        elif line_upper.startswith('SUMMARY:'):
+                            summary_text = line.split(':', 1)[1].strip() if ':' in line else ''
+                            # Collect remaining lines
+                            if i + 1 < len(lines):
+                                summary_text += ' ' + ' '.join([l.strip() for l in lines[i+1:]])
+                            if summary_text:
+                                summary = summary_text.strip()
+                                break
+                
+                # Final fallback: if parsing completely failed, treat entire response as summary
+                if not title or not summary:
+                    logger.warning("Failed to parse title and summary from structured response, using fallback")
+                    if not summary:
+                        summary = response_text
+                    # Use first few words as title if title parsing failed
+                    if not title:
+                        words = summary.split()[:8]  # First 8 words
+                        title = ' '.join(words)
+                        if len(title) > 60:
+                            title = title[:57] + '...'
+
+            logger.info("This year's todos title and summary (from text) generated successfully")
+            return (title, summary)
 
         except Exception as e:
-            logger.error(f"Failed to generate this year's todos summary from text: {str(e)}")
-            return None
+            logger.error(f"Failed to generate this year's todos title and summary from text: {str(e)}")
+            return (None, None)
 # Global instance for backward compatibility
 _default_planner = None
 
@@ -787,7 +935,14 @@ def get_todo_information(user_query: str, todo_data: Dict[str, Any], language: s
     planner = get_default_planner()
     return planner.get_todo_information_generator_response(user_query, todo_data, language)
 
-def summarize_this_year_todos_message(this_year_todos_data: str, language: str = "thai") -> str:
+def summarize_this_year_todos_message(this_year_todos_data: str, language: str = "thai") -> tuple[str, str]:
     """Backward compatibility function for summarizing this year's todos"""
     planner = get_default_planner()
-    return planner.summarize_this_year_todos_from_text(this_year_todos_data, language)
+    title, summary = planner.summarize_this_year_todos_from_text(this_year_todos_data, language)
+    return title, summary
+
+def summarize_this_month_todos_message(this_month_todos_data: str, language: str = "thai") -> tuple[str, str]:
+    """Backward compatibility function for summarizing this month's todos"""
+    planner = get_default_planner()
+    title, summary = planner.summarize_this_month_todos_from_text(this_month_todos_data, language)
+    return title, summary

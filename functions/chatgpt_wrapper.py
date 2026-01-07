@@ -36,7 +36,7 @@ class ChatConfig:
     top_p: float = 0.9
     max_tokens: int = 300
     timeout: int = 60  # Increased from 30 to 60 seconds
-    max_retries: int = 3
+    max_retries: int = 5  # Increased for better rate limit handling
     retry_delay: float = 1.0
     connection_timeout: int = 10  # New: connection timeout
     read_timeout: int = 60  # New: read timeout
@@ -117,21 +117,38 @@ class CircuitBreaker:
 class RateLimiter:
     """Simple rate limiter for API calls"""
     
-    def __init__(self, max_calls: int = 10, time_window: float = 60.0):
+    def __init__(self, max_calls: int = 8, time_window: float = 60.0):
         self.max_calls = max_calls
         self.time_window = time_window
         self.calls: List[float] = []
+        self.lock = Lock()  # Thread-safe operations
     
     def can_proceed(self) -> bool:
         """Check if we can make another API call"""
-        now = time.time()
-        # Remove old calls outside the time window
-        self.calls = [call_time for call_time in self.calls if now - call_time < self.time_window]
-        return len(self.calls) < self.max_calls
+        with self.lock:
+            now = time.time()
+            # Remove old calls outside the time window
+            self.calls = [call_time for call_time in self.calls if now - call_time < self.time_window]
+            return len(self.calls) < self.max_calls
     
     def record_call(self):
         """Record an API call"""
-        self.calls.append(time.time())
+        with self.lock:
+            self.calls.append(time.time())
+    
+    def get_wait_time(self) -> float:
+        """Get the time to wait before the next call is allowed"""
+        with self.lock:
+            if not self.calls:
+                return 0.0
+            now = time.time()
+            # Find the oldest call still in the window
+            valid_calls = [call_time for call_time in self.calls if now - call_time < self.time_window]
+            if len(valid_calls) < self.max_calls:
+                return 0.0
+            # Calculate when the oldest call will expire
+            oldest_call = min(valid_calls)
+            return (oldest_call + self.time_window) - now
 
 class ChatGPTWrapper:
     """Enhanced ChatGPT wrapper with error handling, retries, and monitoring"""
@@ -223,6 +240,19 @@ class ChatGPTWrapper:
             logger.error(f"Unexpected API error on attempt {attempt}: {error_msg}")
             return "I encountered an unexpected error. Please try again later."
     
+    def _extract_retry_after(self, error: Exception) -> Optional[float]:
+        """Extract retry-after time from error response if available"""
+        try:
+            if hasattr(error, 'response') and error.response is not None:
+                headers = error.response.headers
+                if 'retry-after' in headers:
+                    retry_after = float(headers['retry-after'])
+                    logger.info(f"Extracted retry-after: {retry_after} seconds")
+                    return retry_after
+        except (AttributeError, ValueError, TypeError):
+            pass
+        return None
+    
     def _make_api_call(self, messages: List[Dict[str, str]], config: Optional[ChatConfig] = None, attempt: int = 1) -> str:
         """Make API call with retry logic and circuit breaker"""
         try:
@@ -236,8 +266,9 @@ class ChatGPTWrapper:
             
             # Check rate limiting
             if not self.rate_limiter.can_proceed():
-                logger.warning("Rate limit exceeded, waiting...")
-                time.sleep(current_config.retry_delay * 2)
+                wait_time = max(self.rate_limiter.get_wait_time(), current_config.retry_delay * 2)
+                logger.warning(f"Rate limit exceeded, waiting {wait_time:.1f}s...")
+                time.sleep(wait_time)
             
             self.rate_limiter.record_call()
             
@@ -258,6 +289,29 @@ class ChatGPTWrapper:
             self.circuit_breaker.record_success()
             logger.info(f"API call successful (attempt {attempt})")
             return content.strip()
+            
+        except RateLimitError as e:
+            # Handle rate limit errors with special retry logic
+            self.circuit_breaker.record_failure()
+            
+            # Extract retry-after if available
+            retry_after = self._extract_retry_after(e)
+            
+            # Check if we should retry
+            if attempt < current_config.max_retries:
+                # Use retry-after if available, otherwise use longer exponential backoff for rate limits
+                if retry_after:
+                    backoff_time = retry_after + (time.time() % 1)  # Add jitter
+                else:
+                    # Longer backoff for rate limits: start with 5 seconds, then exponential
+                    backoff_time = 5.0 * (2 ** (attempt - 1)) + (time.time() % 1)
+                
+                logger.warning(f"Rate limit exceeded on attempt {attempt}, retrying in {backoff_time:.1f}s...")
+                time.sleep(backoff_time)
+                return self._make_api_call(messages, config, attempt + 1)
+            else:
+                logger.error(f"Rate limit exceeded after {current_config.max_retries} attempts")
+                return "I'm currently experiencing high demand. Please try again in a few moments."
             
         except Exception as e:
             # Record failure in circuit breaker
