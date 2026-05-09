@@ -34,7 +34,7 @@ def _safe_chat_call(self, system_prompt: str, user_prompt: str, language: str = 
         return self.wrapper.chat_with_gpt(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            max_tokens=self.config.max_tokens,
+            max_completion_tokens=self.config.max_completion_tokens,
             temperature=self.config.temperature,
             top_p=self.config.top_p,
             language=language,
@@ -45,14 +45,14 @@ def _safe_chat_call(self, system_prompt: str, user_prompt: str, language: str = 
 def _safe_chat_call(self, system_prompt: str, user_prompt: str, language: str = "thai", **kwargs) -> str:
     try:
         # Extract specific parameters from kwargs to avoid conflicts
-        max_tokens = kwargs.pop('max_tokens', self.config.max_tokens)
+        max_completion_tokens = kwargs.pop('max_completion_tokens', self.config.max_completion_tokens)
         temperature = kwargs.pop('temperature', self.config.temperature)
         top_p = kwargs.pop('top_p', self.config.top_p)
         
         return self.wrapper.chat_with_gpt(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            max_tokens=max_tokens,
+            max_completion_tokens=max_completion_tokens,
             temperature=temperature,
             top_p=top_p,
             language=language,
@@ -113,7 +113,7 @@ cd functions
 from planner_utils import PlannerUtils, PlannerConfig
 
 # Test with custom parameters
-config = PlannerConfig(max_tokens=50, temperature=0.7)
+config = PlannerConfig(max_completion_tokens=50, temperature=1.0)
 planner = PlannerUtils(config=config)
 
 # This will use the custom parameters

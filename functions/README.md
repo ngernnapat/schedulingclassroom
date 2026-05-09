@@ -117,7 +117,7 @@ Generates an optimized school schedule based on provided parameters.
 
 - `firebase-functions==0.1.0` - Firebase Functions framework
 - `firebase-admin==6.2.0` - Firebase Admin SDK
-- `pandas==2.0.3` - Data manipulation
+- `pandas==2.1.0` - Data manipulation
 - `pulp==2.7.0` - Linear programming
 - `ortools==9.7.2997` - Google OR-Tools for optimization
 - `plotly==5.15.0` - Data visualization

@@ -2,26 +2,47 @@ import os
 import json
 import time
 import uuid
-from typing import List, Optional, Literal, Dict, Any
+import asyncio
+import concurrent.futures
+from typing import List, Optional, Literal, Dict, Any, Tuple, Union
 from dataclasses import dataclass, asdict
 
-from firebase_functions import https_fn
-from firebase_admin import initialize_app
+# Firebase imports - optional for local testing
+try:
+    from firebase_functions import https_fn
+    from firebase_admin import initialize_app
+    FIREBASE_AVAILABLE = True
+except ImportError:
+    FIREBASE_AVAILABLE = False
+    https_fn = None
+    print("Note: Firebase modules not available - running in local mode")
 
 from pydantic import BaseModel, Field, ValidationError, conint, constr, model_validator
 
 # ---- Initialize Firebase Admin (safe if called multiple times) ----
-try:
-    initialize_app()
-except ValueError:
-    # Already initialized in warm container
-    pass
+if FIREBASE_AVAILABLE:
+    try:
+        initialize_app()
+    except ValueError:
+        # Already initialized in warm container
+        pass
 
 # ---- OpenAI (Responses API) ----
 # pip install openai>=1.40
 from openai import OpenAI
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Lazy initialization of OpenAI client to prevent cold start failures
+_openai_client = None
+
+def get_openai_client():
+    """Get or create OpenAI client with lazy initialization."""
+    global _openai_client
+    if _openai_client is None:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY environment variable is not set")
+        _openai_client = OpenAI(api_key=api_key)
+    return _openai_client
 
 
 # =========================
@@ -29,6 +50,121 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 # =========================
 
 PlanCategory = Literal["learning", "exercise", "travel", "finance", "health", "personal_development", "other"]
+
+# =========================
+# Extracted User Context (from detailPrompt)
+# =========================
+
+class UserProfile(BaseModel):
+    """Extracted user profile information"""
+    experience_level: Optional[Literal["beginner", "intermediate", "advanced", "expert"]] = Field(
+        default=None,
+        description="User's experience level in this domain"
+    )
+    age_group: Optional[Literal["teen", "young_adult", "adult", "senior"]] = Field(
+        default=None,
+        description="User's age group for appropriate content"
+    )
+    physical_limitations: Optional[List[str]] = Field(
+        default=None,
+        description="Any physical limitations or health conditions mentioned"
+    )
+    available_resources: Optional[List[str]] = Field(
+        default=None,
+        description="Equipment, tools, or resources user has access to"
+    )
+    location: Optional[str] = Field(
+        default=None,
+        description="User's location or destination (for travel/local activities)"
+    )
+
+class UserGoals(BaseModel):
+    """Extracted user goals and motivations"""
+    primary_goal: Optional[str] = Field(
+        default=None,
+        description="Main objective user wants to achieve"
+    )
+    secondary_goals: Optional[List[str]] = Field(
+        default=None,
+        description="Additional objectives or sub-goals"
+    )
+    target_outcome: Optional[str] = Field(
+        default=None,
+        description="Specific measurable outcome (e.g., 'run 5K', 'pass JLPT N3', 'lose 5kg')"
+    )
+    deadline: Optional[str] = Field(
+        default=None,
+        description="Any mentioned deadline or target date"
+    )
+    motivation_type: Optional[Literal["achievement", "health", "social", "mastery", "enjoyment", "necessity"]] = Field(
+        default=None,
+        description="Primary motivation driving the user"
+    )
+
+class UserConstraints(BaseModel):
+    """Extracted user constraints and preferences"""
+    budget_level: Optional[Literal["minimal", "moderate", "flexible", "unlimited"]] = Field(
+        default=None,
+        description="Budget constraints mentioned"
+    )
+    time_constraints: Optional[str] = Field(
+        default=None,
+        description="Any time limitations or busy periods mentioned"
+    )
+    excluded_activities: Optional[List[str]] = Field(
+        default=None,
+        description="Activities user wants to avoid"
+    )
+    preferred_activities: Optional[List[str]] = Field(
+        default=None,
+        description="Activities user prefers or enjoys"
+    )
+    rest_requirements: Optional[str] = Field(
+        default=None,
+        description="Rest day preferences or recovery needs"
+    )
+
+class UserLearningStyle(BaseModel):
+    """Extracted learning and engagement preferences"""
+    learning_style: Optional[Literal["visual", "reading", "hands_on", "auditory", "mixed"]] = Field(
+        default=None,
+        description="Preferred way of learning"
+    )
+    pace_preference: Optional[Literal["slow_steady", "moderate", "intensive", "flexible"]] = Field(
+        default=None,
+        description="Preferred pace of progression"
+    )
+    feedback_preference: Optional[Literal["detailed", "brief", "encouraging", "challenging"]] = Field(
+        default=None,
+        description="How user prefers to receive guidance"
+    )
+
+class ExtractedUserContext(BaseModel):
+    """Complete extracted context from user's detailPrompt"""
+    profile: UserProfile = Field(default_factory=UserProfile)
+    goals: UserGoals = Field(default_factory=UserGoals)
+    constraints: UserConstraints = Field(default_factory=UserConstraints)
+    learning_style: UserLearningStyle = Field(default_factory=UserLearningStyle)
+    
+    # Category-specific extracted information
+    category_specific: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Category-specific details extracted from the prompt"
+    )
+    
+    # Raw interpretation
+    key_requirements: Optional[List[str]] = Field(
+        default=None,
+        description="Key requirements extracted as bullet points"
+    )
+    tone_preference: Optional[Literal["professional", "casual", "motivational", "educational", "friendly"]] = Field(
+        default=None,
+        description="Preferred tone for the content"
+    )
+    special_considerations: Optional[List[str]] = Field(
+        default=None,
+        description="Any special considerations or notes"
+    )
 
 class TimeStamp(BaseModel):
     seconds: int = Field(..., description="Unix seconds")
@@ -48,7 +184,30 @@ class DayPlan(BaseModel):
     title: constr(strip_whitespace=True, min_length=1)
     summary: constr(strip_whitespace=True, min_length=1)
     tasks: List[Task] = Field(default_factory=list)
-    tips: Optional[str] = None
+    tips: Optional[Union[str, List[str]]] = None
+    
+    @model_validator(mode='before')
+    @classmethod
+    def convert_tips_to_string(cls, data: Any) -> Any:
+        """Convert tips from list to string if needed"""
+        if isinstance(data, dict) and 'tips' in data:
+            tips = data['tips']
+            if isinstance(tips, list):
+                # Join list items with newline or bullet points
+                data['tips'] = '\n• '.join(tips) if tips else None
+        return data
+
+class PlannerSummary(BaseModel):
+    """Summary information about the generated planner"""
+    overview: Optional[str] = Field(None, description="Brief overview of what this plan covers and its approach")
+    #targetAudience: Optional[str] = Field(None, description="Who this plan is best suited for")
+    #expectedOutcomes: Optional[List[str]] = Field(None, description="What the user can expect to achieve")
+    keyMilestones: Optional[List[str]] = Field(None, description="Major milestones throughout the plan")
+    #difficultyProgression: Optional[str] = Field(None, description="How difficulty changes over the plan (e.g., 'Gradual increase from beginner to intermediate')")
+    #totalEstimatedHours: Optional[float] = Field(None, description="Total estimated hours to complete the plan")
+    #prerequisites: Optional[List[str]] = Field(None, description="What the user should have/know before starting")
+    tipsForSuccess: Optional[List[str]] = Field(None, description="Key tips to maximize success with this plan")
+    weeklyFocus: Optional[List[str]] = Field(None, description="Brief focus area for each week")
 
 class PlannerContent(BaseModel):
     planName: constr(strip_whitespace=True, min_length=1)
@@ -60,6 +219,12 @@ class PlannerContent(BaseModel):
     createdAt: TimeStamp
     days: List[DayPlan]
     warning: Optional[str] = None  # For day count mismatch warnings
+    
+    # New summary fields
+    summary: Optional[PlannerSummary] = Field(None, description="Summary information about the planner")
+    tags: Optional[List[str]] = Field(None, description="Relevant tags for categorization and search")
+    difficultyLevel: Optional[str] = Field(None, description="Overall difficulty level (beginner, intermediate, advanced)")
+    estimatedCompletionRate: Optional[str] = Field(None, description="Expected completion rate with consistent effort")
 
 # -------- Request --------
 class GeneratePlannerRequest(BaseModel):
@@ -110,6 +275,17 @@ class GeneratePlannerRequest(BaseModel):
     timeOfDay: Optional[Literal["morning", "afternoon", "evening", "flexible"]] = Field(
         default=None,
         description="Preferred time of day for activities"
+    )
+    
+    # Performance options
+    fastMode: bool = Field(
+        default=False,
+        description="Enable fast mode for quicker generation (uses faster model, may have slightly lower quality). Default is True for better UX."
+    )
+    
+    skipContextExtraction: bool = Field(
+        default=False,
+        description="Skip the context extraction step for faster generation (less personalized)"
     )
     
     @model_validator(mode='after')
@@ -187,12 +363,272 @@ class PlanChunk:
 
 @dataclass
 class ChatWrapperConfig:
-    model: str = "gpt-4o"
-    temperature: float = 0.7
+    model: str = "gpt-5.2"  # High quality model for content generation
+    fast_model: str = "gpt-5.1"  # Faster model for fast mode
+    extraction_model: str = "gpt-5.1"  # Faster model for context extraction
+    temperature: float = 1.0  # Default temperature (some models only support 1.0)
+    fast_temperature: float = 1.0  # Default temperature for fast mode
+    extraction_temperature: float = 1.0  # Default temperature for extraction
     chunk_size: int = 30  # Days per chunk for large plans
     max_chunks: int = 3   # Maximum number of chunks (90 days max)
     # Guardrails via JSON schema (response_format)
     json_schema: Dict[str, Any] = None
+
+
+class ContextExtractor:
+    """
+    Extracts structured user context from free-form detailPrompt using LLM.
+    This enables personalized planner generation without requiring users to fill many fields.
+    """
+    
+    def __init__(self, model: str = "gpt-5-mini", temperature: float = 1.0):
+        self.model = model
+        self.temperature = temperature
+    
+    def _get_extraction_schema(self, category: str) -> Dict[str, Any]:
+        """Get JSON schema for context extraction based on category"""
+        
+        # Category-specific fields to extract
+        category_specific_schema = {
+            "learning": {
+                "type": "object",
+                "properties": {
+                    "subject_area": {"type": ["string", "null"], "description": "Main subject being learned"},
+                    "current_knowledge": {"type": ["string", "null"], "description": "What user already knows"},
+                    "target_skill_level": {"type": ["string", "null"], "description": "Desired proficiency level"},
+                    "learning_resources": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Available learning materials"},
+                    "exam_or_certification": {"type": ["string", "null"], "description": "Any exam or certification goal"},
+                    "practice_focus": {"type": ["string", "null"], "description": "Specific areas to focus practice on"}
+                }
+            },
+            "exercise": {
+                "type": "object",
+                "properties": {
+                    "fitness_goal": {"type": ["string", "null"], "description": "Primary fitness objective"},
+                    "current_fitness_level": {"type": ["string", "null"], "description": "Current fitness state"},
+                    "workout_types_preferred": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Preferred workout types"},
+                    "equipment_available": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Available equipment"},
+                    "injuries_or_limitations": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Physical limitations"},
+                    "workout_location": {"type": ["string", "null"], "description": "Where workouts will happen"},
+                    "target_metrics": {"type": ["string", "null"], "description": "Specific metrics to achieve"}
+                }
+            },
+            "travel": {
+                "type": "object",
+                "properties": {
+                    "destination": {"type": ["string", "null"], "description": "Travel destination(s)"},
+                    "trip_type": {"type": ["string", "null"], "description": "Type of trip (adventure, relaxation, cultural, etc.)"},
+                    "travel_companions": {"type": ["string", "null"], "description": "Who is traveling (solo, couple, family, group)"},
+                    "interests": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Activities and interests"},
+                    "accommodation_preference": {"type": ["string", "null"], "description": "Preferred accommodation type"},
+                    "transportation_preference": {"type": ["string", "null"], "description": "Preferred transportation"},
+                    "must_see_places": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Must-visit locations"}
+                }
+            },
+            "finance": {
+                "type": "object",
+                "properties": {
+                    "financial_goal": {"type": ["string", "null"], "description": "Primary financial objective"},
+                    "current_situation": {"type": ["string", "null"], "description": "Current financial state"},
+                    "income_level": {"type": ["string", "null"], "description": "General income bracket"},
+                    "debt_situation": {"type": ["string", "null"], "description": "Any debt to manage"},
+                    "saving_target": {"type": ["string", "null"], "description": "Specific saving goal"},
+                    "investment_interest": {"type": ["string", "null"], "description": "Interest in investments"},
+                    "financial_knowledge": {"type": ["string", "null"], "description": "Current financial literacy level"}
+                }
+            },
+            "health": {
+                "type": "object",
+                "properties": {
+                    "health_goal": {"type": ["string", "null"], "description": "Primary health objective"},
+                    "current_health_status": {"type": ["string", "null"], "description": "Current health state"},
+                    "health_conditions": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Existing health conditions"},
+                    "diet_preferences": {"type": ["string", "null"], "description": "Dietary preferences or restrictions"},
+                    "sleep_patterns": {"type": ["string", "null"], "description": "Current sleep habits"},
+                    "stress_level": {"type": ["string", "null"], "description": "Current stress level"},
+                    "wellness_focus": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Areas to focus on"}
+                }
+            },
+            "personal_development": {
+                "type": "object",
+                "properties": {
+                    "development_area": {"type": ["string", "null"], "description": "Main area of development"},
+                    "current_challenges": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Current challenges faced"},
+                    "skills_to_develop": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Skills to build"},
+                    "habits_to_build": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Habits to establish"},
+                    "habits_to_break": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Habits to eliminate"},
+                    "life_area_focus": {"type": ["string", "null"], "description": "Life area to focus on"},
+                    "role_models": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Mentioned role models or influences"}
+                }
+            },
+            "other": {
+                "type": "object",
+                "properties": {
+                    "main_topic": {"type": ["string", "null"], "description": "Main topic or activity"},
+                    "specific_requirements": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Specific requirements mentioned"},
+                    "desired_outcomes": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Desired outcomes"}
+                }
+            }
+        }
+        
+        return {
+            "name": "extracted_user_context",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "profile": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "experience_level": {"type": ["string", "null"], "enum": ["beginner", "intermediate", "advanced", "expert", None]},
+                            "age_group": {"type": ["string", "null"], "enum": ["teen", "young_adult", "adult", "senior", None]},
+                            "physical_limitations": {"type": ["array", "null"], "items": {"type": "string"}},
+                            "available_resources": {"type": ["array", "null"], "items": {"type": "string"}},
+                            "location": {"type": ["string", "null"]}
+                        },
+                        "required": ["experience_level", "age_group", "physical_limitations", "available_resources", "location"]
+                    },
+                    "goals": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "primary_goal": {"type": ["string", "null"]},
+                            "secondary_goals": {"type": ["array", "null"], "items": {"type": "string"}},
+                            "target_outcome": {"type": ["string", "null"]},
+                            "deadline": {"type": ["string", "null"]},
+                            "motivation_type": {"type": ["string", "null"], "enum": ["achievement", "health", "social", "mastery", "enjoyment", "necessity", None]}
+                        },
+                        "required": ["primary_goal", "secondary_goals", "target_outcome", "deadline", "motivation_type"]
+                    },
+                    "constraints": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "budget_level": {"type": ["string", "null"], "enum": ["minimal", "moderate", "flexible", "unlimited", None]},
+                            "time_constraints": {"type": ["string", "null"]},
+                            "excluded_activities": {"type": ["array", "null"], "items": {"type": "string"}},
+                            "preferred_activities": {"type": ["array", "null"], "items": {"type": "string"}},
+                            "rest_requirements": {"type": ["string", "null"]}
+                        },
+                        "required": ["budget_level", "time_constraints", "excluded_activities", "preferred_activities", "rest_requirements"]
+                    },
+                    "learning_style": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "learning_style": {"type": ["string", "null"], "enum": ["visual", "reading", "hands_on", "auditory", "mixed", None]},
+                            "pace_preference": {"type": ["string", "null"], "enum": ["slow_steady", "moderate", "intensive", "flexible", None]},
+                            "feedback_preference": {"type": ["string", "null"], "enum": ["detailed", "brief", "encouraging", "challenging", None]}
+                        },
+                        "required": ["learning_style", "pace_preference", "feedback_preference"]
+                    },
+                    "category_specific": category_specific_schema.get(category, category_specific_schema["other"]),
+                    "key_requirements": {"type": ["array", "null"], "items": {"type": "string"}},
+                    "tone_preference": {"type": ["string", "null"], "enum": ["professional", "casual", "motivational", "educational", "friendly", None]},
+                    "special_considerations": {"type": ["array", "null"], "items": {"type": "string"}}
+                },
+                "required": ["profile", "goals", "constraints", "learning_style", "category_specific", "key_requirements", "tone_preference", "special_considerations"]
+            }
+        }
+    
+    def _get_extraction_prompt(self, category: str) -> str:
+        """Get the system prompt for context extraction"""
+        return f"""You are an expert at understanding user requirements and extracting structured information.
+
+Your task is to analyze the user's free-form description and extract relevant information for creating a personalized {category} planner.
+
+EXTRACTION GUIDELINES:
+1. Extract ONLY information that is explicitly mentioned or strongly implied
+2. Use null for any field where information is not available
+3. Be conservative - don't make assumptions beyond what's stated
+4. Look for implicit cues (e.g., "I've never done this before" implies beginner level)
+5. Extract specific details that will help personalize the plan
+
+CATEGORY-SPECIFIC EXTRACTION ({category.upper()}):
+{"- For LEARNING: Look for subject area, current knowledge, exam goals, preferred learning methods" if category == "learning" else ""}
+{"- For EXERCISE: Look for fitness goals, current fitness level, available equipment, injuries, preferred workout types" if category == "exercise" else ""}
+{"- For TRAVEL: Look for destination, trip type, companions, interests, budget, must-see places" if category == "travel" else ""}
+{"- For FINANCE: Look for financial goals, current situation, saving targets, debt, investment interest" if category == "finance" else ""}
+{"- For HEALTH: Look for health goals, conditions, diet preferences, sleep issues, stress factors" if category == "health" else ""}
+{"- For PERSONAL_DEVELOPMENT: Look for skills to develop, habits to build/break, life areas to focus on" if category == "personal_development" else ""}
+
+INFERENCE RULES:
+- "beginner/new/first time/never done" → experience_level: beginner
+- "some experience/familiar with/done before" → experience_level: intermediate  
+- "experienced/skilled/years of experience" → experience_level: advanced
+- "expert/professional/master" → experience_level: expert
+- "tight budget/cheap/affordable" → budget_level: minimal
+- "no budget limit/money is not an issue" → budget_level: unlimited
+- "intense/fast/aggressive" → pace_preference: intensive
+- "slow/gradual/easy pace" → pace_preference: slow_steady
+
+Output a JSON object with the extracted information. Use null for any fields where information is not available or cannot be inferred."""
+    
+    def extract_context(self, detail_prompt: str, category: str, plan_name: str) -> Optional[ExtractedUserContext]:
+        """
+        Extract structured context from user's free-form detail prompt.
+        
+        Args:
+            detail_prompt: User's free-form description of their requirements
+            category: The plan category (learning, exercise, etc.)
+            plan_name: Name of the plan for additional context
+            
+        Returns:
+            ExtractedUserContext with structured information, or None if extraction fails
+        """
+        if not detail_prompt or len(detail_prompt.strip()) < 10:
+            # Not enough information to extract
+            return None
+        
+        try:
+            user_message = f"""Plan Name: {plan_name}
+Category: {category}
+
+User's Description:
+{detail_prompt}
+
+Extract all relevant structured information from this description."""
+
+            response = get_openai_client().chat.completions.create(
+                model=self.model,
+                temperature=self.temperature,
+                messages=[
+                    {"role": "system", "content": self._get_extraction_prompt(category)},
+                    {"role": "user", "content": user_message}
+                ],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": self._get_extraction_schema(category)
+                }
+            )
+            
+            if not response.choices or not response.choices[0].message.content:
+                print("Warning: Empty response from context extraction")
+                return None
+            
+            raw_response = response.choices[0].message.content
+            data = json.loads(raw_response)
+            
+            # Convert to ExtractedUserContext
+            context = ExtractedUserContext(
+                profile=UserProfile(**data.get("profile", {})),
+                goals=UserGoals(**data.get("goals", {})),
+                constraints=UserConstraints(**data.get("constraints", {})),
+                learning_style=UserLearningStyle(**data.get("learning_style", {})),
+                category_specific=data.get("category_specific"),
+                key_requirements=data.get("key_requirements"),
+                tone_preference=data.get("tone_preference"),
+                special_considerations=data.get("special_considerations")
+            )
+            
+            print(f"Successfully extracted user context: {len(context.key_requirements or [])} key requirements found")
+            return context
+            
+        except Exception as e:
+            print(f"Warning: Context extraction failed: {e}. Proceeding without structured context.")
+            return None
 
 class ChatWrapper:
     """
@@ -410,19 +846,19 @@ class ChatWrapper:
             "special_considerations": []
         }
         
-        # Analyze based on category and total days (optimized for faster processing)
-        if req.totalDays <= 7:
+        # Analyze based on category and total days (OPTIMIZED FOR SPEED - larger chunks = fewer API calls)
+        if req.totalDays <= 10:
             analysis["complexity"] = "simple"
-            analysis["optimal_chunk_size"] = req.totalDays
-        elif req.totalDays <= 14:
+            analysis["optimal_chunk_size"] = req.totalDays  # Single chunk
+        elif req.totalDays <= 20:
             analysis["complexity"] = "moderate"
-            analysis["optimal_chunk_size"] = 7
+            analysis["optimal_chunk_size"] = req.totalDays  # Single chunk for speed
         elif req.totalDays <= 30:
             analysis["complexity"] = "moderate"
-            analysis["optimal_chunk_size"] = 15  # Increased from 10 to reduce API calls
+            analysis["optimal_chunk_size"] = 30  # Try single chunk first (gpt-4o can handle 30 days)
         else:
             analysis["complexity"] = "complex"
-            analysis["optimal_chunk_size"] = 20  # Increased from 15 to reduce API calls
+            analysis["optimal_chunk_size"] = 30  # Max 30 days per chunk to balance quality/speed
         
         # Category-specific analysis
         if req.category == "learning":
@@ -783,51 +1219,408 @@ class ChatWrapper:
         
         raise PlannerGenerationError(error_message, user_message)
 
-    @staticmethod
-    def _system_prompt() -> str:
-        return (
+    def _build_system_prompt(self, category: str, extracted_context: Optional[ExtractedUserContext] = None) -> str:
+        """Build a personalized system prompt based on category and extracted context"""
+        
+        base_prompt = (
             "You are an expert planner-content generator for a lifestyle planner app. "
             "Generate structured daily plans with clear titles, concise summaries, and actionable tasks. "
-            "Respect the category logic:\n"
-            "- learning: progressive skill-building with variety, spaced repetition, and weekly reflection.\n"
-            "- exercise: alternate focus (strength/cardio/flexibility/mobility), include rest & recovery, safe progressions.\n"
-            "- travel: cluster activities by location, alternate heavy/light days, include logistics & budget tips.\n"
-            "- finance: budgeting, expense tracking, saving strategies, progressive financial literacy.\n"
-            "- health: holistic wellness covering nutrition, sleep, stress management, sustainable habits.\n"
-            "- personal_development: goal setting, productivity, mindfulness, self-reflection practices.\n"
-            "- other: flexible structure based on user's specific needs and goals.\n"
-            "Rules:\n"
-            "1) Keep each day practical (2-4 tasks, which may include details from the detailPrompt). 2) Add brief tips when helpful. 3) Titles are short and motivating.\n"
-            "4) Never invent unsafe or extreme advice; prefer safe defaults.\n"
-            "5) CRITICAL: Output MUST be valid JSON matching the exact schema provided.\n"
-            "6) Include ALL required fields: planName, category, totalDays, createdAt, days.\n"
-            "7) ABSOLUTE REQUIREMENT: The 'days' array MUST contain EXACTLY the number of days specified in totalDays. If totalDays=30, you MUST generate exactly 30 days. If totalDays=7, you MUST generate exactly 7 days. NO MORE, NO LESS.\n"
-            "8) TIME ALLOCATION: If minutesPerDay is specified, use it as a flexible guideline. Allocate time to tasks based on their natural requirements and complexity. The total duration should approximate minutesPerDay (within ±20% is acceptable), but prioritize logical task durations over exact matching. Each task should have a duration_min value that reflects its actual time needs.\n"
-            "9) DAY NUMBERING: Each day must have a dayNumber field starting from 1 and incrementing sequentially (1, 2, 3, ..., totalDays).\n"
-            "10) DETAILED TASK INSTRUCTIONS: Each task MUST include comprehensive, actionable instructions that users can follow without external links. Focus on providing clear, step-by-step guidance within the task description itself.\n"
-            "   TASK QUALITY REQUIREMENTS:\n"
-            "   ✓ Provide specific, actionable steps for each task\n"
-            "   ✓ Include relevant tips, techniques, or methods\n"
-            "   ✓ Give clear success criteria or what to expect\n"
-            "   ✓ Include safety considerations where applicable\n"
-            "   ✓ Make tasks self-contained and complete\n"
-            "   ✓ Use the 'note' field for additional helpful details\n"
-            "   \n"
-            "   TASK DESCRIPTION EXAMPLES:\n"
-            "   ✅ GOOD: 'Practice Python variables: Create 5 different variable types (string, integer, float, boolean, list). Write a simple program that uses each type and prints the results. Focus on proper naming conventions and data type understanding.'\n"
-            "   ✅ GOOD: 'Morning cardio workout: Do 20 minutes of moderate-intensity exercise (brisk walking, jogging, or cycling). Start with 5-minute warm-up, maintain steady pace for 15 minutes, finish with 5-minute cool-down. Monitor your heart rate and stay hydrated.'\n"
-            "   ❌ BAD: 'Learn Python' (too vague)\n"
-            "   ❌ BAD: 'Do some exercise' (not specific enough)\n"
-           
         )
+        
+        # Category-specific expertise
+        category_expertise = {
+            "learning": (
+                "You are a learning science expert who understands spaced repetition, active recall, "
+                "and progressive skill building. Design learning plans that:\n"
+                "- Start with foundational concepts before advancing\n"
+                "- Include regular review sessions to reinforce retention\n"
+                "- Alternate between theory and practical application\n"
+                "- Build in weekly reflection and consolidation days\n"
+                "- Vary learning activities to maintain engagement\n"
+            ),
+            "exercise": (
+                "You are a certified fitness professional who understands exercise physiology and "
+                "progressive training. Design workout plans that:\n"
+                "- Follow proper periodization (preparation, building, peak, recovery)\n"
+                "- Include appropriate warm-up and cool-down for each session\n"
+                "- Alternate muscle groups and training modalities\n"
+                "- Build in rest days and deload periods\n"
+                "- Progress safely with gradual intensity increases\n"
+                "- Adapt to user's available equipment and limitations\n"
+            ),
+            "travel": (
+                "You are an experienced travel planner who understands logistics and local experiences. "
+                "Design travel itineraries that:\n"
+                "- Group activities by geographic proximity\n"
+                "- Balance busy exploration days with relaxed ones\n"
+                "- Include practical logistics (transport, timing, reservations)\n"
+                "- Suggest local experiences and hidden gems\n"
+                "- Account for weather, seasons, and local events\n"
+                "- Include buffer time for unexpected discoveries\n"
+            ),
+            "finance": (
+                "You are a financial literacy expert who understands budgeting, saving, and investing. "
+                "Design financial plans that:\n"
+                "- Start with assessment and goal-setting\n"
+                "- Build foundational habits before complex strategies\n"
+                "- Include regular tracking and review tasks\n"
+                "- Progress from saving to investing concepts\n"
+                "- Provide actionable, specific financial tasks\n"
+                "- Account for user's financial situation and goals\n"
+            ),
+            "health": (
+                "You are a wellness expert who understands holistic health and sustainable habits. "
+                "Design health plans that:\n"
+                "- Address multiple dimensions (physical, mental, nutritional)\n"
+                "- Build sustainable habits over quick fixes\n"
+                "- Include regular self-assessment checkpoints\n"
+                "- Balance action items with rest and recovery\n"
+                "- Provide evidence-based recommendations\n"
+                "- Adapt to user's health conditions and preferences\n"
+            ),
+            "personal_development": (
+                "You are a personal development coach who understands behavior change and growth. "
+                "Design development plans that:\n"
+                "- Start with self-reflection and goal clarity\n"
+                "- Build habits using proven frameworks (habit stacking, tiny habits)\n"
+                "- Include journaling and reflection prompts\n"
+                "- Progress from awareness to action to mastery\n"
+                "- Balance challenge with achievability\n"
+                "- Incorporate accountability mechanisms\n"
+            ),
+            "other": (
+                "You are a versatile planning expert who can adapt to any domain. "
+                "Design plans that:\n"
+                "- Analyze the user's specific needs carefully\n"
+                "- Create logical progression from start to goal\n"
+                "- Include variety and engagement\n"
+                "- Build in reflection and adjustment points\n"
+            )
+        }
+        
+        # Add personalization based on extracted context
+        personalization_rules = []
+        
+        if extracted_context:
+            # Experience level adaptation
+            if extracted_context.profile.experience_level:
+                level = extracted_context.profile.experience_level
+                if level == "beginner":
+                    personalization_rules.append(
+                        "BEGINNER ADAPTATION: Use simple language, provide detailed explanations, "
+                        "break tasks into smaller steps, include encouragement, avoid jargon."
+                    )
+                elif level == "intermediate":
+                    personalization_rules.append(
+                        "INTERMEDIATE ADAPTATION: Assume basic knowledge, focus on building skills, "
+                        "include moderate challenges, reference foundational concepts briefly."
+                    )
+                elif level == "advanced":
+                    personalization_rules.append(
+                        "ADVANCED ADAPTATION: Use technical terminology appropriately, focus on optimization, "
+                        "include challenging tasks, assume strong foundation."
+                    )
+                elif level == "expert":
+                    personalization_rules.append(
+                        "EXPERT ADAPTATION: Focus on mastery and refinement, include advanced techniques, "
+                        "provide nuanced recommendations, challenge conventional approaches."
+                    )
+            
+            # Age group adaptation
+            if extracted_context.profile.age_group:
+                age = extracted_context.profile.age_group
+                if age == "teen":
+                    personalization_rules.append(
+                        "TEEN ADAPTATION: Use engaging, relatable language, include social elements, "
+                        "shorter task durations, gamification where appropriate."
+                    )
+                elif age == "senior":
+                    personalization_rules.append(
+                        "SENIOR ADAPTATION: Prioritize safety and accessibility, moderate intensity, "
+                        "clear instructions, health considerations, appropriate pacing."
+                    )
+            
+            # Physical limitations
+            if extracted_context.profile.physical_limitations:
+                limitations = ", ".join(extracted_context.profile.physical_limitations)
+                personalization_rules.append(
+                    f"PHYSICAL LIMITATIONS: User has mentioned: {limitations}. "
+                    "Provide safe alternatives, avoid contraindicated activities, include modifications."
+                )
+            
+            # Goal-based personalization
+            if extracted_context.goals.primary_goal:
+                personalization_rules.append(
+                    f"PRIMARY GOAL: User wants to '{extracted_context.goals.primary_goal}'. "
+                    "Every day should contribute toward this goal. Reference progress toward it."
+                )
+            
+            if extracted_context.goals.target_outcome:
+                personalization_rules.append(
+                    f"TARGET OUTCOME: User aims for '{extracted_context.goals.target_outcome}'. "
+                    "Include measurable progress markers and milestone celebrations."
+                )
+            
+            if extracted_context.goals.deadline:
+                personalization_rules.append(
+                    f"DEADLINE: User has a target date of '{extracted_context.goals.deadline}'. "
+                    "Pace the plan appropriately to achieve goals by this date."
+                )
+            
+            # Motivation type
+            if extracted_context.goals.motivation_type:
+                motivation = extracted_context.goals.motivation_type
+                motivation_styles = {
+                    "achievement": "Focus on progress metrics, milestones, and accomplishments.",
+                    "health": "Emphasize health benefits and long-term wellbeing outcomes.",
+                    "social": "Include social elements, accountability, and sharing opportunities.",
+                    "mastery": "Focus on skill development, depth of understanding, expertise.",
+                    "enjoyment": "Prioritize fun, variety, and intrinsic satisfaction.",
+                    "necessity": "Focus on practical outcomes and efficient goal achievement."
+                }
+                personalization_rules.append(
+                    f"MOTIVATION: User is motivated by {motivation}. {motivation_styles.get(motivation, '')}"
+                )
+            
+            # Constraints
+            if extracted_context.constraints.budget_level:
+                budget = extracted_context.constraints.budget_level
+                if budget == "minimal":
+                    personalization_rules.append(
+                        "BUDGET: User has a tight budget. Prioritize free/low-cost options, DIY approaches."
+                    )
+                elif budget == "unlimited":
+                    personalization_rules.append(
+                        "BUDGET: User has flexible budget. Can suggest premium options and services."
+                    )
+            
+            if extracted_context.constraints.excluded_activities:
+                excluded = ", ".join(extracted_context.constraints.excluded_activities)
+                personalization_rules.append(
+                    f"EXCLUDED ACTIVITIES: Do NOT include: {excluded}"
+                )
+            
+            if extracted_context.constraints.preferred_activities:
+                preferred = ", ".join(extracted_context.constraints.preferred_activities)
+                personalization_rules.append(
+                    f"PREFERRED ACTIVITIES: Prioritize including: {preferred}"
+                )
+            
+            # Learning style
+            if extracted_context.learning_style.learning_style:
+                style = extracted_context.learning_style.learning_style
+                style_guidance = {
+                    "visual": "Include diagrams, visualizations, demonstrations, video references.",
+                    "reading": "Provide detailed written instructions, reading materials, documentation.",
+                    "hands_on": "Focus on practical exercises, experiments, doing over theory.",
+                    "auditory": "Include verbal instructions, discussions, audio resources.",
+                    "mixed": "Vary between different learning modalities."
+                }
+                personalization_rules.append(
+                    f"LEARNING STYLE: User prefers {style} learning. {style_guidance.get(style, '')}"
+                )
+            
+            # Pace preference
+            if extracted_context.learning_style.pace_preference:
+                pace = extracted_context.learning_style.pace_preference
+                pace_guidance = {
+                    "slow_steady": "Gradual progression, more practice time, thorough coverage.",
+                    "moderate": "Balanced pace with adequate practice and progression.",
+                    "intensive": "Aggressive progression, challenging tasks, maximum output.",
+                    "flexible": "Adaptable structure with optional extensions."
+                }
+                personalization_rules.append(
+                    f"PACE: User prefers {pace} pace. {pace_guidance.get(pace, '')}"
+                )
+            
+            # Tone preference
+            if extracted_context.tone_preference:
+                tone = extracted_context.tone_preference
+                tone_guidance = {
+                    "professional": "Use formal language, focus on efficiency and results.",
+                    "casual": "Use friendly, relaxed language, conversational tone.",
+                    "motivational": "Use encouraging, inspiring language, celebrate progress.",
+                    "educational": "Use informative, teaching-focused language, explain concepts.",
+                    "friendly": "Use warm, supportive language, personal touch."
+                }
+                personalization_rules.append(
+                    f"TONE: Write in a {tone} tone. {tone_guidance.get(tone, '')}"
+                )
+            
+            # Category-specific context
+            if extracted_context.category_specific:
+                cs = extracted_context.category_specific
+                if category == "exercise" and cs:
+                    if cs.get("equipment_available"):
+                        equip = ", ".join(cs["equipment_available"])
+                        personalization_rules.append(f"EQUIPMENT: User has access to: {equip}")
+                    if cs.get("workout_location"):
+                        personalization_rules.append(f"LOCATION: Workouts will be at: {cs['workout_location']}")
+                    if cs.get("injuries_or_limitations"):
+                        injuries = ", ".join(cs["injuries_or_limitations"])
+                        personalization_rules.append(f"INJURIES/LIMITATIONS: Be careful of: {injuries}")
+                
+                elif category == "learning" and cs:
+                    if cs.get("subject_area"):
+                        personalization_rules.append(f"SUBJECT: Focus on learning {cs['subject_area']}")
+                    if cs.get("exam_or_certification"):
+                        personalization_rules.append(f"EXAM GOAL: Preparing for {cs['exam_or_certification']}")
+                    if cs.get("current_knowledge"):
+                        personalization_rules.append(f"CURRENT KNOWLEDGE: User already knows: {cs['current_knowledge']}")
+                
+                elif category == "travel" and cs:
+                    if cs.get("destination"):
+                        personalization_rules.append(f"DESTINATION: Planning trip to {cs['destination']}")
+                    if cs.get("travel_companions"):
+                        personalization_rules.append(f"TRAVELERS: {cs['travel_companions']}")
+                    if cs.get("must_see_places"):
+                        places = ", ".join(cs["must_see_places"])
+                        personalization_rules.append(f"MUST VISIT: Include {places}")
+                
+                elif category == "finance" and cs:
+                    if cs.get("financial_goal"):
+                        personalization_rules.append(f"FINANCIAL GOAL: {cs['financial_goal']}")
+                    if cs.get("saving_target"):
+                        personalization_rules.append(f"SAVING TARGET: {cs['saving_target']}")
+                
+                elif category == "health" and cs:
+                    if cs.get("health_goal"):
+                        personalization_rules.append(f"HEALTH GOAL: {cs['health_goal']}")
+                    if cs.get("health_conditions"):
+                        conditions = ", ".join(cs["health_conditions"])
+                        personalization_rules.append(f"HEALTH CONDITIONS: Consider: {conditions}")
+                    if cs.get("diet_preferences"):
+                        personalization_rules.append(f"DIET: {cs['diet_preferences']}")
+                
+                elif category == "personal_development" and cs:
+                    if cs.get("skills_to_develop"):
+                        skills = ", ".join(cs["skills_to_develop"])
+                        personalization_rules.append(f"SKILLS TO DEVELOP: {skills}")
+                    if cs.get("habits_to_build"):
+                        habits = ", ".join(cs["habits_to_build"])
+                        personalization_rules.append(f"HABITS TO BUILD: {habits}")
+            
+            # Key requirements
+            if extracted_context.key_requirements:
+                reqs = "\n".join([f"  - {r}" for r in extracted_context.key_requirements])
+                personalization_rules.append(f"KEY REQUIREMENTS:\n{reqs}")
+            
+            # Special considerations
+            if extracted_context.special_considerations:
+                special = "\n".join([f"  - {s}" for s in extracted_context.special_considerations])
+                personalization_rules.append(f"SPECIAL CONSIDERATIONS:\n{special}")
+        
+        # Build the complete prompt
+        personalization_section = ""
+        if personalization_rules:
+            personalization_section = (
+                "\n\n=== PERSONALIZATION (CRITICAL - FOLLOW THESE) ===\n" +
+                "\n".join(personalization_rules) +
+                "\n=== END PERSONALIZATION ===\n"
+            )
+        
+        rules = """
+GENERATION RULES:
+1) Keep each day practical (2-4 tasks tailored to the user's context)
+2) Add brief tips that are relevant to the user's situation
+3) Titles should be short, motivating, and reflect the day's focus
+4) Never invent unsafe or extreme advice; prefer safe defaults
+5) CRITICAL: Output MUST be valid JSON matching the exact schema provided
+6) Include ALL required fields: planName, category, totalDays, createdAt, days, summary, tags, difficultyLevel, estimatedCompletionRate
+7) ABSOLUTE REQUIREMENT: The 'days' array MUST contain EXACTLY the number of days specified in totalDays
+8) TIME ALLOCATION: If minutesPerDay is specified, allocate time based on task complexity (±20% flexibility)
+9) DAY NUMBERING: dayNumber must start from 1 and increment sequentially
+10) DETAILED TASKS: Each task MUST include comprehensive, actionable instructions
+
+PLAN SUMMARY REQUIREMENTS (REQUIRED):
+You MUST include a comprehensive 'summary' object with these fields:
+- overview: 2-3 sentence overview of the entire plan and its approach
+- targetAudience: Who this plan is ideal for (e.g., "Beginners with no prior experience" or "Intermediate learners looking to advance")
+- expectedOutcomes: List of 3-5 specific outcomes users can expect to achieve
+- keyMilestones: List of 3-5 major milestones throughout the plan (e.g., "Week 1: Master fundamentals", "Week 2: Build first project")
+- difficultyProgression: How difficulty evolves (e.g., "Starts easy, gradually increases to intermediate level by week 3")
+- totalEstimatedHours: Calculate total hours based on daily time allocation and number of days
+- prerequisites: List any prerequisites (or null if none required)
+- tipsForSuccess: 3-5 actionable tips for users to maximize success
+- weeklyFocus: Brief description of each week's main focus area
+
+Also include:
+- tags: 5-8 relevant tags for categorization (e.g., ["python", "programming", "beginner", "30-day", "coding"])
+- difficultyLevel: Overall difficulty ("beginner", "intermediate", "advanced", or "mixed")
+- estimatedCompletionRate: Realistic completion expectation (e.g., "85% with consistent daily practice")
+
+TASK QUALITY REQUIREMENTS:
+✓ Provide specific, actionable steps personalized to the user
+✓ Include relevant tips, techniques, or methods
+✓ Give clear success criteria or what to expect
+✓ Include safety considerations where applicable
+✓ Make tasks self-contained and complete
+✓ Use the 'note' field for additional helpful details
+✓ Reference user's goals, equipment, and preferences when relevant
+
+TASK EXAMPLES:
+✅ GOOD: 'Practice Python variables: Create 5 different variable types (string, integer, float, boolean, list). Write a simple program that uses each type and prints the results. Focus on proper naming conventions and data type understanding.'
+✅ GOOD: 'Morning cardio workout: Do 20 minutes of moderate-intensity exercise (brisk walking, jogging, or cycling). Start with 5-minute warm-up, maintain steady pace for 15 minutes, finish with 5-minute cool-down.'
+❌ BAD: 'Learn Python' (too vague)
+❌ BAD: 'Do some exercise' (not specific enough)
+"""
+        
+        return base_prompt + category_expertise.get(category, category_expertise["other"]) + personalization_section + rules
+
+    def _generate_chunk_worker(
+        self, 
+        chunk_info: Tuple[int, 'PlanChunk', GeneratePlannerRequest, Optional[ExtractedUserContext], int]
+    ) -> Tuple[int, Optional[PlannerContent], Optional[str]]:
+        """
+        Worker function for parallel chunk generation.
+        Returns: (chunk_idx, content, error_message)
+        """
+        chunk_idx, chunk, req, extracted_context, total_chunks = chunk_info
+        chunk_days = chunk.end_day - chunk.start_day + 1
+        
+        max_retries = 2
+        for retry in range(max_retries + 1):
+            try:
+                # Create enhanced request for this chunk
+                enhanced_detail_prompt = self._build_chunk_prompt(req, chunk, chunk_idx, total_chunks)
+                
+                chunk_req = GeneratePlannerRequest(
+                    planName=f"{req.planName} - {chunk.phase_name}",
+                    category=req.category,
+                    totalDays=chunk_days,
+                    detailPrompt=enhanced_detail_prompt,
+                    minutesPerDay=req.minutesPerDay,
+                    intensity=req.intensity,
+                    language=req.language,
+                    startDate=req.startDate,
+                    timeOfDay=req.timeOfDay,
+                    fastMode=req.fastMode,  # Pass through fast mode
+                    skipContextExtraction=True  # Always skip for chunks (already extracted)
+                )
+                
+                # Generate this chunk with pre-extracted context (no re-extraction needed)
+                chunk_content = self.generate_single(chunk_req, extracted_context=extracted_context)
+                
+                # Adjust day numbers
+                for day in chunk_content.days:
+                    day.dayNumber = chunk.start_day + (day.dayNumber - 1)
+                
+                return (chunk_idx, chunk_content, None)
+                
+            except Exception as e:
+                if retry == max_retries:
+                    return (chunk_idx, None, f"Failed chunk {chunk_idx} ({chunk.phase_name}): {str(e)}")
+                time.sleep(0.5)
+        
+        return (chunk_idx, None, f"Failed chunk {chunk_idx} after retries")
 
     def generate_chunked(self, req: GeneratePlannerRequest) -> PlannerContent:
-        """Generate planner content using intelligent chunked approach for large plans (>7 days)"""
+        """Generate planner content using PARALLEL chunked approach for large plans (>7 days)"""
         if req.totalDays <= 7:
             # Use single generation for plans <= 7 days
             return self.generate_single(req)
         
-        # Validate maximum days (reduced to prevent timeouts)
+        # Validate maximum days
         max_days = 60
         if req.totalDays > max_days:
             raise PlannerGenerationError(
@@ -835,96 +1628,125 @@ class ChatWrapper:
                 f"Plans cannot exceed {max_days} days. Please reduce the number of days and try again."
             )
         
+        generation_start_time = time.time()
+        
+        if req.fastMode:
+            print(f"Fast mode enabled for chunked generation")
+        
+        # Stage 1: Extract user context ONCE at the beginning (shared across all chunks)
+        # Skip if skipContextExtraction is enabled
+        extracted_context = None
+        if req.detailPrompt and not req.skipContextExtraction:
+            print(f"Extracting user context for chunked generation...")
+            context_extractor = ContextExtractor(
+                model=self.config.extraction_model,
+                temperature=self.config.extraction_temperature
+            )
+            extracted_context = context_extractor.extract_context(
+                detail_prompt=req.detailPrompt,
+                category=req.category,
+                plan_name=req.planName
+            )
+            if extracted_context:
+                print(f"Context extraction successful. Primary goal: {extracted_context.goals.primary_goal}")
+            else:
+                print("Context extraction returned None, proceeding without structured context")
+        elif req.skipContextExtraction:
+            print("Context extraction skipped (skipContextExtraction=true)")
+        
+        context_time = time.time() - generation_start_time
+        print(f"Context extraction completed in {context_time:.2f}s")
+        
         # Analyze plan requirements to determine optimal chunking strategy
         analysis = self._analyze_plan_requirements(req)
-        print(f"Plan analysis: {analysis}")
         
         # Create intelligent chunks based on analysis
         chunks = self._create_intelligent_chunks(req, analysis)
-        print(f"Created {len(chunks)} intelligent chunks")
+        print(f"Created {len(chunks)} chunks for PARALLEL generation")
         
-        all_days = []
         now_s = int(time.time())
-        generation_start_time = time.time()
-        max_generation_time = 480  # 8 minutes max (leave 1 minute buffer for Cloud Run timeout)
         
-        # Generate each chunk with context and progression
-        for chunk_idx, chunk in enumerate(chunks, 1):
-            # Check if we're approaching timeout
-            elapsed_time = time.time() - generation_start_time
-            if elapsed_time > max_generation_time:
-                raise PlannerGenerationError(
-                    f"Generation timeout: Processed {chunk_idx - 1}/{len(chunks)} chunks in {elapsed_time:.2f} seconds",
-                    f"Plan generation is taking too long. Please try with fewer days or simpler requirements."
-                )
+        # Prepare chunk info for parallel processing
+        chunk_infos = [
+            (idx + 1, chunk, req, extracted_context, len(chunks))
+            for idx, chunk in enumerate(chunks)
+        ]
+        
+        # PARALLEL GENERATION using ThreadPoolExecutor
+        results = {}
+        errors = []
+        
+        # Use max 4 workers to avoid rate limits, but process chunks in parallel
+        max_workers = min(len(chunks), 4)
+        print(f"Starting parallel generation with {max_workers} workers...")
+        
+        parallel_start = time.time()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all chunks for parallel processing
+            future_to_chunk = {
+                executor.submit(self._generate_chunk_worker, info): info[0]
+                for info in chunk_infos
+            }
             
-            chunk_days = chunk.end_day - chunk.start_day + 1
-            print(f"Generating chunk {chunk_idx}/{len(chunks)}: {chunk.phase_name} (days {chunk.start_day}-{chunk.end_day}) - {elapsed_time:.2f}s elapsed")
-            
-            # Retry mechanism for chunk generation
-            max_retries = 2
-            chunk_content = None
-            chunk_start_time = time.time()
-            
-            for retry in range(max_retries + 1):
+            # Collect results as they complete
+            for future in concurrent.futures.as_completed(future_to_chunk):
+                chunk_idx = future_to_chunk[future]
                 try:
-                    # Create enhanced request for this chunk with progression context
-                    enhanced_detail_prompt = self._build_chunk_prompt(req, chunk, chunk_idx, len(chunks))
-                    
-                    chunk_req = GeneratePlannerRequest(
-                        planName=f"{req.planName} - {chunk.phase_name}",
-                        category=req.category,
-                        totalDays=chunk_days,
-                        detailPrompt=enhanced_detail_prompt,
-                        minutesPerDay=req.minutesPerDay,
-                        intensity=req.intensity,
-                        language=req.language,
-                        startDate=req.startDate,
-                        timeOfDay=req.timeOfDay
-                    )
-                    
-                    # Generate this chunk
-                    chunk_content = self.generate_single(chunk_req)
-                    chunk_time = time.time() - chunk_start_time
-                    print(f"Completed chunk {chunk_idx}/{len(chunks)} in {chunk_time:.2f} seconds")
-                    break  # Success, exit retry loop
-                    
-                except Exception as e:
-                    if retry == max_retries:
-                        # Final retry failed
-                        raise PlannerGenerationError(
-                            f"Failed to generate chunk {chunk_idx}/{len(chunks)} ({chunk.phase_name}, days {chunk.start_day}-{chunk.end_day}) after {max_retries + 1} attempts: {str(e)}",
-                            f"Could not generate the complete plan. Failed at {chunk.phase_name} phase. Please try again with fewer days or simpler requirements."
-                        )
+                    idx, content, error = future.result()
+                    if error:
+                        errors.append(error)
+                        print(f"Chunk {idx} failed: {error}")
                     else:
-                        # Wait before retry (reduced backoff for faster processing)
-                        time.sleep(1)  # Reduced from exponential backoff
+                        results[idx] = content
+                        print(f"Chunk {idx} completed successfully")
+                except Exception as e:
+                    errors.append(f"Chunk {chunk_idx} exception: {str(e)}")
+        
+        parallel_time = time.time() - parallel_start
+        print(f"Parallel generation completed in {parallel_time:.2f}s")
+        
+        # Check if any chunks failed
+        if errors:
+            raise PlannerGenerationError(
+                f"Parallel generation failed: {'; '.join(errors)}",
+                f"Could not generate the complete plan. Please try again with fewer days or simpler requirements."
+            )
+        
+        # Assemble days in correct order
+        all_days = []
+        all_tags = set()
+        first_summary = None
+        first_difficulty = None
+        first_completion_rate = None
+        
+        for idx in sorted(results.keys()):
+            chunk_content = results[idx]
+            all_days.extend(chunk_content.days)
             
-            # Adjust day numbers and add to all_days
-            for day in chunk_content.days:
-                # Map chunk day numbers to global day numbers
-                day.dayNumber = chunk.start_day + (day.dayNumber - 1)
-                all_days.append(day)
+            # Collect tags from all chunks
+            if chunk_content.tags:
+                all_tags.update(chunk_content.tags)
             
-            # Add minimal delay between chunks to avoid rate limits (reduced for faster processing)
-            if chunk_idx < len(chunks):
-                time.sleep(0.5)  # Reduced from 1 second to 0.5 seconds
+            # Use first chunk's summary as the base (it has the overview perspective)
+            if idx == 1:
+                first_summary = chunk_content.summary
+                first_difficulty = chunk_content.difficultyLevel
+                first_completion_rate = chunk_content.estimatedCompletionRate
         
         # Validate that we have the correct number of days
         if len(all_days) != req.totalDays:
             raise PlannerGenerationError(
                 f"Chunked generation failed: Expected {req.totalDays} days but got {len(all_days)}",
-                f"Could not generate the complete {req.totalDays}-day plan. Please try again with fewer days or simpler requirements."
+                f"Could not generate the complete {req.totalDays}-day plan. Please try again."
             )
         
-        # Validate day numbering is sequential
+        # Validate and fix day numbering
         for i, day in enumerate(all_days):
             expected_day_num = i + 1
             if day.dayNumber != expected_day_num:
-                print(f"Warning: Day {i+1} has incorrect dayNumber {day.dayNumber}, correcting to {expected_day_num}")
                 day.dayNumber = expected_day_num
         
-        # Create the final content
+        # Create the final content with merged summary data
         final_content = PlannerContent(
             planName=req.planName,
             category=req.category,
@@ -933,8 +1755,15 @@ class ChatWrapper:
             coverImage=None,
             coverImageUrl=None,
             createdAt={"seconds": now_s, "nanoseconds": 0},
-            days=all_days
+            days=all_days,
+            summary=first_summary,
+            tags=list(all_tags) if all_tags else None,
+            difficultyLevel=first_difficulty,
+            estimatedCompletionRate=first_completion_rate
         )
+        
+        total_time = time.time() - generation_start_time
+        print(f"Total generation time: {total_time:.2f}s (context: {context_time:.2f}s, parallel gen: {parallel_time:.2f}s)")
         
         return final_content
 
@@ -987,8 +1816,43 @@ class ChatWrapper:
         else:
             return self.generate_single(req)
 
-    def generate_single(self, req: GeneratePlannerRequest) -> PlannerContent:
+    def generate_single(self, req: GeneratePlannerRequest, extracted_context: Optional[ExtractedUserContext] = None) -> PlannerContent:
+        """
+        Generate planner content with optional pre-extracted context.
+        
+        Args:
+            req: The generation request
+            extracted_context: Pre-extracted context (if None, will extract from detailPrompt)
+        """
         now_s = int(time.time())
+        
+        # Determine model and temperature based on fast mode
+        use_model = self.config.fast_model if req.fastMode else self.config.model
+        use_temperature = self.config.fast_temperature if req.fastMode else self.config.temperature
+        
+        if req.fastMode:
+            print(f"Fast mode enabled: using {use_model}")
+        
+        # Stage 1: Extract structured context from detailPrompt if not already provided
+        # Skip if fastMode + skipContextExtraction is enabled
+        if extracted_context is None and req.detailPrompt and not req.skipContextExtraction:
+            print(f"Extracting user context from detailPrompt...")
+            context_extractor = ContextExtractor(
+                model=self.config.extraction_model,
+                temperature=self.config.extraction_temperature
+            )
+            extracted_context = context_extractor.extract_context(
+                detail_prompt=req.detailPrompt,
+                category=req.category,
+                plan_name=req.planName
+            )
+            if extracted_context:
+                print(f"Context extraction successful. Primary goal: {extracted_context.goals.primary_goal}")
+            else:
+                print("Context extraction returned None, proceeding without structured context")
+        elif req.skipContextExtraction:
+            print("Context extraction skipped (skipContextExtraction=true)")
+        
         payload = {
             "planName": req.planName,
             "category": req.category,
@@ -1002,7 +1866,7 @@ class ChatWrapper:
             "unix_now": now_s
         }
 
-        # Build the json schema for the exact PlannerContent shape
+        # Build the json schema for the exact PlannerContent shape with summary fields
         schema = self.config.json_schema or {
             "name": "planner_content",
             "schema": {
@@ -1024,6 +1888,26 @@ class ChatWrapper:
                         },
                         "required": ["seconds", "nanoseconds"]
                     },
+                    # New summary fields
+                    "summary": {
+                        "type": ["object", "null"],
+                        "additionalProperties": False,
+                        "properties": {
+                            "overview": {"type": ["string", "null"], "description": "Brief overview of the plan (2-3 sentences)"},
+                            #"targetAudience": {"type": ["string", "null"], "description": "Who this plan is best suited for"},
+                            #"expectedOutcomes": {"type": ["array", "null"], "items": {"type": "string"}, "description": "3-5 expected outcomes"},
+                            "keyMilestones": {"type": ["array", "null"], "items": {"type": "string"}, "description": "3-5 key milestones"},
+                            #"difficultyProgression": {"type": ["string", "null"], "description": "How difficulty changes"},
+                            #"totalEstimatedHours": {"type": ["number", "null"], "description": "Total hours to complete"},
+                            #"prerequisites": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Prerequisites if any"},
+                            "tipsForSuccess": {"type": ["array", "null"], "items": {"type": "string"}, "description": "3-5 tips for success"},
+                            "weeklyFocus": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Focus for each week"}
+                        },
+                        "required": ["overview", "keyMilestones", "tipsForSuccess", "weeklyFocus"]
+                    },
+                    "tags": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Relevant tags for the plan"},
+                    "difficultyLevel": {"type": ["string", "null"], "enum": ["beginner", "intermediate", "advanced", "mixed", None], "description": "Overall difficulty"},
+                    "estimatedCompletionRate": {"type": ["string", "null"], "description": "Expected completion rate"},
                     "days": {
                         "type": "array",
                         "minItems": 1,
@@ -1053,13 +1937,13 @@ class ChatWrapper:
                                         "required": ["id", "text", "done", "link"]
                                     }
                                 },
-                                "tips": {"type": ["string", "null"]}
+                                "tips": {"type": ["string", "array", "null"], "items": {"type": "string"}}
                             },
                             "required": ["id", "dayNumber", "title", "summary", "tasks"]
                         }
                     }
                 },
-                "required": ["planName", "category", "totalDays", "createdAt", "days"]
+                "required": ["planName", "category", "totalDays", "createdAt", "days", "summary", "tags", "difficultyLevel", "estimatedCompletionRate"]
             }
         }
 
@@ -1111,28 +1995,120 @@ class ChatWrapper:
         # Language requirement (brief)
         lang_note = "Write in Thai." if req.language == "th" else "Write in English."
 
-        # Build the user message
+        # Build the user message with extracted context
         user_msg_parts = [
             lang_note,
             f"Category: {req.category}",
             f"Plan name: {req.planName}",
             f"Total days: {req.totalDays}",
-            f"Minutes per day (optional): {req.minutesPerDay}",
-            f"Intensity (optional): {req.intensity}",
-            f"Details from user (optional): {req.detailPrompt}",
         ]
         
-        # Add optional context if provided
+        # Add basic parameters
+        if req.minutesPerDay:
+            user_msg_parts.append(f"Minutes per day: {req.minutesPerDay}")
+        if req.intensity:
+            user_msg_parts.append(f"Intensity: {req.intensity}")
         if req.startDate:
             user_msg_parts.append(f"Preferred start date: {req.startDate}")
         if req.timeOfDay:
             user_msg_parts.append(f"Preferred time of day: {req.timeOfDay}")
         
+        # Add original detail prompt for reference
+        if req.detailPrompt:
+            user_msg_parts.append(f"\nOriginal user description:\n{req.detailPrompt}")
+        
+        # Add extracted context as structured information
+        if extracted_context:
+            user_msg_parts.append("\n=== EXTRACTED USER PROFILE (USE THIS FOR PERSONALIZATION) ===")
+            
+            # Profile
+            if extracted_context.profile:
+                profile = extracted_context.profile
+                if profile.experience_level:
+                    user_msg_parts.append(f"Experience Level: {profile.experience_level}")
+                if profile.age_group:
+                    user_msg_parts.append(f"Age Group: {profile.age_group}")
+                if profile.physical_limitations:
+                    user_msg_parts.append(f"Physical Limitations: {', '.join(profile.physical_limitations)}")
+                if profile.available_resources:
+                    user_msg_parts.append(f"Available Resources: {', '.join(profile.available_resources)}")
+                if profile.location:
+                    user_msg_parts.append(f"Location: {profile.location}")
+            
+            # Goals
+            if extracted_context.goals:
+                goals = extracted_context.goals
+                if goals.primary_goal:
+                    user_msg_parts.append(f"\nPrimary Goal: {goals.primary_goal}")
+                if goals.secondary_goals:
+                    user_msg_parts.append(f"Secondary Goals: {', '.join(goals.secondary_goals)}")
+                if goals.target_outcome:
+                    user_msg_parts.append(f"Target Outcome: {goals.target_outcome}")
+                if goals.deadline:
+                    user_msg_parts.append(f"Deadline: {goals.deadline}")
+                if goals.motivation_type:
+                    user_msg_parts.append(f"Motivation Type: {goals.motivation_type}")
+            
+            # Constraints
+            if extracted_context.constraints:
+                constraints = extracted_context.constraints
+                if constraints.budget_level:
+                    user_msg_parts.append(f"\nBudget Level: {constraints.budget_level}")
+                if constraints.time_constraints:
+                    user_msg_parts.append(f"Time Constraints: {constraints.time_constraints}")
+                if constraints.excluded_activities:
+                    user_msg_parts.append(f"EXCLUDE These Activities: {', '.join(constraints.excluded_activities)}")
+                if constraints.preferred_activities:
+                    user_msg_parts.append(f"PREFER These Activities: {', '.join(constraints.preferred_activities)}")
+                if constraints.rest_requirements:
+                    user_msg_parts.append(f"Rest Requirements: {constraints.rest_requirements}")
+            
+            # Learning style
+            if extracted_context.learning_style:
+                ls = extracted_context.learning_style
+                if ls.learning_style:
+                    user_msg_parts.append(f"\nLearning Style: {ls.learning_style}")
+                if ls.pace_preference:
+                    user_msg_parts.append(f"Pace Preference: {ls.pace_preference}")
+                if ls.feedback_preference:
+                    user_msg_parts.append(f"Feedback Preference: {ls.feedback_preference}")
+            
+            # Category-specific details
+            if extracted_context.category_specific:
+                user_msg_parts.append(f"\nCategory-Specific Details:")
+                for key, value in extracted_context.category_specific.items():
+                    if value:
+                        if isinstance(value, list):
+                            user_msg_parts.append(f"  - {key}: {', '.join(value)}")
+                        else:
+                            user_msg_parts.append(f"  - {key}: {value}")
+            
+            # Key requirements
+            if extracted_context.key_requirements:
+                user_msg_parts.append(f"\nKey Requirements:")
+                for req_item in extracted_context.key_requirements:
+                    user_msg_parts.append(f"  • {req_item}")
+            
+            # Tone preference
+            if extracted_context.tone_preference:
+                user_msg_parts.append(f"\nTone: {extracted_context.tone_preference}")
+            
+            # Special considerations
+            if extracted_context.special_considerations:
+                user_msg_parts.append(f"\nSpecial Considerations:")
+                for consideration in extracted_context.special_considerations:
+                    user_msg_parts.append(f"  ⚠️ {consideration}")
+            
+            user_msg_parts.append("=== END EXTRACTED CONTEXT ===")
+        
+        # Add category hints
         user_msg_parts.extend([
             "",
             category_hints[req.category],
+            "",
             "Output a JSON object that strictly matches the provided schema. "
             "Use short, punchy titles; concise summaries; and 3–6 actionable tasks per day. "
+            "IMPORTANT: Personalize all content based on the extracted user context above."
         ])
         
         # Add specific guidance for minutesPerDay
@@ -1141,24 +2117,26 @@ class ChatWrapper:
                 "",
                 f"TIME ALLOCATION GUIDELINE: Aim for approximately {req.minutesPerDay} minutes per day total, but allocate time to each task based on its natural requirements and complexity. "
                 f"Each task should have a duration_min value that reflects how long it realistically takes to complete. "
-                f"The total duration can vary from {req.minutesPerDay} minutes - flexibility is preferred over rigid matching. "
-                f"Prioritize creating tasks with appropriate durations that make sense for the activity, even if the daily total is slightly different from {req.minutesPerDay} minutes."
+                f"Flexibility is preferred over rigid matching."
             ])
         else:
-            user_msg_parts.append("Task durations are optional when minutesPerDay is not specified. If you include durations, base them on the natural time requirements of each task.")
+            user_msg_parts.append("Task durations are optional. If you include durations, base them on the natural time requirements of each task.")
         
         user_msg = "\n".join(user_msg_parts)
 
+        # Build personalized system prompt using extracted context
+        system_prompt = self._build_system_prompt(req.category, extracted_context)
+        
         # Response format with JSON schema enforcement
         max_retries = 2
         for attempt in range(max_retries + 1):
             try:
-                response = client.chat.completions.create(
-                    model=self.config.model,
-                    temperature=self.config.temperature,
+                response = get_openai_client().chat.completions.create(
+                    model=use_model,  # Uses fast_model or model based on fastMode
+                    temperature=use_temperature,
                     messages=[{
                         "role": "system",
-                        "content": self._system_prompt()
+                        "content": system_prompt
                     }, {
                         "role": "user",
                         "content": user_msg
@@ -1258,6 +2236,10 @@ class ChatWrapper:
                 else:
                     d.setdefault("dayNumber", expected_day_num)
                 
+                # Convert tips from list to string if needed
+                if "tips" in d and isinstance(d["tips"], list):
+                    d["tips"] = '\n• '.join(d["tips"]) if d["tips"] else None
+                
                 if "tasks" not in d or not isinstance(d.get("tasks"), list):
                     raise PlannerGenerationError(
                         f"Missing or invalid tasks for day {i}",
@@ -1340,6 +2322,21 @@ class ChatWrapper:
                 "Failed to process the generated plan. Please try again."
             )
 
+        # Ensure summary fields are properly structured
+        if "summary" in data and isinstance(data["summary"], dict):
+            # Convert summary dict to PlannerSummary if needed
+            print(f"DEBUG: Summary data found: {list(data['summary'].keys())}")
+        else:
+            # Set default empty summary if not present
+            data.setdefault("summary", None)
+        
+        # Ensure other summary-related fields have defaults
+        data.setdefault("tags", None)
+        data.setdefault("difficultyLevel", None)
+        data.setdefault("estimatedCompletionRate", None)
+        
+        print(f"DEBUG: Final data keys before validation: {list(data.keys())}")
+
         # Validate with Pydantic (final gate)
         try:
             validated = PlannerContent(**data)
@@ -1357,6 +2354,10 @@ class ChatWrapper:
                 data.setdefault("category", req.category)
                 data.setdefault("totalDays", req.totalDays)
                 data.setdefault("createdAt", {"seconds": int(time.time()), "nanoseconds": 0})
+                data.setdefault("summary", None)
+                data.setdefault("tags", None)
+                data.setdefault("difficultyLevel", None)
+                data.setdefault("estimatedCompletionRate", None)
                 
                 # If days is still missing or invalid, fail with proper error
                 if "days" not in data or not isinstance(data.get("days"), list) or len(data["days"]) == 0:
@@ -1387,8 +2388,22 @@ def _cors_headers(origin: Optional[str]) -> Dict[str, str]:
         "Access-Control-Max-Age": "3600"
     }
 
-@https_fn.on_request(memory=2048, max_instances=5, timeout_sec=540)  # 9 minutes timeout
-def generate_planner_content(req: https_fn.Request) -> https_fn.Response:
+# Firebase Cloud Function decorator - conditionally applied
+def _firebase_decorator(func):
+    """Apply Firebase decorator only if Firebase is available"""
+    if FIREBASE_AVAILABLE:
+        return https_fn.on_request(memory=2048, max_instances=5, timeout_sec=540)(func)
+    return func
+
+@_firebase_decorator
+def generate_planner_content(req):
+    """Main HTTP handler for planner generation"""
+    # Handle both Firebase Request and Flask request objects
+    if FIREBASE_AVAILABLE:
+        origin = req.headers.get("Origin")
+    else:
+        origin = req.headers.get("Origin") if hasattr(req, 'headers') else None
+    
     origin = req.headers.get("Origin")
     if req.method == "OPTIONS":
         return https_fn.Response("", status=204, headers=_cors_headers(origin))

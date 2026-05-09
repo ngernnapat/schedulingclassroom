@@ -41,9 +41,10 @@ def test_planner_utils():
         }
         
         # Initialize planner with custom config
+        # Note: GPT-5 models only support temperature=1.0
         config = PlannerConfig(
-            max_tokens=150,
-            temperature=0.8,
+            max_completion_tokens=150,
+            temperature=1.0,  # GPT-5 models only support default temperature
             top_p=0.9,
             enable_emojis=True,
             enable_motivation=True,
@@ -117,7 +118,7 @@ def test_api_call_parameters():
         
         # Test with custom parameters
         config = PlannerConfig(
-            max_tokens=100,
+            max_completion_tokens=100,
             temperature=0.5,
             top_p=0.8
         )
@@ -135,7 +136,7 @@ def test_api_call_parameters():
         result_override = planner._safe_chat_call(
             "You are a test assistant.",
             "Say hello briefly.",
-            max_tokens=20,
+            max_completion_tokens=20,
             temperature=0.1,
             language="thai"
         )

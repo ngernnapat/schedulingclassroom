@@ -88,9 +88,39 @@ firebase deploy --only functions
 
 echo "✅ Deployment completed successfully!"
 
+# Allow public access to all functions (Firebase Functions v2 run on Cloud Run)
+echo ""
+echo "🔓 Allowing public access to all functions..."
+if command -v gcloud &> /dev/null; then
+    PROJECT_ID=$(gcloud config get-value project 2>/dev/null || echo "schedule-optimization-d83ea")
+    REGION="us-central1"
+    # List Cloud Run services (each deployed function is a service) and add allUsers invoker to each
+    FAILED=0
+    while IFS= read -r SERVICE; do
+        [ -z "$SERVICE" ] && continue
+        if gcloud run services add-iam-policy-binding "$SERVICE" \
+            --region="${REGION}" \
+            --member="allUsers" \
+            --role="roles/run.invoker" \
+            --project="${PROJECT_ID}" --quiet 2>/dev/null; then
+            echo "   ✅ ${SERVICE}"
+        else
+            echo "   ⚠️  ${SERVICE} (skipped or already public)"
+            FAILED=$((FAILED + 1))
+        fi
+    done < <(gcloud run services list --region="${REGION}" --project="${PROJECT_ID}" --format="value(metadata.name)" 2>/dev/null)
+    if [ "$FAILED" -gt 0 ]; then
+        echo "⚠️  Some services could not be updated (may already allow public access)."
+    fi
+    echo "✅ Public access step completed."
+else
+    echo "⚠️  gcloud CLI not found; skipping public access. Run allow_public_access.sh to enable."
+fi
+
 # Clean up
 deactivate
 
+echo ""
 echo "🎉 All done! Your Firebase Functions are now deployed."
 echo ""
 echo "📝 Notes:"

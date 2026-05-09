@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Planner Generation - Better UX Example</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 500px;
+            width: 100%;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+        }
+        
+        h1 {
+            text-align: center;
+            margin-bottom: 30px;
+            color: #333;
+        }
+        
+        /* Form Styles */
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #555;
+        }
+        
+        input, select, textarea {
+            width: 100%;
+            padding: 12px 16px;
+            border: 2px solid #e0e0e0;
+            border-radius: 10px;
+            font-size: 16px;
+            transition: border-color 0.3s;
+        }
+        
+        input:focus, select:focus, textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        button {
+            width: 100%;
+            padding: 16px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 18px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        
+        button:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px rgba(102, 126, 234, 0.4);
+        }
+        
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        
+        /* Loading Overlay */
+        .loading-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.8);
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+        }
+        
+        .loading-overlay.active {
+            display: flex;
+        }
+        
+        .loading-card {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 450px;
+            width: 90%;
+            text-align: center;
+        }
+        
+        /* Progress Ring */
+        .progress-ring-container {
+            position: relative;
+            width: 150px;
+            height: 150px;
+            margin: 0 auto 30px;
+        }
+        
+        .progress-ring {
+            transform: rotate(-90deg);
+        }
+        
+        .progress-ring-bg {
+            fill: none;
+            stroke: #e0e0e0;
+            stroke-width: 10;
+        }
+        
+        .progress-ring-fill {
+            fill: none;
+            stroke: url(#gradient);
+            stroke-width: 10;
+            stroke-linecap: round;
+            stroke-dasharray: 408;
+            stroke-dashoffset: 408;
+            transition: stroke-dashoffset 0.5s ease;
+        }
+        
+        .progress-text {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 36px;
+            font-weight: bold;
+            color: #667eea;
+        }
+        
+        /* Stage Indicators */
+        .stages {
+            display: flex;
+            justify-content: space-between;
+            margin: 30px 0;
+            padding: 0 10px;
+        }
+        
+        .stage {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            flex: 1;
+        }
+        
+        .stage-dot {
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            background: #e0e0e0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 8px;
+            transition: all 0.3s;
+            font-size: 12px;
+            color: white;
+        }
+        
+        .stage-dot.active {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            transform: scale(1.2);
+            animation: pulse 1.5s infinite;
+        }
+        
+        .stage-dot.completed {
+            background: #4CAF50;
+        }
+        
+        .stage-label {
+            font-size: 11px;
+            color: #888;
+            text-align: center;
+        }
+        
+        .stage-label.active {
+            color: #667eea;
+            font-weight: 600;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(102, 126, 234, 0.4); }
+            50% { box-shadow: 0 0 0 10px rgba(102, 126, 234, 0); }
+        }
+        
+        /* Progress Message */
+        .progress-message {
+            font-size: 18px;
+            color: #333;
+            margin-bottom: 10px;
+            min-height: 27px;
+        }
+        
+        .time-remaining {
+            font-size: 14px;
+            color: #888;
+            margin-bottom: 20px;
+        }
+        
+        /* Tips Carousel */
+        .tips-container {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 15px;
+            margin-top: 20px;
+        }
+        
+        .tip {
+            display: none;
+            font-size: 14px;
+            color: #666;
+            line-height: 1.5;
+        }
+        
+        .tip.active {
+            display: block;
+            animation: fadeIn 0.5s;
+        }
+        
+        .tip-icon {
+            font-size: 20px;
+            margin-bottom: 8px;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        /* Success State */
+        .success-icon {
+            font-size: 60px;
+            margin-bottom: 20px;
+        }
+        
+        .success-message {
+            font-size: 24px;
+            color: #4CAF50;
+            margin-bottom: 10px;
+        }
+        
+        /* Error State */
+        .error-message {
+            color: #f44336;
+            background: #ffebee;
+            padding: 15px;
+            border-radius: 10px;
+            margin-top: 20px;
+        }
+        
+        /* Result Preview */
+        .result-preview {
+            text-align: left;
+            margin-top: 20px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 10px;
+        }
+        
+        .result-preview h3 {
+            margin-bottom: 15px;
+            color: #333;
+        }
+        
+        .result-stat {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #e0e0e0;
+        }
+        
+        .result-stat:last-child {
+            border-bottom: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container" id="formContainer">
+        <h1>✨ Create Your Planner</h1>
+        
+        <form id="plannerForm">
+            <div class="form-group">
+                <label>Plan Name</label>
+                <input type="text" id="planName" placeholder="e.g., My 30-Day Fitness Journey" required>
+            </div>
+            
+            <div class="form-group">
+                <label>Category</label>
+                <select id="category">
+                    <option value="learning">📚 Learning</option>
+                    <option value="exercise">💪 Exercise</option>
+                    <option value="travel">✈️ Travel</option>
+                    <option value="finance">💰 Finance</option>
+                    <option value="health">🏥 Health</option>
+                    <option value="personal_development">🌱 Personal Development</option>
+                    <option value="other">📋 Other</option>
+                </select>
+            </div>
+            
+            <div class="form-group">
+                <label>Number of Days</label>
+                <input type="number" id="totalDays" value="30" min="1" max="60" required>
+            </div>
+            
+            <div class="form-group">
+                <label>Tell us about your goals</label>
+                <textarea id="detailPrompt" rows="4" placeholder="e.g., I'm a beginner wanting to learn Python for data science. I have 1 hour per day..."></textarea>
+            </div>
+            
+            <button type="submit" id="submitBtn">
+                🚀 Generate My Planner
+            </button>
+        </form>
+    </div>
+    
+    <!-- Loading Overlay -->
+    <div class="loading-overlay" id="loadingOverlay">
+        <div class="loading-card" id="loadingCard">
+            <!-- Progress State -->
+            <div id="progressState">
+                <div class="progress-ring-container">
+                    <svg class="progress-ring" width="150" height="150">
+                        <defs>
+                            <linearGradient id="gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+                                <stop offset="0%" stop-color="#667eea" />
+                                <stop offset="100%" stop-color="#764ba2" />
+                            </linearGradient>
+                        </defs>
+                        <circle class="progress-ring-bg" cx="75" cy="75" r="65" />
+                        <circle class="progress-ring-fill" id="progressRing" cx="75" cy="75" r="65" />
+                    </svg>
+                    <div class="progress-text" id="progressText">0%</div>
+                </div>
+                
+                <div class="progress-message" id="progressMessage">Starting generation...</div>
+                <div class="time-remaining" id="timeRemaining">Estimated time: calculating...</div>
+                
+                <div class="stages">
+                    <div class="stage">
+                        <div class="stage-dot" id="stage1">1</div>
+                        <div class="stage-label">Initialize</div>
+                    </div>
+                    <div class="stage">
+                        <div class="stage-dot" id="stage2">2</div>
+                        <div class="stage-label">Analyze</div>
+                    </div>
+                    <div class="stage">
+                        <div class="stage-dot" id="stage3">3</div>
+                        <div class="stage-label">Generate</div>
+                    </div>
+                    <div class="stage">
+                        <div class="stage-dot" id="stage4">4</div>
+                        <div class="stage-label">Finalize</div>
+                    </div>
+                </div>
+                
+                <div class="tips-container">
+                    <div class="tip active" id="tip1">
+                        <div class="tip-icon">💡</div>
+                        Your personalized plan is being crafted with AI...
+                    </div>
+                    <div class="tip" id="tip2">
+                        <div class="tip-icon">🎯</div>
+                        Each day is tailored to your goals and preferences
+                    </div>
+                    <div class="tip" id="tip3">
+                        <div class="tip-icon">📈</div>
+                        The plan includes progressive difficulty for best results
+                    </div>
+                    <div class="tip" id="tip4">
+                        <div class="tip-icon">✅</div>
+                        You'll get actionable tasks you can start immediately
+                    </div>
+                    <div class="tip" id="tip5">
+                        <div class="tip-icon">🌟</div>
+                        Tips and milestones are included to keep you motivated
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Success State -->
+            <div id="successState" style="display: none;">
+                <div class="success-icon">🎉</div>
+                <div class="success-message">Your Planner is Ready!</div>
+                <div class="result-preview" id="resultPreview"></div>
+                <button onclick="viewResult()" style="margin-top: 20px;">
+                    📋 View Full Plan
+                </button>
+            </div>
+            
+            <!-- Error State -->
+            <div id="errorState" style="display: none;">
+                <div class="success-icon">😕</div>
+                <div class="progress-message">Something went wrong</div>
+                <div class="error-message" id="errorMessage"></div>
+                <button onclick="hideLoading()" style="margin-top: 20px;">
+                    Try Again
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Configuration
+        const API_BASE = 'http://localhost:5001'; // Replace with your actual API URL
+        
+        let currentJobId = null;
+        let pollInterval = null;
+        let tipInterval = null;
+        let currentTip = 1;
+        let generatedResult = null;
+        
+        // Form submission
+        document.getElementById('plannerForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const request = {
+                planName: document.getElementById('planName').value,
+                category: document.getElementById('category').value,
+                totalDays: parseInt(document.getElementById('totalDays').value),
+                detailPrompt: document.getElementById('detailPrompt').value,
+                fastMode: true
+            };
+            
+            await startGeneration(request);
+        });
+        
+        async function startGeneration(request) {
+            showLoading();
+            
+            try {
+                // Option 1: Use async job API (recommended for production)
+                // const response = await fetch(`${API_BASE}/startPlannerGeneration`, {
+                //     method: 'POST',
+                //     headers: { 'Content-Type': 'application/json' },
+                //     body: JSON.stringify(request)
+                // });
+                // const data = await response.json();
+                // currentJobId = data.jobId;
+                // startPolling();
+                
+                // Option 2: Direct generation with simulated progress (for demo)
+                simulateProgress(request);
+                
+            } catch (error) {
+                showError(error.message);
+            }
+        }
+        
+        // Simulate progress for demo (replace with actual polling in production)
+        async function simulateProgress(request) {
+            const totalTime = request.totalDays * 2 + 30; // Estimate
+            let progress = 0;
+            
+            const progressInterval = setInterval(() => {
+                progress += Math.random() * 15;
+                if (progress > 95) progress = 95;
+                
+                const stage = progress < 10 ? 1 : progress < 25 ? 2 : progress < 90 ? 3 : 4;
+                const messages = [
+                    'Initializing...',
+                    'Analyzing your requirements...',
+                    `Generating your ${request.totalDays}-day plan...`,
+                    'Finalizing your planner...'
+                ];
+                
+                updateProgress(progress, messages[stage - 1], stage);
+                
+            }, 1000);
+            
+            // Actual API call
+            try {
+                const response = await fetch(`${API_BASE}/generate_planner_content`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(request)
+                });
+                
+                clearInterval(progressInterval);
+                
+                if (response.ok) {
+                    generatedResult = await response.json();
+                    updateProgress(100, 'Complete!', 4);
+                    setTimeout(() => showSuccess(generatedResult), 500);
+                } else {
+                    const error = await response.json();
+                    showError(error.message || 'Generation failed');
+                }
+            } catch (error) {
+                clearInterval(progressInterval);
+                showError(error.message);
+            }
+        }
+        
+        // Polling for async job status
+        function startPolling() {
+            pollInterval = setInterval(async () => {
+                try {
+                    const response = await fetch(
+                        `${API_BASE}/getPlannerStatus?jobId=${currentJobId}`
+                    );
+                    const status = await response.json();
+                    
+                    updateProgress(
+                        status.progress,
+                        status.progressMessage,
+                        status.stagesCompleted + 1
+                    );
+                    
+                    if (status.status === 'completed') {
+                        stopPolling();
+                        await fetchResult();
+                    } else if (status.status === 'failed') {
+                        stopPolling();
+                        showError(status.error);
+                    }
+                    
+                } catch (error) {
+                    console.error('Polling error:', error);
+                }
+            }, 2000); // Poll every 2 seconds
+        }
+        
+        function stopPolling() {
+            if (pollInterval) {
+                clearInterval(pollInterval);
+                pollInterval = null;
+            }
+        }
+        
+        async function fetchResult() {
+            const response = await fetch(
+                `${API_BASE}/getPlannerResult?jobId=${currentJobId}`
+            );
+            generatedResult = await response.json();
+            showSuccess(generatedResult);
+        }
+        
+        function updateProgress(percent, message, stage) {
+            // Update ring
+            const ring = document.getElementById('progressRing');
+            const circumference = 2 * Math.PI * 65;
+            const offset = circumference - (percent / 100) * circumference;
+            ring.style.strokeDashoffset = offset;
+            
+            // Update text
+            document.getElementById('progressText').textContent = `${Math.round(percent)}%`;
+            document.getElementById('progressMessage').textContent = message;
+            
+            // Update time remaining
+            const remaining = Math.max(0, Math.round((100 - percent) * 1.5));
+            document.getElementById('timeRemaining').textContent = 
+                remaining > 0 ? `About ${remaining} seconds remaining` : 'Almost done...';
+            
+            // Update stages
+            for (let i = 1; i <= 4; i++) {
+                const dot = document.getElementById(`stage${i}`);
+                dot.classList.remove('active', 'completed');
+                if (i < stage) {
+                    dot.classList.add('completed');
+                    dot.textContent = '✓';
+                } else if (i === stage) {
+                    dot.classList.add('active');
+                    dot.textContent = i;
+                } else {
+                    dot.textContent = i;
+                }
+            }
+        }
+        
+        function showLoading() {
+            document.getElementById('loadingOverlay').classList.add('active');
+            document.getElementById('progressState').style.display = 'block';
+            document.getElementById('successState').style.display = 'none';
+            document.getElementById('errorState').style.display = 'none';
+            
+            // Start tip rotation
+            tipInterval = setInterval(() => {
+                document.querySelectorAll('.tip').forEach(t => t.classList.remove('active'));
+                currentTip = (currentTip % 5) + 1;
+                document.getElementById(`tip${currentTip}`).classList.add('active');
+            }, 4000);
+        }
+        
+        function hideLoading() {
+            document.getElementById('loadingOverlay').classList.remove('active');
+            if (tipInterval) clearInterval(tipInterval);
+            stopPolling();
+        }
+        
+        function showSuccess(result) {
+            if (tipInterval) clearInterval(tipInterval);
+            
+            document.getElementById('progressState').style.display = 'none';
+            document.getElementById('successState').style.display = 'block';
+            
+            // Show result preview
+            const preview = document.getElementById('resultPreview');
+            preview.innerHTML = `
+                <h3>📋 ${result.planName}</h3>
+                <div class="result-stat">
+                    <span>Category</span>
+                    <strong>${result.category}</strong>
+                </div>
+                <div class="result-stat">
+                    <span>Duration</span>
+                    <strong>${result.totalDays} days</strong>
+                </div>
+                <div class="result-stat">
+                    <span>Difficulty</span>
+                    <strong>${result.difficultyLevel || 'Adaptive'}</strong>
+                </div>
+                ${result.summary?.totalEstimatedHours ? `
+                <div class="result-stat">
+                    <span>Total Time</span>
+                    <strong>${result.summary.totalEstimatedHours} hours</strong>
+                </div>
+                ` : ''}
+            `;
+        }
+        
+        function showError(message) {
+            if (tipInterval) clearInterval(tipInterval);
+            
+            document.getElementById('progressState').style.display = 'none';
+            document.getElementById('errorState').style.display = 'block';
+            document.getElementById('errorMessage').textContent = message;
+        }
+        
+        function viewResult() {
+            hideLoading();
+            console.log('Full result:', generatedResult);
+            alert('Check console for full result!\n\nIn production, navigate to the planner view page.');
+        }
+    </script>
+</body>
+</html>

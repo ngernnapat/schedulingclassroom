@@ -7,10 +7,48 @@ from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 from enum import Enum
 
-from chatgpt_wrapper import chat_with_gpt, ChatGPTWrapper, get_default_wrapper
+from chatgpt_wrapper import chat_with_gpt, ChatGPTWrapper, get_default_wrapper, RateLimitExceededError
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+
+def _format_month_context(month_context: Optional[Dict[str, Any]] = None) -> str:
+    """Format previous/current/next month data for injection into prompts. Improves RAG-style text generation."""
+    if not month_context or not isinstance(month_context, dict):
+        return ""
+    parts = []
+    for key, label in [("previous", "Previous month"), ("current", "Current month"), ("next", "Next month")]:
+        val = month_context.get(key)
+        if val is None:
+            continue
+        if isinstance(val, str) and val.strip():
+            parts.append(f"{label}: {val.strip()}")
+        elif isinstance(val, list):
+            lines = []
+            for item in val[:15]:
+                if isinstance(item, str):
+                    lines.append(f"  • {item}")
+                elif isinstance(item, dict):
+                    title = item.get("title") or item.get("name") or str(item)[:80]
+                    lines.append(f"  • {title}")
+            if lines:
+                parts.append(f"{label}:\n" + "\n".join(lines))
+    if not parts:
+        return ""
+    return "Month context (use to improve relevance and continuity):\n" + "\n\n".join(parts)
+
+
+# Analysis aims when using RAG todo context: what the model should do with the user's todo list
+RAG_TODO_ANALYSIS_AIMS = """
+When analyzing the user's todo list (from context above), always address these aims. Be practical, not theoretical—tie every point to their actual tasks and dates.
+
+1. **Prevent overload**: Flag days or weeks with too many tasks, back-to-back meetings with no buffer, or unrealistic density. Suggest what to move, drop, or defer.
+2. **Protect deep work time**: Identify focus-needed tasks (e.g. report, coding, study) and suggest when to block uninterrupted time; warn if they're squeezed between meetings.
+3. **Maintain goal momentum**: Spot recurring or goal-related items (e.g. gym, learning, project milestones). Encourage consistency and suggest how to keep them visible and achievable.
+4. **Be practical**: Give 2–4 concrete, actionable suggestions only. No generic advice—reference specific titles, dates, or patterns from their list. Use their language.
+"""
+
 
 class PlannerType(Enum):
     """Types of planner operations"""
@@ -23,8 +61,8 @@ class PlannerType(Enum):
 @dataclass
 class PlannerConfig:
     """Configuration for planner operations"""
-    max_tokens: int = 200
-    temperature: float = 0.7
+    max_completion_tokens: int = 200
+    temperature: float = 1.0
     top_p: float = 0.9
     enable_emojis: bool = True
     enable_motivation: bool = True
@@ -201,23 +239,26 @@ class PlannerUtils:
         
         logger.info("PlannerUtils initialized")
     
-    def _safe_chat_call(self, system_prompt: str, user_prompt: str, language: str = "thai", **kwargs) -> str:
+    def _safe_chat_call(self, system_prompt: str, user_prompt: str, language: str = "thai", model: str = "gpt-5.1", **kwargs) -> str:
         """Make a safe chat call with error handling and graceful degradation"""
         try:
             # Extract specific parameters from kwargs to avoid conflicts
-            max_tokens = kwargs.pop('max_tokens', self.config.max_tokens)
+            max_completion_tokens = kwargs.pop('max_completion_tokens', self.config.max_completion_tokens)
             temperature = kwargs.pop('temperature', self.config.temperature)
             top_p = kwargs.pop('top_p', self.config.top_p)
             
             return self.wrapper.chat_with_gpt(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                max_tokens=max_tokens,
+                max_completion_tokens=max_completion_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 language=language,
+                model=model,
                 **kwargs
             )
+        except RateLimitExceededError:
+            raise
         except Exception as e:
             logger.error(f"Chat call failed: {str(e)}")
             # Return graceful fallback based on language
@@ -423,9 +464,9 @@ class PlannerUtils:
                 user_query, todo_data
             )
             
-            # Make API call with moderate max_tokens for concise responses
+            # Make API call with moderate max_completion_tokens for concise responses
             response = self._safe_chat_call(
-                system_prompt, user_prompt, language=normalized_language, max_tokens=200
+                system_prompt, user_prompt, language=normalized_language, max_completion_tokens=200
             )
             
             logger.info("Todo information generated successfully")
@@ -435,13 +476,21 @@ class PlannerUtils:
             logger.error(f"Failed to get todo information: {str(e)}")
             return "I'm here to help! Could you tell me more about what you'd like to know? 😊"
 
-    def morning_message(self, today_todo_list_data: List[Dict[str, Any]], language: str = "thai") -> str:
+    def morning_message(
+        self,
+        today_todo_list_data: List[Dict[str, Any]],
+        language: str = "thai",
+        user_context: Optional[List[str]] = None,
+        month_context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
         """
         Generate a compact morning message summarizing today's tasks for notification.
         
         Args:
             today_todo_list_data: List of todo items for today
             language: Language for the response
+            user_context: Optional RAG context (e.g. from user memory) to personalize the message
+            month_context: Optional previous/current/next month data to improve relevance
         Returns:
             Compact notification message with task summary, or None if no tasks
         """
@@ -453,25 +502,33 @@ class PlannerUtils:
             total_tasks = len(today_todo_list_data)
             
             # Build concise prompt
-            system_prompt = """You are Evo, creating brief morning notifications.
-                Keep responses motivating and actionable.
+            system_prompt = """You are Evo, a friendly AI assistant creating compact morning notifications for busy users.
 
-                Format the output in a friendly, easy-to-read way:
-                - Use line breaks to separate key information
-                - Include 1-2 relevant emojis for visual appeal
-                - Use clear, concise language
-                - Make it scannable and engaging
-                - Start with a warm greeting or motivational phrase
-                
-                Include helpful suggestions:
-                - Brief preparation tips for the tasks (e.g., gather materials, set up workspace, review notes)
-                - Reminders about what to do after finishing tasks to maintain work-life balance (e.g., take breaks, hydrate, stretch, celebrate small wins, plan downtime)
-                - Keep suggestions practical and encouraging"""
+CRITICAL CONSTRAINT: Your response MUST be exactly 150 characters or less (including all spaces, emojis, and punctuation).
+
+OUTPUT FORMAT:
+- Start with a warm greeting or brief motivational phrase (5-15 chars)
+- Include the task count (e.g., "3 tasks today" or "5 todos")
+- Add 1-2 relevant emojis for visual appeal
+- Include today's auspicious color
+- Use clear, scannable language - no filler words
+
+PRIORITY ORDER (fit what you can within 150 chars):
+1. Greeting/motivation + task count (required)
+2. Task summary with schedule time (e.g., "Meeting 9AM, Report 2PM")
+3. Today's fate/fortune prediction with auspicious color (brief positive outlook)
+
+EXAMPLES OF GOOD OUTPUT:
+- "Good morning! 🌅 4 tasks: Meeting 9AM, Report 2PM. Fate: Productive day! Lucky color: Blue 💪"
+- "Hey! ☀️ 3 todos: Call 10AM, Review 3PM. Success awaits! Wear Green 🍀"
+- "Morning! ✨ 5 tasks starting 8AM. Great things coming! Auspicious color: Gold 🎉"
+
+Remember: Include task times, fate/fortune prediction, and auspicious color."""
             
             # Format tasks with minimal info
             tasks_info = "\n".join([
-                f"• {task.get('title', 'Task')[:30]} - {task.get('start', '')}"
-                for task in today_todo_list_data[:2]  # Show only 2 tasks
+                f"• {task.get('title', 'Task')[:30]} - {task.get('detail', '')} - {task.get('start', '')}"
+                for task in today_todo_list_data  # Show only 2 tasks
             ])
 
             remaining = total_tasks - 2 if total_tasks > 2 else 0
@@ -480,17 +537,30 @@ class PlannerUtils:
             
             user_prompt = (
                 f"Morning notification for {total_tasks} tasks:\n{tasks_info}\n"
-                "Include task summary, brief preparation tips, and post-task balance reminders. Keep it concise but helpful. Include count and 1-2 emojis."
+                "Include task summary with schedule times, today's fate/fortune prediction, and auspicious color. Keep it concise but helpful. Include count and 1-2 emojis. Maximum 150 characters."
             )
+            if user_context:
+                context_block = "\n".join(f"• {c}" for c in user_context[:10])
+                user_prompt = (
+                    f"Relevant user context (use to personalize and suggest schedule optimization):\n{context_block}\n\n"
+                    f"TASK: {user_prompt} "
+                    "If context suggests a quick schedule tip (e.g. buffer time, best focus time) and it fits within 150 characters, include it."
+                )
+            month_block = _format_month_context(month_context)
+            if month_block:
+                user_prompt = f"{month_block}\n\n{user_prompt}"
             
             # Make API call with optimized parameters
+            # Note: max_completion_tokens is for token limit, not character limit
+            # 150 characters needs ~100 tokens for English, ~200+ for Thai due to encoding
             response = self._safe_chat_call(
                 system_prompt, 
                 user_prompt,
-                max_tokens=150,
-                temperature=0.7,  # Balance between creativity and consistency
+                max_completion_tokens=300,  # Enough tokens for 150-char response in any language
+                temperature=1.0,  # Balance between creativity and consistency
                 language=language
             )
+            
             
             logger.info(f"Morning message generated successfully for {total_tasks} tasks")
             return response
@@ -500,13 +570,21 @@ class PlannerUtils:
             return None
 
 
-    def summarize_end_of_the_week_message(self, week_summary: List[Dict[str, Any]], language: str = 'thai') -> str:
+    def summarize_end_of_the_week_message(
+        self,
+        week_summary: List[Dict[str, Any]],
+        language: str = 'thai',
+        user_context: Optional[List[str]] = None,
+        month_context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
         """
         Generate rest and recharge suggestions based on week summary.
         
         Args:
             week_summary: List of completed tasks/activities from the week
             language: Language for the response
+            user_context: Optional RAG context (e.g. from user memory) to personalize suggestions
+            month_context: Optional previous/current/next month data to improve relevance
             
         Returns:
             Personalized rest and recharge suggestions, or None if no data
@@ -532,31 +610,37 @@ class PlannerUtils:
             
             # Format week activities with minimal info
             activities_info = "\n".join([
-                f"• {activity.get('title', 'Activity')[:25]} - {activity.get('typeOfTodo', '')}"
-                for activity in week_summary[:4]  # Show only 4 activities
+                f"• {activity.get('title', 'Activity')} - {activity.get('typeOfTodo', '')} - {activity.get('start', '')}"
+                for activity in week_summary  
             ])
-            
-            if total_activities > 4:
-                activities_info += f"\n• +{total_activities - 4} more"
             
             user_prompt = (
                 f"Weekly summary of {total_activities} completed activities:\n{activities_info}\n"
                 f"Summarize this week and suggest rest to recharge in {language}. "
                 f"Include specific rest activities, preparation tips for next week, and work-life balance reminders. "
-                f"Keep it encouraging with positive emojis."
+                f"Keep it encouraging with positive emojis. Keep it within 120 words. No filler words."
             )
+            if user_context:
+                context_block = "\n".join(f"• {c}" for c in user_context[:10])
+                user_prompt = (
+                    f"User's todo context (analyze to prevent overload, protect deep work, maintain goal momentum—be practical):\n{context_block}\n\n"
+                    f"{user_prompt} "
+                    "Using the context: suggest when to rest, when to batch tasks, and balance based on their habits. Tie suggestions to their actual todos."
+                )
+            month_block = _format_month_context(month_context)
+            if month_block:
+                user_prompt = f"{month_block}\n\n{user_prompt}"
             
             # Make API call with optimized parameters
+            # Note: 120 words needs ~180 tokens for English, ~250+ for Thai/CJK languages
             response = self._safe_chat_call(
                 system_prompt, 
                 user_prompt, 
-                max_tokens=150,
-                temperature=0.7,  # Balance creativity with consistency
+                max_completion_tokens=250,
+                temperature=1.0,  # Balance creativity with consistency
                 language=language
             )
 
-            
-            
             logger.info(f"End-of-week rest suggestions generated successfully for {total_activities} activities")
             return response
             
@@ -572,13 +656,21 @@ class PlannerUtils:
             }
             return fallback_suggestions.get(language, fallback_suggestions['english'])
     
-    def summarize_next_week_message(self, week_data: List[Dict[str, Any]], language: str = "thai") -> str:
+    def summarize_next_week_message(
+        self,
+        week_data: List[Dict[str, Any]],
+        language: str = "thai",
+        user_context: Optional[List[str]] = None,
+        month_context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
         """
         Generate next week summary based on week data.
         
         Args:
             week_data: List of upcoming tasks/events for next week
             language: Language for the response
+            user_context: Optional RAG context (e.g. from user memory) to personalize suggestions
+            month_context: Optional previous/current/next month data to improve relevance
             
         Returns:
             Personalized next week summary, or None if no data
@@ -603,26 +695,33 @@ class PlannerUtils:
             
             # Format upcoming tasks with minimal info
             tasks_info = "\n".join([
-                f"• {task.get('title', 'Task')[:20]} - {task.get('typeOfTodo', '')}"
-                for task in week_data[:5]  # Show only 5 tasks
+                f"• {task.get('title', 'Task')} - {task.get('typeOfTodo', '')} - {task.get('start', '')}"
+                for task in week_data  
             ])
-            
-            remaining = total_tasks - 5 if total_tasks > 5 else 0
-            if remaining:
-                tasks_info += f"\n• +{remaining} more"
             
             user_prompt = (
                 f"Next week preview for {total_tasks} tasks:\n{tasks_info}\n"
                 f"Highlight 2-3 priorities in {language}. Include preparation suggestions and balance reminders. "
-                f"Keep it motivating with emojis."
+                f"Keep it motivating with emojis. Keep it within 120 words. No filler words."
             )
+            if user_context:
+                context_block = "\n".join(f"• {c}" for c in user_context[:10])
+                user_prompt = (
+                    f"User's todo context (analyze to prevent overload, protect deep work, maintain goal momentum—be practical):\n{context_block}\n\n"
+                    f"{user_prompt} "
+                    "Using the context: suggest deep work vs meetings, when to rest, batching tasks, spacing heavy days. Tie suggestions to their actual todos."
+                )
+            month_block = _format_month_context(month_context)
+            if month_block:
+                user_prompt = f"{month_block}\n\n{user_prompt}"
             
             # Make API call with optimized parameters
+            # Note: 120 words needs ~180 tokens for English, ~250+ for Thai/CJK languages
             response = self._safe_chat_call(
                 system_prompt, 
                 user_prompt, 
-                max_tokens=120,
-                temperature=0.7,  # Balance creativity with consistency
+                max_completion_tokens=250,
+                temperature=1.0,  # Balance creativity with consistency
                 language=language
             )
             
@@ -641,14 +740,129 @@ class PlannerUtils:
             }
             return fallback_messages.get(language, fallback_messages['english'])
 
-    def summarize_this_month_todos_from_text(self, this_month_todos_text: str, language: str = "thai") -> tuple[str, str]:
+    def suggest_schedule_optimizations(
+        self,
+        schedule_data: List[Dict[str, Any]],
+        language: str = "thai",
+        user_context: Optional[List[str]] = None,
+        month_context: Optional[Dict[str, Any]] = None,
+        scope: str = "day",
+    ) -> Optional[str]:
+        """
+        Use RAG context + current schedule to suggest how to optimize the user's schedule.
+        Scope can be 'day' (today) or 'week'.
+
+        Args:
+            schedule_data: List of todo/event items (title, start, typeOfTodo, etc.)
+            language: Response language
+            user_context: Optional RAG context (user habits, preferences, past patterns)
+            month_context: Optional previous/current/next month data to improve relevance
+            scope: 'day' or 'week'
+
+        Returns:
+            Text with concrete schedule optimization suggestions.
+        """
+        if not schedule_data:
+            return None
+        total = len(schedule_data)
+        schedule_info = "\n".join([
+            f"• {item.get('title', 'Task')} - {item.get('typeOfTodo', '')} - {item.get('start', '')} - {item.get('date', '')}"
+            for item in schedule_data
+        ])
+        system_prompt = (
+            "You are Evo, an AI schedule coach. Your job is to analyze the user's todo list and suggest how to optimize their schedule. "
+            "Use the user's context (their actual todos, habits, past behavior) and any month context. "
+            + RAG_TODO_ANALYSIS_AIMS +
+            "Keep the response clear and in the requested language. Use bullet points. Aim for 80–150 words."
+        )
+        user_prompt = (
+            f"Schedule to optimize ({scope}, {total} items):\n{schedule_info}\n\n"
+            f"Analyze and provide suggestions in {language}."
+        )
+        if user_context:
+            context_block = "\n".join(f"• {c}" for c in user_context[:10])
+            user_prompt = (
+                f"User's todo list context (analyze this to prevent overload, protect deep work, maintain goals—be practical):\n{context_block}\n\n"
+                f"{user_prompt}"
+            )
+        month_block = _format_month_context(month_context)
+        if month_block:
+            user_prompt = f"{month_block}\n\n{user_prompt}"
+        try:
+            response = self._safe_chat_call(
+                system_prompt,
+                user_prompt,
+                max_completion_tokens=400,
+                temperature=0.7,
+                language=language,
+            )
+            logger.info("Schedule optimization suggestions generated (scope=%s)", scope)
+            return response
+        except Exception as e:
+            logger.error("Failed to generate schedule optimizations: %s", e)
+            return None
+
+    def analyze_todo_list(
+        self,
+        user_context: List[str],
+        language: str = "thai",
+        schedule_data: Optional[List[Dict[str, Any]]] = None,
+        month_context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """
+        Analyze the user's todo list (from RAG context) for: prevent overload, protect deep work,
+        maintain goal momentum, and give practical advice. Optional current schedule_data for focus.
+        """
+        if not user_context or not isinstance(user_context, list):
+            return None
+        context_block = "\n".join(f"• {c}" for c in user_context[:15])
+        system_prompt = (
+            "You are Evo, an AI schedule and productivity coach. Analyze the user's todo list and give brief, practical advice. "
+            + RAG_TODO_ANALYSIS_AIMS +
+            "Output 2–4 short bullet points only. Use the requested language."
+        )
+        user_prompt = (
+            f"User's todo list (from their history):\n{context_block}\n\n"
+            f"Analyze for overload, deep work protection, goal momentum, and give practical suggestions. Respond in {language}."
+        )
+        if schedule_data:
+            schedule_info = "\n".join([
+                f"• {item.get('title', 'Task')} - {item.get('typeOfTodo', '')} - {item.get('start', '')} - {item.get('date', '')}"
+                for item in schedule_data[:30]
+            ])
+            user_prompt = f"Current schedule to consider:\n{schedule_info}\n\n{user_prompt}"
+        month_block = _format_month_context(month_context)
+        if month_block:
+            user_prompt = f"{month_block}\n\n{user_prompt}"
+        try:
+            response = self._safe_chat_call(
+                system_prompt,
+                user_prompt,
+                max_completion_tokens=350,
+                temperature=0.6,
+                language=language,
+            )
+            logger.info("Todo list analysis generated")
+            return response
+        except Exception as e:
+            logger.error("Failed to generate todo list analysis: %s", e)
+            return None
+
+    def summarize_this_month_todos_from_text(
+        self,
+        this_month_todos_text: str,
+        language: str = "thai",
+        month_context: Optional[Dict[str, Any]] = None,
+    ) -> tuple[Optional[str], Optional[str]]:
         """
         Generate a title and summary of this month's todos when the data is provided as a single string.
-        
+        Optional month_context (previous/current/next month data) improves relevance and continuity.
+
         Args:
             this_month_todos_text: Raw text describing this month's todos (any format)
             language: Language for the response (e.g. 'thai', 'english')
-            
+            month_context: Optional dict with keys "previous", "current", "next" (each str or list) for RAG-style context
+
         Returns:
             Tuple of (title, summary) where title is short and catchy, summary is motivating and actionable.
             Returns (None, None) if input is invalid or generation fails.
@@ -664,14 +878,14 @@ class PlannerUtils:
             if original_length > 5000:
                 logger.warning(f"Input text is very long ({original_length} chars), truncating to 5000 chars")
                 this_month_todos_text = this_month_todos_text[:5000] + "..."
-            
+
             normalized_language = self.validator.validate_language(language)
             
             # Build concise prompt for both title and summary (single API call, optimized for speed)
             system_prompt = """You are Evo, an inspiring AI coach.
                 Return TITLE and SUMMARY in this exact format:
                 TITLE: [5-10 words, 1-2 emojis]
-                SUMMARY: [max 400 chars, positive emojis]
+                SUMMARY: [max 400 words, positive emojis]
 
                 Format the output in a friendly, easy-to-read way:
                 - TITLE: Use engaging, motivational language with appropriate emojis
@@ -684,20 +898,24 @@ class PlannerUtils:
                 In the SUMMARY, include helpful guidance:
                 - Preparation tips for upcoming tasks (e.g., organize workspace, gather materials, review goals)
                 - Work-life balance reminders (e.g., schedule downtime, take breaks, celebrate milestones, maintain healthy habits)
-                - Encourage sustainable productivity and well-being"""
+                - Encourage sustainable productivity and well-being
+                - If month context is provided, reference continuity (e.g. building on last month, preparing for next)."""
 
             user_prompt = (
                 f"This month's todos:\n{this_month_todos_text}\n\n"
                 f"TITLE: [5-10 word catchy title with 1-2 emojis in {normalized_language}]\n"
                 f"SUMMARY: [motivating summary, max 400 chars with emojis in {normalized_language}]"
             )
+            month_block = _format_month_context(month_context)
+            if month_block:
+                user_prompt = f"{month_block}\n\n{user_prompt}"
 
             # Generate both title and summary in a single API call (reduced tokens for faster response)
             response = self._safe_chat_call(
                 system_prompt,
                 user_prompt,
-                max_tokens=200,  # Reduced from 300 for faster generation
-                temperature=0.7,
+                max_completion_tokens=200,  # Reduced from 300 for faster generation
+                temperature=1.0,
                 language=normalized_language,
             )
 
@@ -763,17 +981,23 @@ class PlannerUtils:
 
         except Exception as e:
             logger.error(f"Failed to generate this month's todos title and summary from text: {str(e)}")
-    def summarize_this_year_todos_from_text(self, this_year_todos_text: str, language: str = "thai") -> tuple[str, str]:
+    def summarize_this_year_todos_from_text(
+        self,
+        this_year_todos_text: str,
+        language: str = "thai",
+        month_context: Optional[Dict[str, Any]] = None,
+    ) -> tuple[Optional[str], Optional[str]]:
         """
         Generate a title and summary of this year's todos when the data is provided as a single string.
-        
+        Optional month_context (previous/current/next month data) improves relevance and continuity.
+
         Args:
             this_year_todos_text: Raw text describing this year's todos (any format)
             language: Language for the response (e.g. 'thai', 'english')
-            
+            month_context: Optional dict with keys "previous", "current", "next" (each str or list) for RAG-style context
+
         Returns:
-            Tuple of (title, summary) where title is short and catchy, summary is motivating and actionable.
-            Returns (None, None) if input is invalid or generation fails.
+            Tuple of (title, summary). Returns (None, None) if input is invalid or generation fails.
         """
         try:
             # Validate inputs
@@ -786,7 +1010,7 @@ class PlannerUtils:
             if original_length > 5000:
                 logger.warning(f"Input text is very long ({original_length} chars), truncating to 5000 chars")
                 this_year_todos_text = this_year_todos_text[:5000] + "..."
-            
+
             normalized_language = self.validator.validate_language(language)
             
             # Build concise prompt for both title and summary (single API call, optimized for speed)
@@ -794,7 +1018,8 @@ class PlannerUtils:
                 "You are Evo, an inspiring AI coach. "
                 "Return TITLE and SUMMARY in this exact format:\n"
                 "TITLE: [5-10 words, 1-2 emojis]\n"
-                "SUMMARY: [max 200 chars, positive emojis]"
+                "SUMMARY: [max 200 words, positive emojis]\n"
+                "If month context is provided, reference continuity across months (e.g. last month's focus, next month's goals)."
             )
 
             user_prompt = (
@@ -802,13 +1027,16 @@ class PlannerUtils:
                 f"TITLE: [5-10 word catchy title with 1-2 emojis in {normalized_language}]\n"
                 f"SUMMARY: [motivating summary, max 200 chars with emojis in {normalized_language}]"
             )
+            month_block = _format_month_context(month_context)
+            if month_block:
+                user_prompt = f"{month_block}\n\n{user_prompt}"
 
             # Generate both title and summary in a single API call (reduced tokens for faster response)
             response = self._safe_chat_call(
                 system_prompt,
                 user_prompt,
-                max_tokens=200,  # Reduced from 300 for faster generation
-                temperature=0.7,
+                max_completion_tokens=200,  # Reduced from 300 for faster generation
+                temperature=1.0,
                 language=normalized_language,
             )
 
@@ -875,6 +1103,59 @@ class PlannerUtils:
         except Exception as e:
             logger.error(f"Failed to generate this year's todos title and summary from text: {str(e)}")
             return (None, None)
+    def predict_today_todo_fate_message(self, todo_data: List[Dict[str, Any]], language: str = "thai", model: str = "gpt-5.1") -> str:
+        """
+        Predict today's todo fate based on the todo data.
+        
+        Args:
+            todo_data: List of todo data
+            language: Language for the response
+            model: Model to use for the response
+        """
+        try:
+            # Validate inputs
+            # if not todo_data:
+            #     logger.info("No todo data provided for today's todo fate prediction")
+            #     return None
+            # Validate language
+            normalized_language = self.validator.validate_language(language)
+            # Build concise prompt
+            system_prompt = (
+                "You are Evo, a fortune teller. "
+                "Predict today's todo fate based on the todo data. "
+                "Include a brief positive outlook and suggest an auspicious color for today. "
+                "Keep it concise but helpful. Include 1-2 emojis. Maximum 150 characters."
+            )
+            if not todo_data:
+                user_prompt = (
+                    f"Predict today's todo fate in {normalized_language}. "
+                    f"Include a brief positive outlook and an auspicious color for today. "
+                    f"Keep it concise but helpful. Include 1-2 emojis. Maximum 150 characters."
+                )
+            else:
+                user_prompt = (
+                    f"Today's todos:\n{todo_data}\n\n"
+                    f"Predict today's todo fate in {normalized_language}. "
+                    f"Include a brief positive outlook and an auspicious color for today. "
+                    f"Keep it concise but helpful. Include 1-2 emojis. Maximum 150 characters."
+                )
+            # Make API call with optimized parameters
+            # Note: 150 characters needs ~100 tokens for English, ~200+ for Thai/CJK languages
+            response = self._safe_chat_call(
+                system_prompt,
+                user_prompt,
+                max_completion_tokens=300,
+                temperature=1.0,
+                language=normalized_language,
+                model=model,
+            )
+            logger.info("Today's todo fate prediction generated successfully")
+            return response
+        except RateLimitExceededError:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to generate today's todo fate prediction: {str(e)}")
+            return None
 # Global instance for backward compatibility
 _default_planner = None
 
@@ -912,37 +1193,97 @@ def mood_boost(summary: str) -> str:
     planner = get_default_planner()
     return planner.mood_boost(summary)
 
-def message_in_the_morning(today_todo_list_data: List[Dict[str, Any]], language: str = "thai") -> str:
+def message_in_the_morning(
+    today_todo_list_data: List[Dict[str, Any]],
+    language: str = "thai",
+    user_context: Optional[List[str]] = None,
+    month_context: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
     """Backward compatibility function for message in the morning"""
     planner = get_default_planner()
-    return planner.morning_message(today_todo_list_data, language)
+    return planner.morning_message(today_todo_list_data, language, user_context=user_context, month_context=month_context)
 
-def summarize_end_of_the_week_at_friday(week_data: List[Dict[str, Any]], language: str = "thai") -> str:
+def summarize_end_of_the_week_at_friday(
+    week_data: List[Dict[str, Any]],
+    language: str = "thai",
+    user_context: Optional[List[str]] = None,
+    month_context: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
     """Backward compatibility function for summarize end of the week"""
     planner = get_default_planner()
     print(" == summarize_end_of_the_week_at_friday == ")
     print(week_data)
     print(language)
-    return planner.summarize_end_of_the_week_message(week_data, language)
+    return planner.summarize_end_of_the_week_message(week_data, language, user_context=user_context, month_context=month_context)
 
-def summarize_next_week_at_sunday(week_data: List[Dict[str, Any]], language: str = "thai") -> str:
+def summarize_next_week_at_sunday(
+    week_data: List[Dict[str, Any]],
+    language: str = "thai",
+    user_context: Optional[List[str]] = None,
+    month_context: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
     """Backward compatibility function for summarize next week"""
     planner = get_default_planner()
-    return planner.summarize_next_week_message(week_data, language)
+    return planner.summarize_next_week_message(week_data, language, user_context=user_context, month_context=month_context)
+
+def suggest_schedule_optimizations(
+    schedule_data: List[Dict[str, Any]],
+    language: str = "thai",
+    user_context: Optional[List[str]] = None,
+    month_context: Optional[Dict[str, Any]] = None,
+    scope: str = "day",
+) -> Optional[str]:
+    """Suggest how to optimize the user's schedule using RAG context and current schedule."""
+    planner = get_default_planner()
+    return planner.suggest_schedule_optimizations(
+        schedule_data=schedule_data,
+        language=language,
+        user_context=user_context,
+        month_context=month_context,
+        scope=scope,
+    )
+
+
+def analyze_todo_list(
+    user_context: List[str],
+    language: str = "thai",
+    schedule_data: Optional[List[Dict[str, Any]]] = None,
+    month_context: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Analyze user's todo list (RAG context) for overload, deep work, goal momentum; give practical advice."""
+    planner = get_default_planner()
+    return planner.analyze_todo_list(
+        user_context=user_context,
+        language=language,
+        schedule_data=schedule_data,
+        month_context=month_context,
+    )
+
 
 def get_todo_information(user_query: str, todo_data: Dict[str, Any], language: str = "thai") -> str:
     """Backward compatibility function for getting todo information generator response"""
     planner = get_default_planner()
     return planner.get_todo_information_generator_response(user_query, todo_data, language)
 
-def summarize_this_year_todos_message(this_year_todos_data: str, language: str = "thai") -> tuple[str, str]:
+def summarize_this_year_todos_message(
+    this_year_todos_data: str,
+    language: str = "thai",
+    month_context: Optional[Dict[str, Any]] = None,
+) -> tuple[Optional[str], Optional[str]]:
     """Backward compatibility function for summarizing this year's todos"""
     planner = get_default_planner()
-    title, summary = planner.summarize_this_year_todos_from_text(this_year_todos_data, language)
-    return title, summary
+    return planner.summarize_this_year_todos_from_text(this_year_todos_data, language, month_context=month_context)
 
-def summarize_this_month_todos_message(this_month_todos_data: str, language: str = "thai") -> tuple[str, str]:
+def summarize_this_month_todos_message(
+    this_month_todos_data: str,
+    language: str = "thai",
+    month_context: Optional[Dict[str, Any]] = None,
+) -> tuple[Optional[str], Optional[str]]:
     """Backward compatibility function for summarizing this month's todos"""
     planner = get_default_planner()
-    title, summary = planner.summarize_this_month_todos_from_text(this_month_todos_data, language)
-    return title, summary
+    return planner.summarize_this_month_todos_from_text(this_month_todos_data, language, month_context=month_context)
+
+def predict_today_todo_fate(todo_data: List[Dict[str, Any]], language: str = "thai") -> str:
+    """Backward compatibility function for predicting today's todo fate"""
+    planner = get_default_planner()
+    return planner.predict_today_todo_fate_message(todo_data, language, model="gpt-4o-mini")

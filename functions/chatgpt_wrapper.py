@@ -22,19 +22,33 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
+
+class RateLimitExceededError(Exception):
+    """Raised when OpenAI API rate limit is exceeded after all retries."""
+    def __init__(self, message: str = "Rate limit exceeded", retry_after: Optional[float] = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 class ModelType(Enum):
     """Available OpenAI models"""
-    GPT_4O = "gpt-4o"
-    GPT_4O_MINI = "gpt-4o-mini"
-    GPT_3_5_TURBO = "gpt-3.5-turbo"
+    GPT_5_MINI = "gpt-5-mini"
+    GPT_5_1 = "gpt-5.1"
+    GPT_5_2 = "gpt-5.2"
+    
+    GPT_4o_mini = "gpt-4o-mini"
+    GPT_4o_turbo = "gpt-4o-turbo"
+    GPT_4o_turbo_mini = "gpt-4o-turbo-mini"
+    GPT_41_mini ="gpt-4.1-mini"
+   
 
 @dataclass
 class ChatConfig:
     """Configuration for chat requests"""
-    model: str = ModelType.GPT_4O.value
-    temperature: float = 0.7
+    model: str = ModelType.GPT_5_1.value
+    temperature: float = 1.0
     top_p: float = 0.9
-    max_tokens: int = 300
+    max_completion_tokens: int = 1024  # Increased from 300 to allow fuller responses
     timeout: int = 60  # Increased from 30 to 60 seconds
     max_retries: int = 5  # Increased for better rate limit handling
     retry_delay: float = 1.0
@@ -113,6 +127,13 @@ class CircuitBreaker:
             if self.failure_count >= self.failure_threshold:
                 self.state = "OPEN"
                 logger.warning(f"Circuit breaker opened after {self.failure_count} failures")
+    
+    def reset(self):
+        """Manually reset the circuit breaker"""
+        with self.lock:
+            self.failure_count = 0
+            self.state = "CLOSED"
+            logger.info("Circuit breaker manually reset")
 
 class RateLimiter:
     """Simple rate limiter for API calls"""
@@ -170,6 +191,10 @@ class ChatGPTWrapper:
         self.language_detector = LanguageDetector()
         
         logger.info(f"ChatGPT wrapper initialized with model: {self.config.model}")
+    
+    def reset_circuit_breaker(self):
+        """Manually reset the circuit breaker if it's stuck open"""
+        self.circuit_breaker.reset()
     
     def _validate_inputs(self, system_prompt: str, user_prompt: str) -> None:
         """Validate input parameters"""
@@ -272,18 +297,85 @@ class ChatGPTWrapper:
             
             self.rate_limiter.record_call()
             
-            # Make the API call
-            response: ChatCompletion = self.client.chat.completions.create(
-                model=current_config.model,
-                messages=messages,
-                temperature=current_config.temperature,
-                top_p=current_config.top_p,
-                max_tokens=current_config.max_tokens,
-            )
+            # Models that use newer API parameters (max_completion_tokens, no temp/top_p)
+            reasoning_models = ["o1", "o1-mini", "o1-preview", "o3-mini", "o3"]
+            # Models that only support temperature=1.0 but use standard max_completion_tokens
+            temp_restricted_models = ["gpt-5-mini", "gpt-5.1", "gpt-5.2", "gpt-5"]
             
-            content = response.choices[0].message.content
+            model_lower = current_config.model.lower()
+            is_reasoning_model = any(rm in model_lower for rm in reasoning_models)
+            is_temp_restricted = any(rm in model_lower for rm in temp_restricted_models)
+            
+            # Build API call parameters based on model type
+            api_params = {
+                "model": current_config.model,
+                "messages": messages,
+            }
+            
+            # Use appropriate max tokens parameter based on model
+            if is_reasoning_model:
+                # Reasoning models use max_completion_tokens
+                api_params["max_completion_tokens"] = current_config.max_completion_tokens
+            else:
+                # Standard models use max_completion_tokens
+                api_params["max_completion_tokens"] = current_config.max_completion_tokens
+            
+            # Only include temperature/top_p if the model supports them
+            if not is_reasoning_model and not is_temp_restricted:
+                api_params["temperature"] = current_config.temperature
+                api_params["top_p"] = current_config.top_p
+            elif current_config.temperature != 1.0:
+                logger.info(f"Model {current_config.model} only supports temperature=1.0, ignoring temperature={current_config.temperature}")
+            
+            logger.info(f"API params: model={current_config.model}, max_completion_tokens={current_config.max_completion_tokens}")
+            
+            # Make the API call
+            response: ChatCompletion = self.client.chat.completions.create(**api_params)
+            
+            # Log response details for debugging
+            logger.debug(f"Response: {response}")
+            # Extract content from response, handling various response formats
+            content = None
+            if response.choices and len(response.choices) > 0:
+                message = response.choices[0].message
+                finish_reason = response.choices[0].finish_reason
+                logger.debug(f"Message: {message}, finish_reason: {finish_reason}")
+            
+                content = message.content
+                # Check for refusal (some models return refusal instead of content)
+                if not content and hasattr(message, 'refusal') and message.refusal:
+                    logger.warning(f"Model refused to respond: {message.refusal}")
+                    content = f"Unable to process request: {message.refusal}"
+                
+                # Log finish reason for debugging
+                finish_reason = response.choices[0].finish_reason
+                if finish_reason and finish_reason != "stop":
+                    logger.info(f"Response finish_reason: {finish_reason}")
+                
+                # Log if content is empty (regardless of finish_reason)
+                if not content:
+                    logger.warning(f"Empty content received. finish_reason={finish_reason}, usage={response.usage}")
+            
             if not content:
-                raise ValueError("Empty response from API")
+                # Log response structure for debugging
+                finish_reason = response.choices[0].finish_reason if response.choices else None
+                logger.warning(f"Empty response. Model: {current_config.model}, Choices: {len(response.choices) if response.choices else 0}, finish_reason: {finish_reason}")
+                if response.choices and len(response.choices) > 0:
+                    logger.warning(f"Message object: {response.choices[0].message}")
+                
+                # Don't trip circuit breaker for empty responses - it's likely a prompt/token issue, not service failure
+                # Return a user-friendly message instead of raising an exception
+                if finish_reason == "length":
+                    logger.warning(f"Response cut off due to token limit. max_completion_tokens={current_config.max_completion_tokens}")
+                    return "Response was cut off due to token limit. Please try with a shorter prompt or increase max_completion_tokens."
+                else:
+                    return "The model returned an empty response. Please try rephrasing your request."
+            
+            # Handle partial response (content exists but was cut off)
+            finish_reason = response.choices[0].finish_reason if response.choices else None
+            if finish_reason == "length" and content:
+                logger.warning(f"Response truncated at {len(content)} chars due to token limit ({current_config.max_completion_tokens} tokens)")
+                # Return the partial content - it may still be useful
             
             # Record success in circuit breaker
             self.circuit_breaker.record_success()
@@ -311,9 +403,35 @@ class ChatGPTWrapper:
                 return self._make_api_call(messages, config, attempt + 1)
             else:
                 logger.error(f"Rate limit exceeded after {current_config.max_retries} attempts")
-                return "I'm currently experiencing high demand. Please try again in a few moments."
+                raise RateLimitExceededError(
+                    "Rate limit exceeded. Please try again later.",
+                    retry_after=retry_after
+                )
             
         except Exception as e:
+            error_msg = str(e)
+            
+            # Check for temperature not supported error - don't retry with exponential backoff,
+            # instead retry immediately without temperature parameter
+            if "temperature" in error_msg.lower() and "unsupported" in error_msg.lower():
+                logger.warning(f"Model doesn't support custom temperature, retrying without temperature parameter")
+                # Create a new config with default temperature
+                temp_config = ChatConfig(
+                    model=current_config.model,
+                    temperature=1.0,  # Use default temperature
+                    top_p=1.0,  # Also reset top_p to default
+                    max_completion_tokens=current_config.max_completion_tokens,
+                    timeout=current_config.timeout,
+                    max_retries=current_config.max_retries,
+                    retry_delay=current_config.retry_delay
+                )
+                # Retry once with the corrected config
+                if attempt == 1:  # Only retry once for this specific error
+                    return self._make_api_call(messages, temp_config, attempt + 1)
+                else:
+                    self.circuit_breaker.record_failure()
+                    return self._handle_api_error(e, attempt)
+            
             # Record failure in circuit breaker
             self.circuit_breaker.record_failure()
             
@@ -321,7 +439,7 @@ class ChatGPTWrapper:
             if attempt < current_config.max_retries:
                 # Calculate exponential backoff with jitter
                 backoff_time = current_config.retry_delay * (2 ** (attempt - 1)) + (time.time() % 1)
-                logger.warning(f"API call failed on attempt {attempt}: {str(e)}, retrying in {backoff_time:.1f}s")
+                logger.warning(f"API call failed on attempt {attempt}: {error_msg}, retrying in {backoff_time:.1f}s")
                 time.sleep(backoff_time)
                 return self._make_api_call(messages, config, attempt + 1)
             else:
@@ -334,7 +452,7 @@ class ChatGPTWrapper:
         model: Optional[str] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
-        max_tokens: Optional[int] = None,
+        max_completion_tokens: Optional[int] = None,
         auto_detect_language: bool = True,
         reply_language: Optional[str] = None,
         language: Optional[str] = None,
@@ -348,7 +466,7 @@ class ChatGPTWrapper:
             model: OpenAI model name (overrides config)
             temperature: Sampling temperature (overrides config)
             top_p: Nucleus sampling probability (overrides config)
-            max_tokens: Maximum tokens for response (overrides config)
+            max_completion_tokens: Maximum tokens for response (overrides config)
             auto_detect_language: Whether to detect user prompt language
             reply_language: Force a reply language (overrides detection)
             language: Explicit language code (overrides detection)
@@ -384,7 +502,7 @@ class ChatGPTWrapper:
                 model=model or self.config.model,
                 temperature=temperature or self.config.temperature,
                 top_p=top_p or self.config.top_p,
-                max_tokens=max_tokens or self.config.max_tokens,
+                max_completion_tokens=max_completion_tokens or self.config.max_completion_tokens,
                 timeout=self.config.timeout,
                 max_retries=self.config.max_retries,
                 retry_delay=self.config.retry_delay
@@ -414,13 +532,18 @@ def get_default_wrapper() -> ChatGPTWrapper:
         _default_wrapper = ChatGPTWrapper()
     return _default_wrapper
 
+def reset_circuit_breaker():
+    """Reset the circuit breaker on the default wrapper"""
+    wrapper = get_default_wrapper()
+    wrapper.reset_circuit_breaker()
+
 def chat_with_gpt(
     system_prompt: str,
     user_prompt: str,
-    model: str = "gpt-4o",
-    temperature: float = 0.7,
+    model: str = "gpt-5-mini",
+    temperature: float = 1.0,
     top_p: float = 0.9,
-    max_tokens: int = 300,
+    max_completion_tokens: int = 1024,
     auto_detect_language: bool = True,
     reply_language: Optional[str] = None,
     language: Optional[str] = None,
@@ -438,7 +561,7 @@ def chat_with_gpt(
         model=model,
         temperature=temperature,
         top_p=top_p,
-        max_tokens=max_tokens,
+        max_completion_tokens=max_completion_tokens,
         auto_detect_language=auto_detect_language,
         reply_language=reply_language,
         language=language

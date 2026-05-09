@@ -32,9 +32,9 @@ class LogLevel(Enum):
 class OpenAIConfig:
     """OpenAI API configuration"""
     api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
-    model: str = field(default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-4o"))
-    max_tokens: int = field(default_factory=lambda: int(os.getenv("OPENAI_MAX_TOKENS", "300")))
-    temperature: float = field(default_factory=lambda: float(os.getenv("OPENAI_TEMPERATURE", "0.7")))
+    model: str = field(default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-5-mini"))
+    max_completion_tokens: int = field(default_factory=lambda: int(os.getenv("OPENAI_max_completion_tokens", "300")))
+    temperature: float = field(default_factory=lambda: float(os.getenv("OPENAI_TEMPERATURE", "1.0")))
     top_p: float = field(default_factory=lambda: float(os.getenv("OPENAI_TOP_P", "0.9")))
     timeout: int = field(default_factory=lambda: int(os.getenv("OPENAI_TIMEOUT", "60")))
     max_retries: int = field(default_factory=lambda: int(os.getenv("OPENAI_MAX_RETRIES", "3")))
@@ -46,8 +46,8 @@ class OpenAIConfig:
 class PlannerConfig:
     """Planner configuration"""
     default_language: str = field(default_factory=lambda: os.getenv("PLANNER_DEFAULT_LANGUAGE", "thai"))
-    max_tokens: int = field(default_factory=lambda: int(os.getenv("PLANNER_MAX_TOKENS", "200")))
-    temperature: float = field(default_factory=lambda: float(os.getenv("PLANNER_TEMPERATURE", "0.7")))
+    max_completion_tokens: int = field(default_factory=lambda: int(os.getenv("PLANNER_max_completion_tokens", "200")))
+    temperature: float = field(default_factory=lambda: float(os.getenv("PLANNER_TEMPERATURE", "1.0")))
     top_p: float = field(default_factory=lambda: float(os.getenv("PLANNER_TOP_P", "0.9")))
     enable_emojis: bool = field(default_factory=lambda: os.getenv("PLANNER_ENABLE_EMOJIS", "true").lower() == "true")
     enable_motivation: bool = field(default_factory=lambda: os.getenv("PLANNER_ENABLE_MOTIVATION", "true").lower() == "true")
@@ -99,8 +99,8 @@ class AppConfig:
         if not self.firebase.project_id:
             logger.warning("FIREBASE_PROJECT_ID not set, using default")
         
-        if self.openai.max_tokens <= 0:
-            raise ValueError("OPENAI_MAX_TOKENS must be positive")
+        if self.openai.max_completion_tokens <= 0:
+            raise ValueError("OPENAI_max_completion_tokens must be positive")
         
         if not (0 <= self.openai.temperature <= 2):
             raise ValueError("OPENAI_TEMPERATURE must be between 0 and 2")
@@ -128,7 +128,7 @@ class AppConfig:
             "debug": self.debug,
             "openai": {
                 "model": self.openai.model,
-                "max_tokens": self.openai.max_tokens,
+                "max_completion_tokens": self.openai.max_completion_tokens,
                 "temperature": self.openai.temperature,
                 "top_p": self.openai.top_p,
                 "timeout": self.openai.timeout,
@@ -138,7 +138,7 @@ class AppConfig:
             },
             "planner": {
                 "default_language": self.planner.default_language,
-                "max_tokens": self.planner.max_tokens,
+                "max_completion_tokens": self.planner.max_completion_tokens,
                 "temperature": self.planner.temperature,
                 "enable_emojis": self.planner.enable_emojis,
                 "enable_motivation": self.planner.enable_motivation

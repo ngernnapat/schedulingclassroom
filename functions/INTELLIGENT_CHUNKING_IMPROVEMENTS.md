@@ -169,8 +169,8 @@ The system is configurable through `ChatWrapperConfig`:
 ```python
 @dataclass
 class ChatWrapperConfig:
-    model: str = "gpt-4o"
-    temperature: float = 0.7
+    model: str = "gpt-5.1"
+    temperature: float = 1.0
     chunk_size: int = 30  # Days per chunk for large plans
     max_chunks: int = 3   # Maximum number of chunks (90 days max)
     json_schema: Dict[str, Any] = None

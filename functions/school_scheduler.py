@@ -124,11 +124,11 @@ class SchoolScheduler:
                     [0.0, "white"],         # 0 (empty) → white
                     [0.1, "lightblue"],     # 1 → P1
                     [0.2, "skyblue"],       # 2 → P2
-                    [0.3, "dodgerblue"],    # 3 → P3
+                    [1.0, "dodgerblue"],    # 3 → P3
                     [0.4, "steelblue"],     # 4 → P4
                     [0.5, "deepskyblue"],   # 5 → P5
                     [0.6, "cornflowerblue"],# 6 → P6
-                    [0.7, "lightpink"],     # 7 → M1
+                    [1.0, "lightpink"],     # 7 → M1
                     [0.8, "salmon"],        # 8 → M2
                     [0.9, "tomato"],        # 9 → M3
                     [1.0, "orangered"]      # fill to top

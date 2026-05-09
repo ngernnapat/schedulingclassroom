@@ -65,15 +65,15 @@ Comprehensive improvements to `chatgpt_wrapper.py` and `planner_utils.py` focusi
 OPENAI_API_KEY=your_api_key_here
 
 # Optional (with defaults)
-OPENAI_MODEL=gpt-4o
-OPENAI_MAX_TOKENS=300
-OPENAI_TEMPERATURE=0.7
+OPENAI_MODEL=gpt-5.1
+OPENAI_max_completion_tokens=300
+OPENAI_TEMPERATURE=1.0
 OPENAI_MAX_RETRIES=3
 OPENAI_RATE_LIMIT_CALLS=10
 OPENAI_RATE_LIMIT_WINDOW=60.0
 
 PLANNER_DEFAULT_LANGUAGE=thai
-PLANNER_MAX_TOKENS=200
+PLANNER_max_completion_tokens=200
 PLANNER_ENABLE_EMOJIS=true
 
 SECURITY_ENABLE_INPUT_VALIDATION=true
@@ -135,7 +135,7 @@ from planner_utils import PlannerUtils, PlannerConfig
 
 # Custom configuration
 config = ChatConfig(
-    model="gpt-4o-mini",
+    model="gpt-5-mini",
     temperature=0.5,
     max_retries=5
 )

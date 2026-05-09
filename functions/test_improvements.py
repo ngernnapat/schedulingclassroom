@@ -25,9 +25,9 @@ class TestChatGPTWrapper(unittest.TestCase):
     def setUp(self):
         """Set up test environment"""
         self.config = ChatConfig(
-            model="gpt-4o",
-            temperature=0.7,
-            max_tokens=100,
+            model="gpt-5.1",
+            temperature=1.0,
+            max_completion_tokens=100,
             timeout=10,
             max_retries=2
         )
@@ -39,8 +39,8 @@ class TestChatGPTWrapper(unittest.TestCase):
     def test_initialization(self):
         """Test wrapper initialization"""
         self.assertIsNotNone(self.wrapper)
-        self.assertEqual(self.wrapper.config.model, "gpt-4o")
-        self.assertEqual(self.wrapper.config.temperature, 0.7)
+        self.assertEqual(self.wrapper.config.model, "gpt-5.1")
+        self.assertEqual(self.wrapper.config.temperature, 1.0)
     
     def test_input_validation(self):
         """Test input validation"""
@@ -128,8 +128,8 @@ class TestPlannerUtils(unittest.TestCase):
     def setUp(self):
         """Set up test environment"""
         self.config = PlannerConfig(
-            max_tokens=150,
-            temperature=0.8,
+            max_completion_tokens=150,
+            temperature=1.0,  # GPT-5 models only support temperature=1.0
             enable_emojis=True,
             language="thai"
         )
@@ -143,8 +143,8 @@ class TestPlannerUtils(unittest.TestCase):
     def test_planner_initialization(self):
         """Test planner initialization"""
         self.assertIsNotNone(self.planner)
-        self.assertEqual(self.planner.config.max_tokens, 150)
-        self.assertEqual(self.planner.config.temperature, 0.8)
+        self.assertEqual(self.planner.config.max_completion_tokens, 150)
+        self.assertEqual(self.planner.config.temperature, 1.0)
     
     def test_planner_validator(self):
         """Test planner validation"""

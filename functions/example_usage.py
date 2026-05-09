@@ -57,17 +57,17 @@ def example_advanced_usage():
     try:
         # Custom ChatGPT configuration
         chat_config = ChatConfig(
-            model="gpt-4o-mini",
-            temperature=0.5,
-            max_tokens=150,
+            model="gpt-5-mini",
+            temperature=1.0,
+            max_completion_tokens=150,
             max_retries=3,
             timeout=20
         )
         
         # Custom planner configuration
         planner_config = PlannerConfig(
-            max_tokens=200,
-            temperature=0.8,
+            max_completion_tokens=200,
+            temperature=1.0,
             enable_emojis=True,
             language="english"
         )
