@@ -261,7 +261,12 @@ def encourage_in_the_morning():
         pu = get_planner_utils()
         response = pu.message_in_the_morning(
             today_todo_list_data=data['today_todo_list_data'],
-            language=data.get('languageSelected', 'thai')
+            language=data.get('languageSelected', 'thai'),
+            user_context=data.get('user_context'),
+            month_context=data.get('month_context'),
+            earned_runes=data.get('earned_runes'),
+            behavior_stats=data.get('behavior_stats'),
+            identity_context=data.get('identity_context'),
         )
         
         return create_response(data={'response': response}, message='Response generated')
@@ -363,9 +368,18 @@ def todo_fate_prediction():
         
         todo_data = data.get('todo_data', [])
         language = data['languageSelected']
-        
+        output_style = data.get('output_style', 'brief')
+        earned_runes = data.get('earned_runes')
+        behavior_stats = data.get('behavior_stats')
+
         pu = get_planner_utils()
-        response = pu.predict_today_todo_fate(todo_data=todo_data, language=language)
+        response = pu.predict_today_todo_fate(
+            todo_data=todo_data,
+            language=language,
+            earned_runes=earned_runes if isinstance(earned_runes, list) else None,
+            behavior_stats=behavior_stats if isinstance(behavior_stats, dict) else None,
+            output_style=output_style,
+        )
         
         return create_response(data={'response': response}, message='Prediction generated')
         

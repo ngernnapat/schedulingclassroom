@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from chatgpt_wrapper import chat_with_gpt, ChatGPTWrapper, get_default_wrapper, RateLimitExceededError
+from rune_llm_catalog import normalize_earned_runes_for_llm
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -37,6 +38,75 @@ def _format_month_context(month_context: Optional[Dict[str, Any]] = None) -> str
     if not parts:
         return ""
     return "Month context (use to improve relevance and continuity):\n" + "\n\n".join(parts)
+
+
+def _format_identity_context(
+    identity_context: Optional[Dict[str, Any]] = None,
+    last_week_completion_rate: Optional[float] = None,
+) -> str:
+    """
+    Format the user's identity / behavior signals into a prompt block.
+
+    Per docs/ORCHESTRATION.md "Relevance second" priority — coaching should
+    reference the user's actual streaks, badges, and recent completion rate
+    so output is grounded in real behavior rather than generic. The block
+    intentionally uses second-person framing so the LLM can echo identity
+    language ("you're becoming consistent") rather than third-person stats.
+
+    Returns an empty string if no usable context is supplied.
+    """
+    if (not identity_context or not isinstance(identity_context, dict)) and last_week_completion_rate is None:
+        return ""
+
+    ctx = identity_context if isinstance(identity_context, dict) else {}
+    lines = []
+
+    current = ctx.get("currentStreak")
+    longest = ctx.get("longestStreak")
+    if isinstance(current, (int, float)) and current > 0:
+        lines.append(f"Current daily streak: {int(current)} days")
+    if isinstance(longest, (int, float)) and longest > 0:
+        lines.append(f"Longest streak ever: {int(longest)} days")
+
+    last_done = ctx.get("lastCompletionDate")
+    if isinstance(last_done, str) and last_done.strip():
+        lines.append(f"Last completion date: {last_done}")
+
+    dow = ctx.get("dayOfWeek")
+    if isinstance(dow, list) and len(dow) == 7 and any(isinstance(v, (int, float)) and v > 0 for v in dow):
+        names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        # Highlight the user's strongest day so the LLM can build around it.
+        max_idx = max(range(7), key=lambda i: (dow[i] if isinstance(dow[i], (int, float)) else 0))
+        if dow[max_idx]:
+            lines.append(f"Most consistent weekday: {names[max_idx]}")
+
+    badge = ctx.get("latestBadge")
+    if isinstance(badge, dict):
+        phrase = badge.get("becomingPhrase")
+        title = badge.get("title")
+        if phrase or title:
+            label = title or "milestone"
+            if phrase:
+                lines.append(f"Most recent badge: {label} — \"{phrase}\"")
+            else:
+                lines.append(f"Most recent badge: {label}")
+
+    if isinstance(last_week_completion_rate, (int, float)):
+        rate_pct = round(float(last_week_completion_rate) * 100)
+        lines.append(f"Last week's completion rate: {rate_pct}%")
+
+    if not lines:
+        return ""
+
+    header = (
+        "User behavior signals (ground your coaching in this — reference "
+        "specific streaks/dates when they're relevant, and lean into the "
+        "identity framing of the most recent badge phrase rather than "
+        "generic motivational language. If completion rate is low, be "
+        "supportive and propose lighter next steps; if high, reinforce the "
+        "identity that's emerging):"
+    )
+    return header + "\n" + "\n".join(f"- {ln}" for ln in lines)
 
 
 # Analysis aims when using RAG todo context: what the model should do with the user's todo list
@@ -370,35 +440,54 @@ class PlannerUtils:
             logger.error(f"Failed to track progress: {str(e)}")
             return "Thanks for the update! Keep up the great work! 🌟"
     
-    def respond_to_user_input(self, user_input: str, summary: str) -> str:
+    def respond_to_user_input(
+        self,
+        user_input: str,
+        summary: str,
+        identity_context: Optional[Dict[str, Any]] = None,
+        last_week_completion_rate: Optional[float] = None,
+    ) -> str:
         """
         Respond to user input naturally and supportively.
-        
+
         Args:
             user_input: User's input message
             summary: Current planner summary for context
-            
+            identity_context: Optional behavior signals (streaks, badges,
+                day-of-week histogram). Per docs/ORCHESTRATION.md grounds
+                coaching in this user's actual behavior.
+            last_week_completion_rate: Optional 0..1 ratio for last 7 days.
+
         Returns:
             Natural and supportive response
         """
         try:
             # Validate inputs
             user_input = self.validator.validate_user_input(user_input)
-            
+
             if not summary or not isinstance(summary, str):
                 summary = "No planner context available"
-            
+
             # Build prompt
             system_prompt, user_prompt = self.prompt_builder.build_response_prompt(
                 user_input, summary
             )
-            
+
+            # Inject identity / completion-rate signals into the user prompt
+            # so the coach can reference real streaks and lean into the
+            # latest "becoming" phrase. Append only — do not modify the
+            # validator-built parts above so existing behavior is preserved
+            # when no context is supplied.
+            identity_block = _format_identity_context(identity_context, last_week_completion_rate)
+            if identity_block:
+                user_prompt = f"{identity_block}\n\n{user_prompt}"
+
             # Make API call
             response = self._safe_chat_call(system_prompt, user_prompt)
-            
+
             logger.info("User input response generated successfully")
             return response
-            
+
         except Exception as e:
             logger.error(f"Failed to respond to user input: {str(e)}")
             return "I'm here to help! What can I assist you with today? 😊"
@@ -482,6 +571,9 @@ class PlannerUtils:
         language: str = "thai",
         user_context: Optional[List[str]] = None,
         month_context: Optional[Dict[str, Any]] = None,
+        earned_runes: Optional[List[Dict[str, Any]]] = None,
+        behavior_stats: Optional[Dict[str, Any]] = None,
+        identity_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """
         Generate a compact morning message summarizing today's tasks for notification.
@@ -549,6 +641,29 @@ Remember: Include task times, fate/fortune prediction, and auspicious color."""
             month_block = _format_month_context(month_context)
             if month_block:
                 user_prompt = f"{month_block}\n\n{user_prompt}"
+
+            earned = normalize_earned_runes_for_llm(earned_runes)
+            grounding_lines = []
+            if earned:
+                grounding_lines.append(
+                    "Earned Elder Futhark identities (real unlocks): "
+                    + "; ".join(f"{e['name']} ({e['key']})" for e in earned[:10])
+                    + (" …" if len(earned) > 10 else "")
+                )
+            if isinstance(behavior_stats, dict) and behavior_stats:
+                grounding_lines.append(
+                    "Behavior stats: " + json.dumps(behavior_stats, ensure_ascii=False)[:400]
+                )
+            if isinstance(identity_context, dict) and identity_context:
+                id_block = _format_identity_context(identity_context)
+                if id_block.strip():
+                    grounding_lines.append("Identity profile:\n" + id_block[:900])
+            if grounding_lines:
+                user_prompt = "\n".join(grounding_lines) + "\n\n" + user_prompt
+                system_prompt += (
+                    "\n\nWhen character budget is tight, prefer a nod to earned runes / streak "
+                    "over auspicious or lucky colors."
+                )
             
             # Make API call with optimized parameters
             # Note: max_completion_tokens is for token limit, not character limit
@@ -853,6 +968,8 @@ Remember: Include task times, fate/fortune prediction, and auspicious color."""
         this_month_todos_text: str,
         language: str = "thai",
         month_context: Optional[Dict[str, Any]] = None,
+        identity_context: Optional[Dict[str, Any]] = None,
+        last_week_completion_rate: Optional[float] = None,
     ) -> tuple[Optional[str], Optional[str]]:
         """
         Generate a title and summary of this month's todos when the data is provided as a single string.
@@ -909,6 +1026,9 @@ Remember: Include task times, fate/fortune prediction, and auspicious color."""
             month_block = _format_month_context(month_context)
             if month_block:
                 user_prompt = f"{month_block}\n\n{user_prompt}"
+            identity_block = _format_identity_context(identity_context, last_week_completion_rate)
+            if identity_block:
+                user_prompt = f"{identity_block}\n\n{user_prompt}"
 
             # Generate both title and summary in a single API call (reduced tokens for faster response)
             response = self._safe_chat_call(
@@ -986,6 +1106,8 @@ Remember: Include task times, fate/fortune prediction, and auspicious color."""
         this_year_todos_text: str,
         language: str = "thai",
         month_context: Optional[Dict[str, Any]] = None,
+        identity_context: Optional[Dict[str, Any]] = None,
+        last_week_completion_rate: Optional[float] = None,
     ) -> tuple[Optional[str], Optional[str]]:
         """
         Generate a title and summary of this year's todos when the data is provided as a single string.
@@ -1030,6 +1152,9 @@ Remember: Include task times, fate/fortune prediction, and auspicious color."""
             month_block = _format_month_context(month_context)
             if month_block:
                 user_prompt = f"{month_block}\n\n{user_prompt}"
+            identity_block = _format_identity_context(identity_context, last_week_completion_rate)
+            if identity_block:
+                user_prompt = f"{identity_block}\n\n{user_prompt}"
 
             # Generate both title and summary in a single API call (reduced tokens for faster response)
             response = self._safe_chat_call(
@@ -1103,44 +1228,165 @@ Remember: Include task times, fate/fortune prediction, and auspicious color."""
         except Exception as e:
             logger.error(f"Failed to generate this year's todos title and summary from text: {str(e)}")
             return (None, None)
-    def predict_today_todo_fate_message(self, todo_data: List[Dict[str, Any]], language: str = "thai", model: str = "gpt-5.1") -> str:
+    def predict_today_todo_fate_message(
+        self,
+        todo_data: List[Dict[str, Any]],
+        language: str = "thai",
+        model: str = "gpt-5.1",
+        divination_system: str = "elder_futhark",
+        earned_runes: Optional[List[Dict[str, Any]]] = None,
+        behavior_stats: Optional[Dict[str, Any]] = None,
+        output_style: str = "brief",
+    ) -> str:
         """
         Predict today's todo fate based on the todo data.
-        
-        Args:
-            todo_data: List of todo data
-            language: Language for the response
-            model: Model to use for the response
+
+        ``brief`` (default): legacy 1-rune "draw" + short line for push/notifications.
+
+        ``share_card``: uses **earned** runes the user already unlocked (behavioral
+        identity / plasticity), optional stats, and todos to write a longer
+        fortune-style "path reading" that still frames outcomes as emerging from
+        habits and context—not supernatural certainty.
         """
         try:
-            # Validate inputs
-            # if not todo_data:
-            #     logger.info("No todo data provided for today's todo fate prediction")
-            #     return None
-            # Validate language
             normalized_language = self.validator.validate_language(language)
-            # Build concise prompt
+            normalized_output = (output_style or "brief").strip().lower()
+            if normalized_output not in ("brief", "share_card"):
+                normalized_output = "brief"
+
+            earned = normalize_earned_runes_for_llm(
+                earned_runes if isinstance(earned_runes, list) else None
+            )
+            stats = behavior_stats if isinstance(behavior_stats, dict) else {}
+
+            if normalized_output == "share_card":
+                rune_lines = []
+                for r in earned[:24]:
+                    if not isinstance(r, dict):
+                        continue
+                    key = r.get("key") or r.get("rune_key")
+                    if not key:
+                        continue
+                    nm = r.get("name") or key
+                    meaning = r.get("meaning") or ""
+                    cat = r.get("category") or ""
+                    becoming = r.get("becoming") or ""
+                    rune_lines.append(
+                        f"- {nm} ({key}): {meaning}"
+                        + (f" [category: {cat}]" if cat else "")
+                        + (f" — identity line: {becoming}" if becoming else "")
+                    )
+                rune_block = (
+                    "Earned Elder Futhark identities (already unlocked by real behavior — use as vocabulary, not a new random draw):\n"
+                    + ("\n".join(rune_lines) if rune_lines else "(No runes unlocked yet — speak to momentum and first steps.)")
+                )
+                stats_bits = []
+                if stats:
+                    for k in ("runes_unlocked", "runes_total", "current_streak", "completion_rate_7d"):
+                        if k in stats and stats[k] is not None:
+                            stats_bits.append(f"{k}: {stats[k]}")
+                stats_block = (
+                    "Behavior / progress signals:\n" + "\n".join(stats_bits)
+                    if stats_bits
+                    else "Behavior / progress signals: (none provided)"
+                )
+                todo_block = (
+                    f"Today's todos (titles and completion where known):\n{todo_data}\n"
+                    if todo_data
+                    else "Today's todos: (none listed — still give a grounded reading from runes/stats.)\n"
+                )
+                system_prompt = (
+                    "You are Evo, a warm behavioral coach. EVO uses Elder Futhark runes as "
+                    "**recognized identities** earned through real actions — symbols of practice, "
+                    "adaptation, and plasticity — not magical fate. "
+                    "The user's life direction emerges from many small choices, constraints, and "
+                    "context; never claim inevitability, curses, or supernatural knowledge. "
+                    "You may use a poetic, fortune-teller *tone*, but every claim must stay "
+                    "compatible with psychology and agency. "
+                    "Do not mention lucky colors. No medical or legal advice. "
+                    "Write entirely in the user's requested language. "
+                    "Produce 2–4 sentences (about 350–650 characters for Thai or Latin scripts). "
+                    "Optionally end with one short reflective question. At most 2 emojis."
+                )
+                user_prompt = (
+                    f"{rune_block}\n\n{stats_block}\n\n{todo_block}\n"
+                    f"Write the shareable path reading in {normalized_language}. "
+                    "Weave at least one earned rune theme into how they are showing up with their todos; "
+                    "if there are no todos, focus on identity momentum from runes/stats."
+                )
+                response = self._safe_chat_call(
+                    system_prompt,
+                    user_prompt,
+                    max_completion_tokens=700,
+                    temperature=0.95,
+                    language=normalized_language,
+                    model=model,
+                )
+                logger.info("Share-card style todo/rune reading generated successfully")
+                return response
+
+            # --- brief (legacy) path ---
+            normalized_divination_system = (divination_system or "elder_futhark").strip().lower()
+            if normalized_divination_system == "elder_futhark":
+                divination_instruction = (
+                    "Use a 1-rune draw from the Elder Futhark (2nd to 8th century CE). "
+                    "Name exactly one rune and give a practical, positive interpretation for today."
+                )
+            else:
+                divination_instruction = (
+                    f"Use the {normalized_divination_system} rune system for a 1-rune draw. "
+                    "Name exactly one rune and give a practical, positive interpretation for today."
+                )
+
             system_prompt = (
-                "You are Evo, a fortune teller. "
-                "Predict today's todo fate based on the todo data. "
-                "Include a brief positive outlook and suggest an auspicious color for today. "
+                "You are Evo, a supportive rune guide. "
+                "Create a short daily message based on the user's todo context. "
+                f"{divination_instruction} "
+                "Do not mention colors or lucky colors. "
                 "Keep it concise but helpful. Include 1-2 emojis. Maximum 150 characters."
             )
+            ctx_bits = []
+            if stats:
+                for k in (
+                    "runes_unlocked",
+                    "runes_total",
+                    "current_streak",
+                    "longest_streak",
+                    "completion_rate_7d",
+                ):
+                    if k in stats and stats[k] is not None:
+                        ctx_bits.append(f"{k}: {stats[k]}")
+            if earned:
+                ctx_bits.append(
+                    "Earned rune identities: "
+                    + "; ".join(f"{e['name']} ({e['key']})" for e in earned[:10])
+                    + (" …" if len(earned) > 10 else "")
+                )
+            extra_ctx = ""
+            if ctx_bits:
+                extra_ctx = (
+                    "\n\nUser context from real activity (plasticity — not supernatural fate):\n"
+                    + "\n".join(ctx_bits)
+                )
+                system_prompt += (
+                    " You may nod briefly to one earned-identity theme when it fits; "
+                    "still give today's one-rune draw as instructed."
+                )
             if not todo_data:
                 user_prompt = (
-                    f"Predict today's todo fate in {normalized_language}. "
-                    f"Include a brief positive outlook and an auspicious color for today. "
+                    f"Generate today's rune guidance in {normalized_language}. "
+                    f"{divination_instruction} "
+                    "Do not mention colors or lucky colors. "
                     f"Keep it concise but helpful. Include 1-2 emojis. Maximum 150 characters."
-                )
+                ) + extra_ctx
             else:
                 user_prompt = (
                     f"Today's todos:\n{todo_data}\n\n"
-                    f"Predict today's todo fate in {normalized_language}. "
-                    f"Include a brief positive outlook and an auspicious color for today. "
+                    f"Generate today's rune guidance in {normalized_language}. "
+                    f"{divination_instruction} "
+                    "Do not mention colors or lucky colors. "
                     f"Keep it concise but helpful. Include 1-2 emojis. Maximum 150 characters."
-                )
-            # Make API call with optimized parameters
-            # Note: 150 characters needs ~100 tokens for English, ~200+ for Thai/CJK languages
+                ) + extra_ctx
             response = self._safe_chat_call(
                 system_prompt,
                 user_prompt,
@@ -1183,10 +1429,20 @@ def track_progress(user_update: str, todo_data: Dict[str, Any], language: str) -
     summary = planner.summarize_plan(todo_data, "general", language)
     return planner.track_progress(user_update, summary, todo_data)
 
-def respond_to_user_input(user_input: str, summary: str) -> str:
+def respond_to_user_input(
+    user_input: str,
+    summary: str,
+    identity_context: Optional[Dict[str, Any]] = None,
+    last_week_completion_rate: Optional[float] = None,
+) -> str:
     """Backward compatibility function for user input response"""
     planner = get_default_planner()
-    return planner.respond_to_user_input(user_input, summary)
+    return planner.respond_to_user_input(
+        user_input,
+        summary,
+        identity_context=identity_context,
+        last_week_completion_rate=last_week_completion_rate,
+    )
 
 def mood_boost(summary: str) -> str:
     """Backward compatibility function for mood boosting"""
@@ -1198,10 +1454,21 @@ def message_in_the_morning(
     language: str = "thai",
     user_context: Optional[List[str]] = None,
     month_context: Optional[Dict[str, Any]] = None,
+    earned_runes: Optional[List[Dict[str, Any]]] = None,
+    behavior_stats: Optional[Dict[str, Any]] = None,
+    identity_context: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """Backward compatibility function for message in the morning"""
     planner = get_default_planner()
-    return planner.morning_message(today_todo_list_data, language, user_context=user_context, month_context=month_context)
+    return planner.morning_message(
+        today_todo_list_data,
+        language,
+        user_context=user_context,
+        month_context=month_context,
+        earned_runes=earned_runes,
+        behavior_stats=behavior_stats,
+        identity_context=identity_context,
+    )
 
 def summarize_end_of_the_week_at_friday(
     week_data: List[Dict[str, Any]],
@@ -1269,21 +1536,52 @@ def summarize_this_year_todos_message(
     this_year_todos_data: str,
     language: str = "thai",
     month_context: Optional[Dict[str, Any]] = None,
+    identity_context: Optional[Dict[str, Any]] = None,
+    last_week_completion_rate: Optional[float] = None,
 ) -> tuple[Optional[str], Optional[str]]:
     """Backward compatibility function for summarizing this year's todos"""
     planner = get_default_planner()
-    return planner.summarize_this_year_todos_from_text(this_year_todos_data, language, month_context=month_context)
+    return planner.summarize_this_year_todos_from_text(
+        this_year_todos_data,
+        language,
+        month_context=month_context,
+        identity_context=identity_context,
+        last_week_completion_rate=last_week_completion_rate,
+    )
 
 def summarize_this_month_todos_message(
     this_month_todos_data: str,
     language: str = "thai",
     month_context: Optional[Dict[str, Any]] = None,
+    identity_context: Optional[Dict[str, Any]] = None,
+    last_week_completion_rate: Optional[float] = None,
 ) -> tuple[Optional[str], Optional[str]]:
     """Backward compatibility function for summarizing this month's todos"""
     planner = get_default_planner()
-    return planner.summarize_this_month_todos_from_text(this_month_todos_data, language, month_context=month_context)
+    return planner.summarize_this_month_todos_from_text(
+        this_month_todos_data,
+        language,
+        month_context=month_context,
+        identity_context=identity_context,
+        last_week_completion_rate=last_week_completion_rate,
+    )
 
-def predict_today_todo_fate(todo_data: List[Dict[str, Any]], language: str = "thai") -> str:
+def predict_today_todo_fate(
+    todo_data: List[Dict[str, Any]],
+    language: str = "thai",
+    divination_system: str = "elder_futhark",
+    earned_runes: Optional[List[Dict[str, Any]]] = None,
+    behavior_stats: Optional[Dict[str, Any]] = None,
+    output_style: str = "brief",
+) -> str:
     """Backward compatibility function for predicting today's todo fate"""
     planner = get_default_planner()
-    return planner.predict_today_todo_fate_message(todo_data, language, model="gpt-4o-mini")
+    return planner.predict_today_todo_fate_message(
+        todo_data,
+        language,
+        model="gpt-4o-mini",
+        divination_system=divination_system,
+        earned_runes=earned_runes,
+        behavior_stats=behavior_stats,
+        output_style=output_style,
+    )

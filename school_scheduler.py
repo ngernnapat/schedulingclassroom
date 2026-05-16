@@ -109,18 +109,23 @@ class SchoolScheduler:
                     "P1": 1, "P2": 2, "P3": 3, "P4": 4, "P5": 5,
                     "P6": 6, "M1": 7, "M2": 8, "M3": 9
                 },
+                # BUGFIX: the previous color stops list pinned both index 3
+                # (P3) and index 7 (M1) to 1.0, which made the Plotly heatmap
+                # silently mis-color those grades because color stops must be
+                # strictly monotonically increasing in [0, 1]. Re-derive the
+                # stops from grade_to_number so the mapping is always exact
+                # and any future grade additions stay in sync.
                 'colors': [
-                    [0.0, "white"],         # 0 (empty) → white
-                    [0.1, "lightblue"],     # 1 → P1
-                    [0.2, "skyblue"],       # 2 → P2
-                    [1.0, "dodgerblue"],    # 3 → P3
-                    [0.4, "steelblue"],     # 4 → P4
-                    [0.5, "deepskyblue"],   # 5 → P5
-                    [0.6, "cornflowerblue"],# 6 → P6
-                    [1.0, "lightpink"],     # 7 → M1
-                    [0.8, "salmon"],        # 8 → M2
-                    [0.9, "tomato"],        # 9 → M3
-                    [1.0, "orangered"]      # fill to top
+                    [0.0, "white"],            # 0 (empty)        → white
+                    [1 / 9, "lightblue"],      # 1  → P1
+                    [2 / 9, "skyblue"],        # 2  → P2
+                    [3 / 9, "dodgerblue"],     # 3  → P3
+                    [4 / 9, "steelblue"],      # 4  → P4
+                    [5 / 9, "deepskyblue"],    # 5  → P5
+                    [6 / 9, "cornflowerblue"], # 6  → P6
+                    [7 / 9, "lightpink"],      # 7  → M1
+                    [8 / 9, "salmon"],         # 8  → M2
+                    [1.0,   "tomato"],         # 9  → M3
                 ]
             }
             return True

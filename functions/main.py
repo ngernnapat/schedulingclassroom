@@ -29,6 +29,8 @@ from datetime import datetime
 # Load environment variables
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 # Lazy-loaded modules to reduce cold start time
 _planner_utils = None
 _generate_planner_content = None
@@ -76,7 +78,7 @@ def get_school_scheduler():
             _scheduler_available = False
     return _school_scheduler, _scheduler_available
 
-# Lazy-loaded YOLO model
+#Lazy-loaded YOLO model
 _yolo_model = None
 
 def get_yolo_model():
@@ -254,7 +256,7 @@ def create_response(
     metadata: Optional[Dict[str, Any]] = None,
     extra_headers: Optional[Dict[str, str]] = None
 ) -> https_fn.Response:
-    """Create a standardized HTTP response"""
+    """Create a standardized HTTP response."""
     response_data = {
         'success': success,
         'message': message,
@@ -269,8 +271,9 @@ def create_response(
         headers=headers
     )
 
+
 def handle_preflight_request() -> https_fn.Response:
-    """Handle CORS preflight requests"""
+    """Handle CORS preflight requests."""
     return https_fn.Response('', status=200, headers=CORS_HEADERS)
 
 
@@ -402,215 +405,215 @@ def format_schedule_data(schedule_df, homeroom_df) -> Tuple[List[Dict[str, Any]]
     
     return reformatted_schedule, homeroom_data
 
-# Generate a school schedule based on provided parameters
-@https_fn.on_request(max_instances=3)
-def generate_schedule(req: https_fn.Request) -> https_fn.Response:
-    """Generate a school schedule based on provided parameters"""
-    start_time = time.time()
+# # Generate a school schedule based on provided parameters
+# @https_fn.on_request(max_instances=3)
+# def generate_schedule(req: https_fn.Request) -> https_fn.Response:
+#     """Generate a school schedule based on provided parameters"""
+#     start_time = time.time()
     
-    try:
-        # Handle preflight requests
-        if req.method == 'OPTIONS':
-            return handle_preflight_request()
+#     try:
+#         # Handle preflight requests
+#         if req.method == 'OPTIONS':
+#             return handle_preflight_request()
         
-        # Validate HTTP method
-        if req.method != 'POST':
-            return create_response(
-                success=False,
-                message=f'Method {req.method} not allowed',
-                error='This endpoint only accepts POST requests with JSON data',
-                status_code=405,
-                data={
-                    'endpoints': {
-                        'POST /generate_schedule': 'Generate a school schedule (requires JSON data)',
-                        'GET /health_check': 'Check service health',
-                        'GET /get_schedule_info': 'Get API information and examples',
-                        'GET /debug': 'Get debug information'
-                    }
-                }
-            )
+#         # Validate HTTP method
+#         if req.method != 'POST':
+#             return create_response(
+#                 success=False,
+#                 message=f'Method {req.method} not allowed',
+#                 error='This endpoint only accepts POST requests with JSON data',
+#                 status_code=405,
+#                 data={
+#                     'endpoints': {
+#                         'POST /generate_schedule': 'Generate a school schedule (requires JSON data)',
+#                         'GET /health_check': 'Check service health',
+#                         'GET /get_schedule_info': 'Get API information and examples',
+#                         'GET /debug': 'Get debug information'
+#                     }
+#                 }
+#             )
         
-        # Parse request data
-        try:
-            data = req.get_json()
-            if data is None:
-                return create_response(
-                    success=False,
-                    message='No JSON data provided',
-                    error='This endpoint requires a POST request with JSON data in the body',
-                    status_code=400,
-                    data={'example': ScheduleRequest.Config.json_schema_extra['example']}
-                )
-        except Exception as e:
-            logger.error(f"JSON parsing error: {e}")
-            return create_response(
-                success=False,
-                message='Invalid JSON',
-                error=f'This endpoint requires a POST request with valid JSON data in the body. Error: {str(e)}',
-                status_code=400
-            )
+#         # Parse request data
+#         try:
+#             data = req.get_json()
+#             if data is None:
+#                 return create_response(
+#                     success=False,
+#                     message='No JSON data provided',
+#                     error='This endpoint requires a POST request with JSON data in the body',
+#                     status_code=400,
+#                     data={'example': ScheduleRequest.Config.json_schema_extra['example']}
+#                 )
+#         except Exception as e:
+#             logger.error(f"JSON parsing error: {e}")
+#             return create_response(
+#                 success=False,
+#                 message='Invalid JSON',
+#                 error=f'This endpoint requires a POST request with valid JSON data in the body. Error: {str(e)}',
+#                 status_code=400
+#             )
         
-        # Validate request data
-        is_valid, error_message = validate_schedule_request(data)
-        if not is_valid:
-            logger.warning(f"Invalid request data: {error_message}")
-            return create_response(
-                success=False,
-                message='Validation failed',
-                error=error_message,
-                status_code=400
-            )
+#         # Validate request data
+#         is_valid, error_message = validate_schedule_request(data)
+#         if not is_valid:
+#             logger.warning(f"Invalid request data: {error_message}")
+#             return create_response(
+#                 success=False,
+#                 message='Validation failed',
+#                 error=error_message,
+#                 status_code=400
+#             )
         
-        # Check if SchoolScheduler is available (lazy load)
-        SchoolScheduler, scheduler_available = get_school_scheduler()
-        if not scheduler_available:
-            logger.error("SchoolScheduler module not available")
-            return create_response(
-                success=False,
-                message='Service unavailable',
-                error='SchoolScheduler module not available',
-                status_code=500
-            )
+#         # Check if SchoolScheduler is available (lazy load)
+#         SchoolScheduler, scheduler_available = get_school_scheduler()
+#         if not scheduler_available:
+#             logger.error("SchoolScheduler module not available")
+#             return create_response(
+#                 success=False,
+#                 message='Service unavailable',
+#                 error='SchoolScheduler module not available',
+#                 status_code=500
+#             )
         
-        # Generate schedule
-        logger.info(f"Generating schedule with parameters: {data}")
+#         # Generate schedule
+#         logger.info(f"Generating schedule with parameters: {data}")
         
-        try:
-            scheduler = SchoolScheduler()
-            scheduler.set_pe_constraints_enabled(data.get('enable_pe_constraints', False))
-            scheduler.set_homeroom_mode(data.get('homeroom_mode', 1))
+#         try:
+#             scheduler = SchoolScheduler()
+#             scheduler.set_pe_constraints_enabled(data.get('enable_pe_constraints', False))
+#             scheduler.set_homeroom_mode(data.get('homeroom_mode', 1))
             
-            # Initialize scheduler inputs
-            logger.info("Initializing scheduler inputs...")
-            if not scheduler.get_inputs(
-                n_teachers=data['n_teachers'],
-                grades=data['grades'],
-                pe_teacher=data.get('pe_teacher', 'T13'),
-                pe_grades=data.get('pe_grades', ['P4', 'P5', 'P6', 'M1', 'M2', 'M3']),
-                pe_day=data.get('pe_day', 3),
-                n_pe_periods=data.get('n_pe_periods', 6),
-                start_hour=data.get('start_hour', 8),
-                n_hours=data.get('n_hours', 8),
-                lunch_hour=data.get('lunch_hour', 5),
-                days_per_week=data.get('days_per_week', 5),
-                enable_pe_constraints=data.get('enable_pe_constraints', False),
-                homeroom_mode=data.get('homeroom_mode', 1)
-            ):
-                logger.error("Failed to initialize scheduler inputs")
-                return create_response(
-                    success=False,
-                    message='Initialization failed',
-                    error='Failed to initialize scheduler inputs',
-                    status_code=500
-                )
+#             # Initialize scheduler inputs
+#             logger.info("Initializing scheduler inputs...")
+#             if not scheduler.get_inputs(
+#                 n_teachers=data['n_teachers'],
+#                 grades=data['grades'],
+#                 pe_teacher=data.get('pe_teacher', 'T13'),
+#                 pe_grades=data.get('pe_grades', ['P4', 'P5', 'P6', 'M1', 'M2', 'M3']),
+#                 pe_day=data.get('pe_day', 3),
+#                 n_pe_periods=data.get('n_pe_periods', 6),
+#                 start_hour=data.get('start_hour', 8),
+#                 n_hours=data.get('n_hours', 8),
+#                 lunch_hour=data.get('lunch_hour', 5),
+#                 days_per_week=data.get('days_per_week', 5),
+#                 enable_pe_constraints=data.get('enable_pe_constraints', False),
+#                 homeroom_mode=data.get('homeroom_mode', 1)
+#             ):
+#                 logger.error("Failed to initialize scheduler inputs")
+#                 return create_response(
+#                     success=False,
+#                     message='Initialization failed',
+#                     error='Failed to initialize scheduler inputs',
+#                     status_code=500
+#                 )
             
-            # Build optimization model
-            logger.info("Building optimization model...")
-            scheduler.get_model()
+#             # Build optimization model
+#             logger.info("Building optimization model...")
+#             scheduler.get_model()
             
-            # Solve optimization problem
-            logger.info("Solving optimization problem...")
-            if not scheduler.get_solution():
-                logger.warning("No feasible solution found for the given constraints")
-                return create_response(
-                    success=False,
-                    message='No solution found',
-                    error='No feasible solution found for the given constraints',
-                    status_code=422
-                )
+#             # Solve optimization problem
+#             logger.info("Solving optimization problem...")
+#             if not scheduler.get_solution():
+#                 logger.warning("No feasible solution found for the given constraints")
+#                 return create_response(
+#                     success=False,
+#                     message='No solution found',
+#                     error='No feasible solution found for the given constraints',
+#                     status_code=422
+#                 )
             
-            # Format response data
-            logger.info("Preparing response data...")
-            schedule_data, homeroom_data = format_schedule_data(scheduler.schedule_df, scheduler.homeroom_df)
+#             # Format response data
+#             logger.info("Preparing response data...")
+#             schedule_data, homeroom_data = format_schedule_data(scheduler.schedule_df, scheduler.homeroom_df)
             
-            processing_time = round(time.time() - start_time, 2)
-            logger.info(f"Schedule generated successfully in {processing_time} seconds")
+#             processing_time = round(time.time() - start_time, 2)
+#             logger.info(f"Schedule generated successfully in {processing_time} seconds")
             
-            return create_response(
-                data={
-                    'schedule': schedule_data,
-                    'homeroom': homeroom_data,
-                    'parameters': data
-                },
-                success=True,
-                message='Schedule generated successfully',
-                metadata={
-                    'total_assignments': len(schedule_data),
-                    'homeroom_assignments': len(homeroom_data),
-                    'processing_time_seconds': processing_time
-                }
-            )
+#             return create_response(
+#                 data={
+#                     'schedule': schedule_data,
+#                     'homeroom': homeroom_data,
+#                     'parameters': data
+#                 },
+#                 success=True,
+#                 message='Schedule generated successfully',
+#                 metadata={
+#                     'total_assignments': len(schedule_data),
+#                     'homeroom_assignments': len(homeroom_data),
+#                     'processing_time_seconds': processing_time
+#                 }
+#             )
             
-        except Exception as e:
-            logger.error(f"Error in schedule generation: {str(e)}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            return create_response(
-                success=False,
-                message='Schedule generation failed',
-                error=f'Schedule generation failed: {str(e)}',
-                status_code=500
-            )
+#         except Exception as e:
+#             logger.error(f"Error in schedule generation: {str(e)}")
+#             logger.error(f"Traceback: {traceback.format_exc()}")
+#             return create_response(
+#                 success=False,
+#                 message='Schedule generation failed',
+#                 error=f'Schedule generation failed: {str(e)}',
+#                 status_code=500
+#             )
         
-    except Exception as e:
-        logger.error(f"Unexpected error in generate_schedule: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        return create_response(
-            success=False,
-            message='Internal server error',
-            error=f'Internal server error: {str(e)}',
-            status_code=500
-        )
+#     except Exception as e:
+#         logger.error(f"Unexpected error in generate_schedule: {str(e)}")
+#         logger.error(f"Traceback: {traceback.format_exc()}")
+#         return create_response(
+#             success=False,
+#             message='Internal server error',
+#             error=f'Internal server error: {str(e)}',
+#             status_code=500
+#         )
 
 
-# Get information about available schedule parameters and constraints
-@https_fn.on_request()
-def get_schedule_info(req: https_fn.Request) -> https_fn.Response:
-    """Get information about available schedule parameters and constraints"""
-    if req.method == 'OPTIONS':
-        return handle_preflight_request()
+# # Get information about available schedule parameters and constraints
+# @https_fn.on_request()
+# def get_schedule_info(req: https_fn.Request) -> https_fn.Response:
+#     """Get information about available schedule parameters and constraints"""
+#     if req.method == 'OPTIONS':
+#         return handle_preflight_request()
     
-    if req.method != 'GET':
-        return create_response(
-            success=False,
-            message='Method not allowed',
-            error='Only GET method is allowed',
-            status_code=405
-        )
+#     if req.method != 'GET':
+#         return create_response(
+#             success=False,
+#             message='Method not allowed',
+#             error='Only GET method is allowed',
+#             status_code=405
+#         )
     
-    info_data = {
-        'description': 'School Schedule Optimization API',
-        'endpoints': {
-            'POST /generate_schedule': 'Generate a new school schedule',
-            'GET /health_check': 'Check service health',
-            'GET /get_schedule_info': 'Get API information',
-            'GET /debug': 'Get debug information'
-        },
-        'required_parameters': {
-            'n_teachers': f'Number of teachers (integer, 1-{MAX_TEACHERS})',
-            'grades': f'List of grade levels (e.g., ["P1", "P2", "P3"], max {MAX_GRADES} items)'
-        },
-        'optional_parameters': {
-            'pe_teacher': 'Physical education teacher ID (default: "T13")',
-            'pe_grades': 'Grades that have PE (default: ["P4", "P5", "P6", "M1", "M2", "M3"])',
-            'pe_day': 'Day for PE classes (default: 3)',
-            'n_pe_periods': 'Number of PE periods (default: 6)',
-            'start_hour': 'Starting hour (default: 8)',
-            'n_hours': f'Number of hours per day (default: 8, max: {MAX_HOURS_PER_DAY})',
-            'lunch_hour': 'Lunch hour (default: 5)',
-            'days_per_week': f'Days per week (default: 5, max: {MAX_DAYS_PER_WEEK})',
-            'enable_pe_constraints': 'Enable PE constraints (default: false)',
-            'homeroom_mode': 'Homeroom mode: 0=none, 1=basic, 2=advanced (default: 1)'
-        },
-        'example_request': ScheduleRequest.Config.json_schema_extra['example'],
-        'constraints': {
-            'max_teachers': MAX_TEACHERS,
-            'max_grades': MAX_GRADES,
-            'max_hours_per_day': MAX_HOURS_PER_DAY,
-            'max_days_per_week': MAX_DAYS_PER_WEEK
-        }
-    }
+#     info_data = {
+#         'description': 'School Schedule Optimization API',
+#         'endpoints': {
+#             'POST /generate_schedule': 'Generate a new school schedule',
+#             'GET /health_check': 'Check service health',
+#             'GET /get_schedule_info': 'Get API information',
+#             'GET /debug': 'Get debug information'
+#         },
+#         'required_parameters': {
+#             'n_teachers': f'Number of teachers (integer, 1-{MAX_TEACHERS})',
+#             'grades': f'List of grade levels (e.g., ["P1", "P2", "P3"], max {MAX_GRADES} items)'
+#         },
+#         'optional_parameters': {
+#             'pe_teacher': 'Physical education teacher ID (default: "T13")',
+#             'pe_grades': 'Grades that have PE (default: ["P4", "P5", "P6", "M1", "M2", "M3"])',
+#             'pe_day': 'Day for PE classes (default: 3)',
+#             'n_pe_periods': 'Number of PE periods (default: 6)',
+#             'start_hour': 'Starting hour (default: 8)',
+#             'n_hours': f'Number of hours per day (default: 8, max: {MAX_HOURS_PER_DAY})',
+#             'lunch_hour': 'Lunch hour (default: 5)',
+#             'days_per_week': f'Days per week (default: 5, max: {MAX_DAYS_PER_WEEK})',
+#             'enable_pe_constraints': 'Enable PE constraints (default: false)',
+#             'homeroom_mode': 'Homeroom mode: 0=none, 1=basic, 2=advanced (default: 1)'
+#         },
+#         'example_request': ScheduleRequest.Config.json_schema_extra['example'],
+#         'constraints': {
+#             'max_teachers': MAX_TEACHERS,
+#             'max_grades': MAX_GRADES,
+#             'max_hours_per_day': MAX_HOURS_PER_DAY,
+#             'max_days_per_week': MAX_DAYS_PER_WEEK
+#         }
+#     }
     
-    return create_response(data=info_data, message='API information retrieved successfully')
+#     return create_response(data=info_data, message='API information retrieved successfully')
 
 ########### Generate Planner Content API Endpoints #############
 @https_fn.on_request(memory=2048, max_instances=5, timeout_sec=540, cpu=2)  # 9 minutes timeout
@@ -1190,11 +1193,9 @@ def process_planner_job(req: https_fn.Request) -> https_fn.Response:
 @https_fn.on_request(memory=2048, max_instances=5, timeout_sec=540, cpu=2)  # 9 minutes timeout
 def generate_planner_content_async(req: https_fn.Request) -> https_fn.Response:
     """
-    Combined async endpoint: Starts job and processes it in one request.
-    For simpler client integration - returns job ID immediately,
-    then client can poll get_planner_job_status for updates.
-    
-    This is a convenience endpoint that combines start + process.
+    Starts planner generation job and returns a job ID immediately.
+    Client should call process_planner_job to execute the job, then poll
+    job status endpoints (or read job record) for progress/result.
     """
     if req.method == 'OPTIONS':
         return handle_preflight_request()
@@ -1209,8 +1210,6 @@ def generate_planner_content_async(req: https_fn.Request) -> https_fn.Response:
     
     gpc = get_generate_planner_content()
     job_id = None
-    started_at = time.time()
-
     try:
         request_data = req.get_json() or {}
         request_data.setdefault("fastMode", True)
@@ -1221,56 +1220,30 @@ def generate_planner_content_async(req: https_fn.Request) -> https_fn.Response:
         job = _create_planner_job(parsed.model_dump())
         job_id = job["job_id"]
         
-        logger.info(f"Starting async generation for job: {job_id}")
+        logger.info(f"Queued async generation job: {job_id}")
         
         # Update status
         _update_planner_job(job_id, {
-            "status": "processing",
+            "status": "pending",
             "progress": 10,
-            "progress_message": "Starting generation...",
+            "progress_message": "Job queued. Call process_planner_job to start generation.",
             "current_stage": "initializing",
-            "stages_completed": 1
+            "stages_completed": 0
         })
-        
-        # Generate content
-        _update_planner_job(job_id, {
-            "progress": 25,
-            "progress_message": f"Generating {parsed.totalDays}-day {parsed.category} plan...",
-            "current_stage": "generating_days",
-            "stages_completed": 2,
-            "estimated_seconds_remaining": max(5, int(job.get("estimated_seconds_remaining", 120) * 0.7))
-        })
-        
-        chat = gpc.ChatWrapper(gpc.ChatWrapperConfig())
-        content = chat.generate(parsed)
-        result_payload = content.model_dump()
-        elapsed_ms = int((time.time() - started_at) * 1000)
-        
-        # Complete
-        _update_planner_job(job_id, {
-            "status": "completed",
-            "progress": 100,
-            "progress_message": "Generation complete!",
-            "current_stage": "completed",
-            "stages_completed": 4,
-            "estimated_seconds_remaining": 0,
-            "result": result_payload,
-            "elapsed_ms": elapsed_ms
-        })
-        
-        logger.info(f"Completed async generation for job: {job_id}")
-        
-        # Return the result directly
+
         return create_response(
-            data=result_payload,
-            message="Planner generated successfully",
+            data={
+                "jobId": job_id,
+                "status": "pending"
+            },
+            message="Planner generation job queued",
             metadata={
                 "jobId": job_id,
-                "elapsedMs": elapsed_ms,
-                "status": "completed",
+                "status": "pending",
                 "totalDays": parsed.totalDays,
                 "category": parsed.category,
-                "fastMode": parsed.fastMode
+                "fastMode": parsed.fastMode,
+                "nextStep": "Call process_planner_job with this jobId to execute generation"
             }
         )
         
@@ -1282,23 +1255,8 @@ def generate_planner_content_async(req: https_fn.Request) -> https_fn.Response:
             error=str(errors),
             status_code=400
         )
-    except gpc.PlannerGenerationError as e:
-        logger.error(f"Planner generation failed: {e.message}")
-        if job_id:
-            _update_planner_job(job_id, {
-                "status": "failed",
-                "progress_message": "Generation failed",
-                "error": e.user_message
-            })
-        return create_response(
-            success=False,
-            message='Generation failed',
-            error=e.user_message,
-            status_code=500,
-            metadata={"jobId": job_id}
-        )
     except Exception as e:
-        logger.error(f"Error in async generation: {e}")
+        logger.error(f"Error queueing async generation job: {e}")
         import traceback
         traceback.print_exc()
         
@@ -1503,7 +1461,17 @@ def coach(req: https_fn.Request) -> https_fn.Response:
                 )
         
         pu = get_planner_utils()
-        response = pu.respond_to_user_input(data['user_input'], data['summary'])
+        # Optional behavior-grounding context (see docs/ORCHESTRATION.md
+        # "Relevance second" — coaching should reference real streaks /
+        # last-week completion rather than generic motivational copy).
+        identity_context = data.get('identity_context')
+        last_week_completion_rate = data.get('last_week_completion_rate')
+        response = pu.respond_to_user_input(
+            data['user_input'],
+            data['summary'],
+            identity_context=identity_context,
+            last_week_completion_rate=last_week_completion_rate,
+        )
         return create_response(
             data={'response': response},
             message='Response generated successfully'
@@ -1567,7 +1535,10 @@ def encourage_in_the_morning(req: https_fn.Request) -> https_fn.Response:
             today_todo_list_data=data['today_todo_list_data'],
             language=data.get('languageSelected', 'thai'),
             user_context=user_context,
-            month_context=month_context
+            month_context=month_context,
+            earned_runes=data.get('earned_runes'),
+            behavior_stats=data.get('behavior_stats'),
+            identity_context=data.get('identity_context'),
         )
         return create_response(
             data={'response': response},
@@ -1962,11 +1933,15 @@ def summary_this_year_todos(req: https_fn.Request) -> https_fn.Response:
         language = data.get('languageSelected', 'thai')
         logger.info(f"Summarizing this year's todos in language: {language}")
         month_context = _month_context_for_user(data.get('user_id'), data)
+        identity_context = data.get('identity_context')
+        last_week_completion_rate = data.get('last_week_completion_rate')
         pu = get_planner_utils()
         title, summary = pu.summarize_this_year_todos_message(
             this_year_todos_data=data['this_year_todos_data'],
             language=language,
-            month_context=month_context
+            month_context=month_context,
+            identity_context=identity_context,
+            last_week_completion_rate=last_week_completion_rate,
         )
         return create_response(
             data={'title': title, 'summary': summary},
@@ -2031,11 +2006,15 @@ def summary_this_month_todos(req: https_fn.Request) -> https_fn.Response:
         language = data.get('languageSelected', 'thai')
         logger.info(f"Summarizing this month's todos in language: {language}")
         month_context = _month_context_for_user(data.get('user_id'), data)
+        identity_context = data.get('identity_context')
+        last_week_completion_rate = data.get('last_week_completion_rate')
         pu = get_planner_utils()
         title, summary = pu.summarize_this_month_todos_message(
             this_month_todos_data=data['this_month_todos_data'],
             language=language,
-            month_context=month_context
+            month_context=month_context,
+            identity_context=identity_context,
+            last_week_completion_rate=last_week_completion_rate,
         )
         return create_response(
             data={'title': title, 'summary': summary},
@@ -2053,10 +2032,10 @@ def summary_this_month_todos(req: https_fn.Request) -> https_fn.Response:
             status_code=500
         )
 
-# Encourage the user to start the day using ChatGPT
+# Generate rune-based daily guidance using ChatGPT
 @https_fn.on_request(memory=1024, max_instances=3, timeout_sec=540, cpu=1)
 def todo_fate_prediction(req: https_fn.Request) -> https_fn.Response:
-    """predict the fate of the user's todos using ChatGPT"""
+    """Generate rune-based daily guidance (Elder Futhark by default) from the user's todos using ChatGPT."""
     if req.method == 'OPTIONS':
         return handle_preflight_request()
     
@@ -2089,6 +2068,11 @@ def todo_fate_prediction(req: https_fn.Request) -> https_fn.Response:
                     status_code=400
                 )
 
+        divination_system = data.get('divination_system', 'elder_futhark')
+        output_style = data.get('output_style', 'brief')
+        earned_runes = data.get('earned_runes')
+        behavior_stats = data.get('behavior_stats')
+
         if 'todo_data' in data:
             todo_data = data['todo_data']
             language = data['languageSelected']
@@ -2096,10 +2080,17 @@ def todo_fate_prediction(req: https_fn.Request) -> https_fn.Response:
             todo_data = []
             language = 'english'
         pu = get_planner_utils()
-        response = pu.predict_today_todo_fate(todo_data=todo_data, language=language)
+        response = pu.predict_today_todo_fate(
+            todo_data=todo_data,
+            language=language,
+            divination_system=divination_system,
+            earned_runes=earned_runes if isinstance(earned_runes, list) else None,
+            behavior_stats=behavior_stats if isinstance(behavior_stats, dict) else None,
+            output_style=output_style,
+        )
         return create_response(
             data={'response': response},
-            message='Todo fate prediction generated successfully'
+            message='Rune guidance generated successfully'
         )
     except Exception as e:
         from chatgpt_wrapper import RateLimitExceededError
