@@ -4,7 +4,7 @@ import time
 import uuid
 import asyncio
 import concurrent.futures
-from typing import List, Optional, Literal, Dict, Any, Tuple, Union
+from typing import List, Optional, Literal, Dict, Any, Tuple, Union, Callable
 from dataclasses import dataclass, asdict
 
 # Firebase imports - optional for local testing
@@ -50,6 +50,89 @@ def get_openai_client():
 # =========================
 
 PlanCategory = Literal["learning", "exercise", "travel", "finance", "health", "personal_development", "other"]
+
+_GENERIC_PLAN_NAMES = frozenset({"30-day practice", "30-Day Practice", ""})
+
+_CATEGORY_NAME_LABELS = {
+    "en": {
+        "learning": "Learning",
+        "exercise": "Fitness",
+        "travel": "Travel",
+        "finance": "Finance",
+        "health": "Wellness",
+        "personal_development": "Growth",
+        "other": "Personal",
+    },
+    "th": {
+        "learning": "การเรียนรู้",
+        "exercise": "ฟิตเนส",
+        "travel": "ท่องเที่ยว",
+        "finance": "การเงิน",
+        "health": "สุขภาพ",
+        "personal_development": "พัฒนาตัวเอง",
+        "other": "ส่วนตัว",
+    },
+}
+
+_DEFAULT_DETAIL_PROMPTS = {
+    "en": {
+        "learning": "I want a realistic daily learning plan with practice and review. About 45 minutes per day.",
+        "exercise": "I want a balanced workout plan I can stick to. About 45 minutes per session, beginner-friendly, include rest days.",
+        "travel": "Plan a day-by-day trip itinerary with about 4 hours of activities per day — sights, meals, local experiences, transit, and rest breaks.",
+        "finance": "Build simple daily money habits: track spending, save, and learn basics step by step.",
+        "health": "I want sustainable wellness habits for body and mind with realistic daily steps.",
+        "personal_development": "Help me build focus, habits, and reflection with small daily actions.",
+        "other": "Create a realistic daily plan toward my goal with small, clear tasks.",
+    },
+    "th": {
+        "learning": "ต้องการแผนเรียนรู้รายวันที่ทำได้จริง มีฝึกและทบทวน ประมาณ 45 นาทีต่อวัน",
+        "exercise": "ต้องการแผนออกกำลังกายที่ทำต่อเนื่องได้ ประมาณ 45 นาทีต่อครั้ง มือใหม่ มีวันพัก",
+        "travel": "วางแผนทริปรายวัน ประมาณ 4 ชั่วโมงต่อวัน — สถานที่ อาหาร ประสบการณ์ท้องถิ่น การเดินทาง และพักผ่อน",
+        "finance": "สร้างนิสัยการเงินรายวัน ติดตามรายจ่าย ออม และเรียนรู้ทีละขั้น",
+        "health": "ต้องการนิสัยสุขภาพที่ยั่งยืน ทั้งกายและใจ ขั้นตอนเล็กๆ ต่อวัน",
+        "personal_development": "สร้างสมาธิ นิสัย และการทบทวน ด้วยการลงมือเล็กๆ ทุกวัน",
+        "other": "สร้างแผนรายวันที่ทำได้จริง งานชัดเจน ขั้นเล็กๆ",
+    },
+}
+
+
+def suggest_plan_name(category: str, total_days: int, language: str = "en") -> str:
+    """Auto title when the client omits or sends a generic plan name."""
+    lang = "th" if language == "th" else "en"
+    labels = _CATEGORY_NAME_LABELS[lang]
+    cat_label = labels.get(category, labels["other"])
+    if lang == "th":
+        return f"แผน{cat_label} {total_days} วัน"
+    return f"{total_days}-Day {cat_label} Plan"
+
+
+def default_detail_prompt_for_category(category: str, language: str = "en") -> str:
+    lang = "th" if language == "th" else "en"
+    prompts = _DEFAULT_DETAIL_PROMPTS[lang]
+    return prompts.get(category, prompts["other"])
+
+
+# Typical daily commitment and plan length per category (lean mobile form + API defaults)
+_CATEGORY_PLAN_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "exercise": {"minutesPerDay": 45, "totalDays": 21, "intensity": "moderate"},
+    "learning": {"minutesPerDay": 45, "totalDays": 14, "intensity": "moderate"},
+    "travel": {"minutesPerDay": 240, "totalDays": 7, "intensity": "moderate"},
+    "finance": {"minutesPerDay": 15, "totalDays": 21, "intensity": "easy"},
+    "health": {"minutesPerDay": 25, "totalDays": 21, "intensity": "moderate"},
+    "personal_development": {"minutesPerDay": 20, "totalDays": 21, "intensity": "moderate"},
+    "other": {"minutesPerDay": 30, "totalDays": 7, "intensity": "moderate"},
+}
+
+
+def default_plan_params_for_category(category: str) -> Dict[str, Any]:
+    return dict(_CATEGORY_PLAN_DEFAULTS.get(category, _CATEGORY_PLAN_DEFAULTS["other"]))
+
+
+def resolve_fast_mode(total_days: int, fast_mode: Optional[bool] = None) -> bool:
+    """Sensible default: longer plans use faster model unless client overrides."""
+    if fast_mode is not None:
+        return bool(fast_mode)
+    return total_days > 14
 
 # =========================
 # Extracted User Context (from detailPrompt)
@@ -197,6 +280,27 @@ class DayPlan(BaseModel):
                 data['tips'] = '\n• '.join(tips) if tips else None
         return data
 
+ProgressCallback = Callable[[Dict[str, Any]], None]
+
+
+class PlanPhaseOutline(BaseModel):
+    phase_name: str
+    start_day: int
+    end_day: int
+    focus: str
+    goals: List[str] = Field(default_factory=list)
+
+
+class PlanOutline(BaseModel):
+    """High-level plan structure generated before day-by-day content."""
+    overview: str
+    difficulty_arc: Optional[str] = None
+    key_milestones: List[str] = Field(default_factory=list)
+    weekly_focus: List[str] = Field(default_factory=list)
+    rest_day_numbers: List[int] = Field(default_factory=list)
+    phases: List[PlanPhaseOutline] = Field(default_factory=list)
+
+
 class PlannerSummary(BaseModel):
     """Summary information about the generated planner"""
     overview: Optional[str] = Field(None, description="Brief overview of what this plan covers and its approach")
@@ -240,14 +344,21 @@ class GeneratePlannerRequest(BaseModel):
         description="Type of planner content to generate"
     )
     
-    totalDays: conint(ge=1, le=90) = Field(
-        default=30,
-        description="Number of days in the plan (1-90)"
+    totalDays: Optional[conint(ge=1, le=90)] = Field(
+        default=None,
+        description="Number of days in the plan (1-90). Omit for a category-typical length.",
     )
     
     detailPrompt: Optional[constr(strip_whitespace=True, max_length=1000)] = Field(
         default=None,
         description="User specifics (level, constraints, destinations, equipment, etc.) - max 1000 characters"
+    )
+
+    # Server-only: full draft JSON for refine_plan (not sent from mobile detailPrompt field)
+    refinementContext: Optional[str] = Field(
+        default=None,
+        max_length=120000,
+        description="Internal draft plan JSON for refinement requests",
     )
     
     # Optional configuration knobs:
@@ -277,48 +388,57 @@ class GeneratePlannerRequest(BaseModel):
         description="Preferred time of day for activities"
     )
     
-    # Performance options
-    fastMode: bool = Field(
-        default=False,
-        description="Enable fast mode for quicker generation (uses faster model, may have slightly lower quality). Default is True for better UX."
+    # Performance options (None = auto: faster model for plans longer than 14 days)
+    fastMode: Optional[bool] = Field(
+        default=None,
+        description="Enable fast mode for quicker generation. Omit to auto-select from plan length.",
     )
     
     skipContextExtraction: bool = Field(
         default=False,
         description="Skip the context extraction step for faster generation (less personalized)"
     )
+
+    userId: Optional[str] = Field(
+        default=None,
+        description="Owner uid — used by Firebase to sync completed jobs into draft plans",
+    )
+    planId: Optional[str] = Field(
+        default=None,
+        description="Draft lifestyle-plans document id for background generation",
+    )
     
     @model_validator(mode='after')
     def validate_plan_consistency(self) -> 'GeneratePlannerRequest':
         """Validate business logic constraints with user-friendly suggestions."""
-        # Validate minutesPerDay makes sense for the category - use warnings instead of errors
         if self.minutesPerDay and self.category == "exercise":
             if self.minutesPerDay < 15:
-                # Auto-adjust to minimum safe duration instead of raising error
                 print(f"Warning: Exercise plans should be at least 15 minutes for safety. Adjusting from {self.minutesPerDay} to 15 minutes.")
                 self.minutesPerDay = 15
             if self.minutesPerDay > 480:
-                # Auto-adjust to maximum safe duration instead of raising error
                 print(f"Warning: Exercise plans should not exceed 8 hours for safety. Adjusting from {self.minutesPerDay} to 480 minutes.")
                 self.minutesPerDay = 480
-        
-        # Validate totalDays vs minutesPerDay for reasonable workload - use warnings instead of errors
+
+        if self.minutesPerDay and self.category == "travel":
+            if self.minutesPerDay < 60:
+                print(
+                    f"Warning: Travel itineraries need meaningful daily activity time. "
+                    f"Adjusting from {self.minutesPerDay} to 120 minutes."
+                )
+                self.minutesPerDay = 120
+
         if self.minutesPerDay and self.totalDays:
             total_hours = (self.minutesPerDay * self.totalDays) / 60
-            if total_hours > 200:  # More than 200 total hours seems excessive
-                # Suggest reducing intensity instead of failing
+            if total_hours > 200:
                 print(f"Warning: Plan would require {total_hours:.1f} total hours, which may be intensive. Consider reducing daily time or total days.")
-                # Auto-adjust to more reasonable duration
                 suggested_minutes = int((200 * 60) / self.totalDays)
                 if suggested_minutes < self.minutesPerDay:
                     print(f"Auto-adjusting daily time from {self.minutesPerDay} to {suggested_minutes} minutes for better balance.")
                     self.minutesPerDay = suggested_minutes
-        
-        # Validate startDate format if provided - be more flexible with date formats
+
         if self.startDate:
             try:
                 from datetime import datetime
-                # Try multiple common date formats
                 date_formats = ["%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"]
                 parsed_date = None
                 for fmt in date_formats:
@@ -327,15 +447,64 @@ class GeneratePlannerRequest(BaseModel):
                         break
                     except ValueError:
                         continue
-                
                 if parsed_date is None:
                     print(f"Warning: Date format '{self.startDate}' not recognized. Please use YYYY-MM-DD format. Continuing without date validation.")
                 else:
-                    # Normalize to YYYY-MM-DD format
                     self.startDate = parsed_date.strftime("%Y-%m-%d")
             except Exception as e:
                 print(f"Warning: Could not parse start date '{self.startDate}': {e}. Continuing without date validation.")
-        
+
+        # Lean-form defaults (mobile sends category + goal; other fields optional)
+        if not self.detailPrompt or not str(self.detailPrompt).strip():
+            self.detailPrompt = default_detail_prompt_for_category(self.category, self.language)
+            print(f"Applied default detailPrompt for category={self.category}")
+
+        cat_defaults = default_plan_params_for_category(self.category)
+
+        if self.minutesPerDay is None:
+            self.minutesPerDay = cat_defaults["minutesPerDay"]
+
+        if not self.intensity:
+            self.intensity = cat_defaults["intensity"]
+
+        if self.totalDays is None:
+            self.totalDays = cat_defaults["totalDays"]
+
+        name_stripped = (self.planName or "").strip()
+        if not name_stripped or name_stripped.lower() in _GENERIC_PLAN_NAMES:
+            self.planName = suggest_plan_name(self.category, self.totalDays, self.language)
+
+        self.fastMode = resolve_fast_mode(self.totalDays, self.fastMode)
+
+        return self
+
+
+class RefinePlannerRequest(BaseModel):
+    """Refine an existing draft plan based on user feedback."""
+
+    refinementPrompt: constr(strip_whitespace=True, min_length=1, max_length=800) = Field(
+        description="What the user wants changed in the current draft"
+    )
+    existingContent: Dict[str, Any] = Field(
+        description="Current PlannerContent object to refine"
+    )
+    planName: constr(strip_whitespace=True, min_length=1, max_length=100)
+    category: PlanCategory
+    totalDays: conint(ge=1, le=90)
+    minutesPerDay: Optional[conint(ge=10, le=480)] = None
+    intensity: Optional[Literal["easy", "moderate", "hard", "periodized"]] = None
+    language: Literal["en", "th"] = "en"
+    fastMode: bool = True
+    refineDayStart: Optional[conint(ge=1, le=90)] = None
+    refineDayEnd: Optional[conint(ge=1, le=90)] = None
+
+    @model_validator(mode='after')
+    def validate_refine_range(self) -> 'RefinePlannerRequest':
+        if self.refineDayStart is not None and self.refineDayEnd is not None:
+            if self.refineDayStart > self.refineDayEnd:
+                raise ValueError("refineDayStart must be <= refineDayEnd")
+            if self.refineDayEnd > self.totalDays:
+                raise ValueError("refineDayEnd exceeds totalDays")
         return self
 
 
@@ -363,9 +532,9 @@ class PlanChunk:
 
 @dataclass
 class ChatWrapperConfig:
-    model: str = "gpt-5.2"  # High quality model for content generation
-    fast_model: str = "gpt-5.1"  # Faster model for fast mode
-    extraction_model: str = "gpt-5.1"  # Faster model for context extraction
+    model: str = "gpt-5.4"  # High quality model for content generation
+    fast_model: str = "gpt-5.4-mini"  # Faster model for fast mode
+    extraction_model: str = "gpt-5.4-mini"  # Faster model for context extraction
     temperature: float = 1.0  # Default temperature (some models only support 1.0)
     fast_temperature: float = 1.0  # Default temperature for fast mode
     extraction_temperature: float = 1.0  # Default temperature for extraction
@@ -642,6 +811,148 @@ class ChatWrapper:
     """
     def __init__(self, config: ChatWrapperConfig):
         self.config = config
+
+    def _emit_progress(
+        self,
+        callback: Optional[ProgressCallback],
+        *,
+        progress: int,
+        progress_message: str,
+        current_stage: str,
+        stages_completed: Optional[int] = None,
+    ) -> None:
+        if not callback:
+            return
+        payload: Dict[str, Any] = {
+            "progress": progress,
+            "progress_message": progress_message,
+            "current_stage": current_stage,
+        }
+        if stages_completed is not None:
+            payload["stages_completed"] = stages_completed
+        callback(payload)
+
+    def _outline_to_prompt_section(self, outline: Optional[PlanOutline]) -> str:
+        if not outline:
+            return ""
+        lines = [
+            "\n=== PLAN OUTLINE (FOLLOW THIS STRUCTURE) ===",
+            f"Overview: {outline.overview}",
+        ]
+        if outline.difficulty_arc:
+            lines.append(f"Difficulty arc: {outline.difficulty_arc}")
+        if outline.key_milestones:
+            lines.append("Key milestones: " + " | ".join(outline.key_milestones[:8]))
+        if outline.weekly_focus:
+            lines.append("Weekly focus: " + " | ".join(outline.weekly_focus))
+        if outline.rest_day_numbers:
+            lines.append(f"Rest/light days (day numbers): {outline.rest_day_numbers}")
+        for phase in outline.phases:
+            goals = ", ".join(phase.goals[:3]) if phase.goals else ""
+            lines.append(
+                f"Phase '{phase.phase_name}' (days {phase.start_day}-{phase.end_day}): "
+                f"{phase.focus}" + (f" | Goals: {goals}" if goals else "")
+            )
+        lines.append("=== END PLAN OUTLINE ===\n")
+        return "\n".join(lines)
+
+    def generate_outline(
+        self,
+        req: GeneratePlannerRequest,
+        extracted_context: Optional[ExtractedUserContext] = None,
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> Optional[PlanOutline]:
+        """Build a structural outline before generating daily content."""
+        self._emit_progress(
+            progress_callback,
+            progress=22,
+            progress_message="Planning structure and milestones...",
+            current_stage="building_outline",
+            stages_completed=2,
+        )
+        use_model = self.config.fast_model if req.fastMode else self.config.extraction_model
+        lang_note = "Write in Thai." if req.language == "th" else "Write in English."
+        context_bits = []
+        if extracted_context and extracted_context.goals.primary_goal:
+            context_bits.append(f"Primary goal: {extracted_context.goals.primary_goal}")
+        if req.detailPrompt:
+            context_bits.append(f"User description: {req.detailPrompt[:600]}")
+
+        schema = {
+            "name": "plan_outline",
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "overview": {"type": "string"},
+                    "difficulty_arc": {"type": ["string", "null"]},
+                    "key_milestones": {"type": "array", "items": {"type": "string"}},
+                    "weekly_focus": {"type": "array", "items": {"type": "string"}},
+                    "rest_day_numbers": {"type": "array", "items": {"type": "integer"}},
+                    "phases": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "phase_name": {"type": "string"},
+                                "start_day": {"type": "integer", "minimum": 1},
+                                "end_day": {"type": "integer", "minimum": 1},
+                                "focus": {"type": "string"},
+                                "goals": {"type": "array", "items": {"type": "string"}},
+                            },
+                            "required": ["phase_name", "start_day", "end_day", "focus", "goals"],
+                        },
+                    },
+                },
+                "required": [
+                    "overview",
+                    "difficulty_arc",
+                    "key_milestones",
+                    "weekly_focus",
+                    "rest_day_numbers",
+                    "phases",
+                ],
+            },
+        }
+
+        user_msg = (
+            f"{lang_note}\n"
+            f"Category: {req.category}\n"
+            f"Plan: {req.planName}\n"
+            f"Total days: {req.totalDays}\n"
+            f"Intensity: {req.intensity or 'moderate'}\n"
+            f"Minutes per day: {req.minutesPerDay or 'flexible'}\n"
+            + ("\n".join(context_bits) if context_bits else "")
+            + "\n\nCreate a logical outline with phases covering all days 1.."
+            f"{req.totalDays} without gaps. Include appropriate rest/light days."
+        )
+
+        try:
+            response = get_openai_client().chat.completions.create(
+                model=use_model,
+                temperature=1.0,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are an expert curriculum and habit-plan designer. "
+                            "Output only JSON matching the schema. Phases must cover every day "
+                            "from 1 to totalDays with no overlaps or gaps."
+                        ),
+                    },
+                    {"role": "user", "content": user_msg},
+                ],
+                response_format={"type": "json_schema", "json_schema": schema},
+            )
+            raw = response.choices[0].message.content if response.choices else None
+            if not raw:
+                return None
+            data = self._parse_json_response(raw)
+            return PlanOutline(**data)
+        except Exception as e:
+            print(f"Warning: outline generation failed, continuing without outline: {e}")
+            return None
 
     def _parse_json_response(self, raw_response: str) -> dict:
         """Parse JSON response with fallback mechanisms for common issues"""
@@ -1219,13 +1530,27 @@ class ChatWrapper:
         
         raise PlannerGenerationError(error_message, user_message)
 
-    def _build_system_prompt(self, category: str, extracted_context: Optional[ExtractedUserContext] = None) -> str:
+    def _build_system_prompt(
+        self,
+        category: str,
+        extracted_context: Optional[ExtractedUserContext] = None,
+        refinement_mode: bool = False,
+    ) -> str:
         """Build a personalized system prompt based on category and extracted context"""
         
-        base_prompt = (
-            "You are an expert planner-content generator for a lifestyle planner app. "
-            "Generate structured daily plans with clear titles, concise summaries, and actionable tasks. "
-        )
+        if refinement_mode:
+            base_prompt = (
+                "You are an expert plan editor for a lifestyle planner app. "
+                "The user has a DRAFT plan and wants specific changes. "
+                "Preserve days, tasks, and structure they did NOT ask to change. "
+                "Apply only the requested refinements while keeping the same totalDays. "
+                "Output a complete updated plan JSON matching the schema. "
+            )
+        else:
+            base_prompt = (
+                "You are an expert planner-content generator for a lifestyle planner app. "
+                "Generate structured daily plans with clear titles, concise summaries, and actionable tasks. "
+            )
         
         # Category-specific expertise
         category_expertise = {
@@ -1251,9 +1576,11 @@ class ChatWrapper:
             "travel": (
                 "You are an experienced travel planner who understands logistics and local experiences. "
                 "Design travel itineraries that:\n"
-                "- Group activities by geographic proximity\n"
-                "- Balance busy exploration days with relaxed ones\n"
-                "- Include practical logistics (transport, timing, reservations)\n"
+                "- Fill each day with a realistic schedule using most of the user's daily time budget "
+                "(typically several hours: sightseeing blocks, meals, transit, and short rest breaks)\n"
+                "- Group activities by geographic proximity to minimize backtracking\n"
+                "- Balance busy exploration days with lighter recovery days\n"
+                "- Include practical logistics (transport, timing, reservations, opening hours)\n"
                 "- Suggest local experiences and hidden gems\n"
                 "- Account for weather, seasons, and local events\n"
                 "- Include buffer time for unexpected discoveries\n"
@@ -1568,21 +1895,27 @@ TASK EXAMPLES:
         return base_prompt + category_expertise.get(category, category_expertise["other"]) + personalization_section + rules
 
     def _generate_chunk_worker(
-        self, 
-        chunk_info: Tuple[int, 'PlanChunk', GeneratePlannerRequest, Optional[ExtractedUserContext], int]
+        self,
+        chunk_info: Tuple[
+            int, 'PlanChunk', GeneratePlannerRequest,
+            Optional[ExtractedUserContext], int, Optional[PlanOutline],
+            Optional[ProgressCallback],
+        ],
     ) -> Tuple[int, Optional[PlannerContent], Optional[str]]:
         """
         Worker function for parallel chunk generation.
         Returns: (chunk_idx, content, error_message)
         """
-        chunk_idx, chunk, req, extracted_context, total_chunks = chunk_info
+        chunk_idx, chunk, req, extracted_context, total_chunks, plan_outline, progress_callback = chunk_info
         chunk_days = chunk.end_day - chunk.start_day + 1
         
         max_retries = 2
         for retry in range(max_retries + 1):
             try:
                 # Create enhanced request for this chunk
-                enhanced_detail_prompt = self._build_chunk_prompt(req, chunk, chunk_idx, total_chunks)
+                enhanced_detail_prompt = self._build_chunk_prompt(
+                    req, chunk, chunk_idx, total_chunks, plan_outline
+                )
                 
                 chunk_req = GeneratePlannerRequest(
                     planName=f"{req.planName} - {chunk.phase_name}",
@@ -1599,7 +1932,12 @@ TASK EXAMPLES:
                 )
                 
                 # Generate this chunk with pre-extracted context (no re-extraction needed)
-                chunk_content = self.generate_single(chunk_req, extracted_context=extracted_context)
+                chunk_content = self.generate_single(
+                    chunk_req,
+                    extracted_context=extracted_context,
+                    plan_outline=plan_outline,
+                    progress_callback=progress_callback,
+                )
                 
                 # Adjust day numbers
                 for day in chunk_content.days:
@@ -1614,11 +1952,19 @@ TASK EXAMPLES:
         
         return (chunk_idx, None, f"Failed chunk {chunk_idx} after retries")
 
-    def generate_chunked(self, req: GeneratePlannerRequest) -> PlannerContent:
+    def generate_chunked(
+        self,
+        req: GeneratePlannerRequest,
+        progress_callback: Optional[ProgressCallback] = None,
+        plan_outline: Optional[PlanOutline] = None,
+    ) -> PlannerContent:
         """Generate planner content using PARALLEL chunked approach for large plans (>7 days)"""
         if req.totalDays <= 7:
-            # Use single generation for plans <= 7 days
-            return self.generate_single(req)
+            return self.generate_single(
+                req,
+                progress_callback=progress_callback,
+                plan_outline=plan_outline,
+            )
         
         # Validate maximum days
         max_days = 60
@@ -1653,6 +1999,17 @@ TASK EXAMPLES:
                 print("Context extraction returned None, proceeding without structured context")
         elif req.skipContextExtraction:
             print("Context extraction skipped (skipContextExtraction=true)")
+
+        self._emit_progress(
+            progress_callback,
+            progress=20,
+            progress_message="Understanding your goals...",
+            current_stage="extracting_context",
+            stages_completed=1,
+        )
+
+        if plan_outline is None:
+            plan_outline = self.generate_outline(req, extracted_context, progress_callback)
         
         context_time = time.time() - generation_start_time
         print(f"Context extraction completed in {context_time:.2f}s")
@@ -1668,9 +2025,17 @@ TASK EXAMPLES:
         
         # Prepare chunk info for parallel processing
         chunk_infos = [
-            (idx + 1, chunk, req, extracted_context, len(chunks))
+            (idx + 1, chunk, req, extracted_context, len(chunks), plan_outline, progress_callback)
             for idx, chunk in enumerate(chunks)
         ]
+
+        self._emit_progress(
+            progress_callback,
+            progress=35,
+            progress_message=f"Generating {req.totalDays} days in {len(chunks)} phases...",
+            current_stage="generating_days",
+            stages_completed=3,
+        )
         
         # PARALLEL GENERATION using ThreadPoolExecutor
         results = {}
@@ -1699,6 +2064,14 @@ TASK EXAMPLES:
                     else:
                         results[idx] = content
                         print(f"Chunk {idx} completed successfully")
+                        done_chunks = len(results)
+                        pct = 35 + int((done_chunks / len(chunks)) * 50)
+                        self._emit_progress(
+                            progress_callback,
+                            progress=min(pct, 85),
+                            progress_message=f"Completed phase {done_chunks} of {len(chunks)}...",
+                            current_stage="generating_days",
+                        )
                 except Exception as e:
                     errors.append(f"Chunk {chunk_idx} exception: {str(e)}")
         
@@ -1727,11 +2100,19 @@ TASK EXAMPLES:
             if chunk_content.tags:
                 all_tags.update(chunk_content.tags)
             
-            # Use first chunk's summary as the base (it has the overview perspective)
             if idx == 1:
                 first_summary = chunk_content.summary
                 first_difficulty = chunk_content.difficultyLevel
                 first_completion_rate = chunk_content.estimatedCompletionRate
+
+        if plan_outline:
+            outline_summary = PlannerSummary(
+                overview=plan_outline.overview,
+                keyMilestones=plan_outline.key_milestones or None,
+                tipsForSuccess=(first_summary.tipsForSuccess if first_summary else None),
+                weeklyFocus=plan_outline.weekly_focus or None,
+            )
+            first_summary = outline_summary
         
         # Validate that we have the correct number of days
         if len(all_days) != req.totalDays:
@@ -1762,13 +2143,27 @@ TASK EXAMPLES:
             estimatedCompletionRate=first_completion_rate
         )
         
+        self._emit_progress(
+            progress_callback,
+            progress=92,
+            progress_message="Finalizing your plan...",
+            current_stage="finalizing",
+            stages_completed=4,
+        )
+
         total_time = time.time() - generation_start_time
         print(f"Total generation time: {total_time:.2f}s (context: {context_time:.2f}s, parallel gen: {parallel_time:.2f}s)")
         
         return final_content
 
-    def _build_chunk_prompt(self, req: GeneratePlannerRequest, chunk: PlanChunk, 
-                           chunk_idx: int, total_chunks: int) -> str:
+    def _build_chunk_prompt(
+        self,
+        req: GeneratePlannerRequest,
+        chunk: PlanChunk,
+        chunk_idx: int,
+        total_chunks: int,
+        plan_outline: Optional[PlanOutline] = None,
+    ) -> str:
         """Build an enhanced prompt for a specific chunk with progression context"""
         prompt_parts = []
         
@@ -1795,6 +2190,24 @@ TASK EXAMPLES:
         # Special instructions (truncated)
         special_instructions = chunk.special_instructions[:300] + "..." if len(chunk.special_instructions) > 300 else chunk.special_instructions
         prompt_parts.append(f"Instructions: {special_instructions}")
+
+        if plan_outline:
+            phase_outline = next(
+                (p for p in plan_outline.phases if p.start_day == chunk.start_day and p.end_day == chunk.end_day),
+                None,
+            )
+            if not phase_outline:
+                phase_outline = next(
+                    (
+                        p for p in plan_outline.phases
+                        if p.start_day <= chunk.start_day <= p.end_day
+                    ),
+                    None,
+                )
+            if phase_outline:
+                prompt_parts.append(f"Outline focus: {phase_outline.focus}")
+                if phase_outline.goals:
+                    prompt_parts.append("Outline goals: " + ", ".join(phase_outline.goals[:3]))
         
         # Quality requirements (concise)
         prompt_parts.append("Requirements: Unique daily content, logical progression, specific actionable tasks, variety in activities")
@@ -1808,15 +2221,199 @@ TASK EXAMPLES:
         
         return full_prompt
 
-    def generate(self, req: GeneratePlannerRequest) -> PlannerContent:
-        """Main generation method with intelligent routing"""
-        # Use intelligent chunked generation for plans > 7 days, single for smaller ones
-        if req.totalDays > 7:
-            return self.generate_chunked(req)
-        else:
-            return self.generate_single(req)
+    def _compact_plan_snapshot(
+        self,
+        content: PlannerContent,
+        day_start: Optional[int] = None,
+        day_end: Optional[int] = None,
+        *,
+        aggressive: bool = False,
+    ) -> Dict[str, Any]:
+        """Compact plan for refinement prompts (token-efficient)."""
+        summary_limit = 200 if aggressive else 400
+        task_limit = 120 if aggressive else 220
+        days_out = []
+        for day in content.days:
+            if day_start is not None and day.dayNumber < day_start:
+                continue
+            if day_end is not None and day.dayNumber > day_end:
+                continue
+            days_out.append({
+                "dayNumber": day.dayNumber,
+                "title": (day.title or "")[:120],
+                "summary": (day.summary or "")[:summary_limit],
+                "tasks": [
+                    {
+                        "text": (t.text or "")[:task_limit],
+                        "duration_min": t.duration_min,
+                    }
+                    for t in (day.tasks or [])[:6]
+                ],
+            })
+        summary = content.summary
+        return {
+            "planName": content.planName,
+            "category": content.category,
+            "totalDays": content.totalDays,
+            "minutesPerDay": content.minutesPerDay,
+            "difficultyLevel": content.difficultyLevel,
+            "summary": {
+                "overview": summary.overview if summary else None,
+                "keyMilestones": summary.keyMilestones if summary else None,
+                "weeklyFocus": summary.weeklyFocus if summary else None,
+            } if summary else None,
+            "days": days_out,
+        }
 
-    def generate_single(self, req: GeneratePlannerRequest, extracted_context: Optional[ExtractedUserContext] = None) -> PlannerContent:
+    def _build_refinement_context_json(
+        self,
+        content: PlannerContent,
+        day_start: Optional[int] = None,
+        day_end: Optional[int] = None,
+        max_chars: int = 100000,
+    ) -> str:
+        """Serialize compact draft for refinement; shrink if needed."""
+        compact = self._compact_plan_snapshot(content, day_start, day_end, aggressive=False)
+        payload = json.dumps(compact, ensure_ascii=False)
+        if len(payload) <= max_chars:
+            return payload
+        compact = self._compact_plan_snapshot(content, day_start, day_end, aggressive=True)
+        payload = json.dumps(compact, ensure_ascii=False)
+        if len(payload) <= max_chars:
+            return payload
+        return payload[: max_chars - 24] + "\n/* draft truncated */"
+
+    def refine_plan(
+        self,
+        req: RefinePlannerRequest,
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> PlannerContent:
+        """Refine an existing draft plan from user feedback (full plan or day range)."""
+        existing = PlannerContent.model_validate(req.existingContent)
+        created_at = existing.createdAt
+
+        self._emit_progress(
+            progress_callback,
+            progress=15,
+            progress_message="Applying your changes...",
+            current_stage="refining",
+            stages_completed=1,
+        )
+
+        partial = req.refineDayStart is not None and req.refineDayEnd is not None
+        if partial:
+            start, end = req.refineDayStart, req.refineDayEnd
+            scope_note = f"Only regenerate days {start} through {end}. Other days stay unchanged in the final merged plan."
+            slice_days = end - start + 1
+        else:
+            scope_note = "Update the full plan as needed."
+            start, end, slice_days = 1, existing.totalDays, existing.totalDays
+
+        lang_note = "Write in Thai." if req.language == "th" else "Write in English."
+        draft_json = self._build_refinement_context_json(
+            existing,
+            day_start=start if partial else None,
+            day_end=end if partial else None,
+        )
+        refine_detail = (
+            f"{lang_note}\n"
+            f"REFINEMENT REQUEST:\n{req.refinementPrompt}\n\n"
+            f"{scope_note}\n"
+            f"Original plan had {existing.totalDays} days.\n"
+            "Apply the refinement. Keep logical progression and the user's goals.\n"
+            "The current draft JSON is provided in refinementContext."
+        )
+
+        gen_req = GeneratePlannerRequest(
+            planName=req.planName,
+            category=req.category,
+            totalDays=slice_days if partial else existing.totalDays,
+            detailPrompt=refine_detail[:1000],
+            refinementContext=draft_json,
+            minutesPerDay=req.minutesPerDay or existing.minutesPerDay,
+            intensity=req.intensity,
+            language=req.language,
+            fastMode=req.fastMode,
+            skipContextExtraction=True,
+        )
+
+        self._emit_progress(
+            progress_callback,
+            progress=40,
+            progress_message="Updating plan content...",
+            current_stage="generating_days",
+            stages_completed=2,
+        )
+
+        if partial:
+            slice_content = self.generate_single(
+                gen_req,
+                progress_callback=progress_callback,
+                is_refinement=True,
+            )
+            day_by_num = {d.dayNumber: d for d in existing.days}
+            for d in slice_content.days:
+                target_num = start + (d.dayNumber - 1)
+                d.dayNumber = target_num
+                d.id = d.id or uuid.uuid4().hex[:8]
+                day_by_num[target_num] = d
+            merged_days = [day_by_num[i] for i in range(1, existing.totalDays + 1) if i in day_by_num]
+            result = PlannerContent(
+                planName=existing.planName,
+                category=existing.category,
+                totalDays=existing.totalDays,
+                minutesPerDay=req.minutesPerDay or existing.minutesPerDay,
+                coverImage=existing.coverImage,
+                coverImageUrl=existing.coverImageUrl,
+                createdAt=created_at,
+                days=merged_days,
+                summary=slice_content.summary or existing.summary,
+                tags=slice_content.tags or existing.tags,
+                difficultyLevel=slice_content.difficultyLevel or existing.difficultyLevel,
+                estimatedCompletionRate=slice_content.estimatedCompletionRate or existing.estimatedCompletionRate,
+            )
+        else:
+            result = self.generate_single(
+                gen_req,
+                progress_callback=progress_callback,
+                is_refinement=True,
+            )
+            result.createdAt = created_at
+
+        self._emit_progress(
+            progress_callback,
+            progress=95,
+            progress_message="Finalizing updates...",
+            current_stage="finalizing",
+            stages_completed=3,
+        )
+        return result
+
+    def generate(
+        self,
+        req: GeneratePlannerRequest,
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> PlannerContent:
+        """Main generation method with intelligent routing"""
+        self._emit_progress(
+            progress_callback,
+            progress=5,
+            progress_message="Starting generation...",
+            current_stage="initializing",
+            stages_completed=0,
+        )
+        if req.totalDays > 7:
+            return self.generate_chunked(req, progress_callback=progress_callback)
+        return self.generate_single(req, progress_callback=progress_callback)
+
+    def generate_single(
+        self,
+        req: GeneratePlannerRequest,
+        extracted_context: Optional[ExtractedUserContext] = None,
+        progress_callback: Optional[ProgressCallback] = None,
+        plan_outline: Optional[PlanOutline] = None,
+        is_refinement: bool = False,
+    ) -> PlannerContent:
         """
         Generate planner content with optional pre-extracted context.
         
@@ -1852,6 +2449,28 @@ TASK EXAMPLES:
                 print("Context extraction returned None, proceeding without structured context")
         elif req.skipContextExtraction:
             print("Context extraction skipped (skipContextExtraction=true)")
+
+        if not is_refinement and plan_outline is None and not req.skipContextExtraction and req.detailPrompt:
+            self._emit_progress(
+                progress_callback,
+                progress=18,
+                progress_message="Understanding your goals...",
+                current_stage="extracting_context",
+                stages_completed=1,
+            )
+            plan_outline = self.generate_outline(req, extracted_context, progress_callback)
+
+        self._emit_progress(
+            progress_callback,
+            progress=40,
+            progress_message=(
+                f"Updating your {req.totalDays}-day plan..."
+                if is_refinement
+                else f"Generating your {req.totalDays}-day plan..."
+            ),
+            current_stage="generating_days",
+            stages_completed=3,
+        )
         
         payload = {
             "planName": req.planName,
@@ -2015,7 +2634,15 @@ TASK EXAMPLES:
         
         # Add original detail prompt for reference
         if req.detailPrompt:
-            user_msg_parts.append(f"\nOriginal user description:\n{req.detailPrompt}")
+            if is_refinement:
+                user_msg_parts.append(f"\nRefinement instructions:\n{req.detailPrompt}")
+            else:
+                user_msg_parts.append(f"\nOriginal user description:\n{req.detailPrompt}")
+
+        if is_refinement and req.refinementContext:
+            user_msg_parts.append(
+                f"\n=== CURRENT DRAFT PLAN (JSON) ===\n{req.refinementContext}\n=== END DRAFT ==="
+            )
         
         # Add extracted context as structured information
         if extracted_context:
@@ -2100,6 +2727,10 @@ TASK EXAMPLES:
                     user_msg_parts.append(f"  ⚠️ {consideration}")
             
             user_msg_parts.append("=== END EXTRACTED CONTEXT ===")
+
+        outline_section = self._outline_to_prompt_section(plan_outline)
+        if outline_section:
+            user_msg_parts.append(outline_section)
         
         # Add category hints
         user_msg_parts.extend([
@@ -2125,7 +2756,9 @@ TASK EXAMPLES:
         user_msg = "\n".join(user_msg_parts)
 
         # Build personalized system prompt using extracted context
-        system_prompt = self._build_system_prompt(req.category, extracted_context)
+        system_prompt = self._build_system_prompt(
+            req.category, extracted_context, refinement_mode=is_refinement
+        )
         
         # Response format with JSON schema enforcement
         max_retries = 2

@@ -618,47 +618,60 @@ def format_schedule_data(schedule_df, homeroom_df) -> Tuple[List[Dict[str, Any]]
 ########### Generate Planner Content API Endpoints #############
 @https_fn.on_request(memory=2048, max_instances=5, timeout_sec=540, cpu=2)  # 9 minutes timeout
 def generate_planner_content(req: https_fn.Request) -> https_fn.Response:
-    """Generate planner content using ChatGPT"""
+    """Generate planner content (sync). Supports chunked generation for totalDays > 7."""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+
+    if req.method != 'POST':
+        return create_response(
+            success=False,
+            message='Method not allowed',
+            error='Only POST method is allowed',
+            status_code=405,
+        )
+
     try:
-        # Lazy load the module
         gpc = get_generate_planner_content()
-        
-        payload = req.get_json()
-        print(f"Received payload: {payload}")
-        
+        payload = req.get_json() or {}
+        logger.info("generate_planner_content: days=%s", payload.get("totalDays"))
         parsed = gpc.GeneratePlannerRequest(**payload)
-        print(f"Parsed request: {parsed}")
-        
-        content = gpc.chat.generate(parsed)
-        print(f"Generated content: {content.planName} with {len(content.days)} days")
-        
-        return content.model_dump()
+        chat = gpc.ChatWrapper(gpc.ChatWrapperConfig())
+        content = chat.generate(parsed)
+        logger.info(
+            "generate_planner_content: %s with %s days",
+            content.planName,
+            len(content.days),
+        )
+        return create_response(
+            data=content.model_dump(),
+            message="Plan generated successfully",
+        )
     except ValidationError as ve:
-        print(f"Validation error: {ve.errors()}")
-        # Format validation errors in a user-friendly way
         errors = []
         for error in ve.errors():
             field = " → ".join(str(loc) for loc in error["loc"])
             message = error["msg"]
-            # Make error messages more user-friendly
             if "type_error" in message:
                 message = "Please provide a valid value"
             elif "value_error" in message:
                 message = "The value provided is not valid"
             errors.append(f"{field}: {message}")
-        
-        user_friendly_detail = {
-            "error": "Invalid request parameters",
-            "message": "Please check the following fields and try again:",
-            "details": errors
-        }
-        raise HTTPException(status_code=400, detail=user_friendly_detail)
+        return create_response(
+            success=False,
+            message="Please check the following fields and try again",
+            error="; ".join(errors),
+            status_code=400,
+        )
+    except gpc.PlannerGenerationError as e:
+        return create_response(
+            success=False,
+            message="Generation failed",
+            error=e.user_message,
+            status_code=500,
+        )
     except Exception as e:
-        print(f"Unexpected error: {e}")
-        import traceback
+        logger.error("generate_planner_content error: %s", e)
         traceback.print_exc()
-        
-        # Provide user-friendly error message without exposing internals
         error_str = str(e).lower()
         if "api" in error_str or "openai" in error_str:
             user_message = "We're having trouble generating your planner right now. Please try again in a moment."
@@ -668,8 +681,63 @@ def generate_planner_content(req: https_fn.Request) -> https_fn.Response:
             user_message = "We've reached our service limit. Please try again in a few minutes."
         else:
             user_message = "We couldn't generate your planner. Please check your inputs and try again."
-        
-        raise HTTPException(status_code=500, detail={"error": "Generation failed", "message": user_message})
+        return create_response(
+            success=False,
+            message="Generation failed",
+            error=user_message,
+            status_code=500,
+        )
+
+
+@https_fn.on_request(memory=2048, max_instances=5, timeout_sec=540, cpu=2)
+def refine_planner_content(req: https_fn.Request) -> https_fn.Response:
+    """Refine an existing AI-generated plan draft based on user feedback."""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+
+    if req.method != 'POST':
+        return create_response(
+            success=False,
+            message='Method not allowed',
+            error='Only POST method is allowed',
+            status_code=405,
+        )
+
+    try:
+        gpc = get_generate_planner_content()
+        payload = req.get_json() or {}
+        parsed = gpc.RefinePlannerRequest(**payload)
+        chat = gpc.ChatWrapper(gpc.ChatWrapperConfig())
+        content = chat.refine_plan(parsed)
+        return create_response(
+            data=content.model_dump(),
+            message="Plan refined successfully",
+        )
+    except ValidationError as ve:
+        errors = [f"{'.'.join(str(loc) for loc in e['loc'])}: {e['msg']}" for e in ve.errors()]
+        return create_response(
+            success=False,
+            message='Invalid request parameters',
+            error=str(errors),
+            status_code=400,
+        )
+    except gpc.PlannerGenerationError as e:
+        return create_response(
+            success=False,
+            message='Refinement failed',
+            error=e.user_message,
+            status_code=500,
+        )
+    except Exception as e:
+        logger.error(f"refine_planner_content error: {e}")
+        import traceback
+        traceback.print_exc()
+        return create_response(
+            success=False,
+            message='Refinement failed',
+            error=str(e),
+            status_code=500,
+        )
 
 
 # =========================
@@ -764,52 +832,36 @@ def _get_planner_job(job_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _planner_job_progress_callback(job_id: str):
+    """Returns a callback that writes generation progress to Firestore."""
+    def _callback(updates: Dict[str, Any]) -> None:
+        payload = dict(updates)
+        if "progress_message" in payload:
+            payload.setdefault("status", "processing")
+        _update_planner_job(job_id, payload)
+    return _callback
+
+
 def _run_planner_generation_background(job_id: str, request_data: Dict[str, Any]):
     """
     Background worker function to generate planner content.
-    Called in a separate thread after start_planner_generation returns.
+    Called in a separate thread after async job creation returns.
     """
     try:
         gpc = get_generate_planner_content()
         parsed = gpc.GeneratePlannerRequest(**request_data)
-        
-        # Update status to processing
+
         _update_planner_job(job_id, {
             "status": "processing",
-            "progress": 10,
+            "progress": 5,
             "progress_message": "Starting generation...",
             "current_stage": "initializing",
-            "stages_completed": 1
+            "stages_completed": 0,
         })
-        
-        # Update progress - analyzing
-        _update_planner_job(job_id, {
-            "progress": 20,
-            "progress_message": "Analyzing requirements...",
-            "current_stage": "analyzing",
-        })
-        
-        # Update progress - generating
-        _update_planner_job(job_id, {
-            "progress": 30,
-            "progress_message": f"Generating {parsed.totalDays}-day {parsed.category} plan...",
-            "current_stage": "generating_days",
-            "stages_completed": 2
-        })
-        
-        # Generate the planner content
+
         chat = gpc.ChatWrapper(gpc.ChatWrapperConfig())
-        content = chat.generate(parsed)
-        
-        # Update progress - finalizing
-        _update_planner_job(job_id, {
-            "progress": 90,
-            "progress_message": "Finalizing...",
-            "current_stage": "finalizing",
-            "stages_completed": 3
-        })
-        
-        # Complete the job
+        content = chat.generate(parsed, progress_callback=_planner_job_progress_callback(job_id))
+
         _update_planner_job(job_id, {
             "status": "completed",
             "progress": 100,
@@ -817,24 +869,26 @@ def _run_planner_generation_background(job_id: str, request_data: Dict[str, Any]
             "current_stage": "completed",
             "stages_completed": 4,
             "estimated_seconds_remaining": 0,
-            "result": content.model_dump()
+            "result": content.model_dump(),
         })
-        
+
         logger.info(f"✓ Background generation completed for job: {job_id}")
-        
+
     except Exception as e:
         logger.error(f"✗ Background generation failed for job {job_id}: {e}")
         import traceback
         traceback.print_exc()
-        
+
         error_msg = str(e)
-        if hasattr(e, 'user_message'):
+        if hasattr(e, "user_message"):
             error_msg = e.user_message
-            
+
         _update_planner_job(job_id, {
             "status": "failed",
+            "progress": 0,
             "progress_message": "Generation failed",
-            "error": error_msg
+            "current_stage": "failed",
+            "error": error_msg,
         })
 
 
@@ -944,6 +998,8 @@ def process_planner_job(req: https_fn.Request) -> https_fn.Response:
             status_code=405
         )
     
+    job_id = None
+    gpc = None
     try:
         data = req.get_json() or {}
         job_id = data.get('jobId')
@@ -965,237 +1021,189 @@ def process_planner_job(req: https_fn.Request) -> https_fn.Response:
                 status_code=404
             )
         
-        # Update status to processing
-        _update_planner_job(job_id, {
-            "status": "processing",
-            "progress": 10,
-            "progress_message": "Starting generation...",
-            "current_stage": "initializing",
-            "stages_completed": 1
-        })
-        
-        # Get the request data and generate
+        if job.get("status") == "completed" and job.get("result"):
+            return create_response(
+                data={"jobId": job_id, "status": "completed"},
+                message="Planner generation already completed",
+            )
+
+        if job.get("status") == "processing" and job.get("progress", 0) > 10:
+            return create_response(
+                data={"jobId": job_id, "status": "processing", "progress": job.get("progress")},
+                message="Planner generation already in progress",
+            )
+
         gpc = get_generate_planner_content()
         request_data = job["request"]
-        parsed = gpc.GeneratePlannerRequest(**request_data)
-        
-        # Update progress
-        _update_planner_job(job_id, {
-            "progress": 25,
-            "progress_message": f"Generating {parsed.totalDays}-day plan...",
-            "current_stage": "generating_days",
-            "stages_completed": 2
-        })
-        
-        # Generate the planner content
-        chat = gpc.ChatWrapper(gpc.ChatWrapperConfig())
-        content = chat.generate(parsed)
-        
-        # Update progress
-        _update_planner_job(job_id, {
-            "progress": 90,
-            "progress_message": "Finalizing...",
-            "current_stage": "finalizing",
-            "stages_completed": 3
-        })
-        
-        # Complete the job
-        _update_planner_job(job_id, {
-            "status": "completed",
-            "progress": 100,
-            "progress_message": "Generation complete!",
-            "current_stage": "completed",
-            "stages_completed": 4,
-            "estimated_seconds_remaining": 0,
-            "result": content.model_dump()
-        })
-        
+
+        _run_planner_generation_background(job_id, request_data)
+        job_after = _get_planner_job(job_id)
+        if not job_after:
+            raise RuntimeError("Job record missing after generation")
+        if job_after.get("status") == "failed":
+            raise gpc.PlannerGenerationError(
+                job_after.get("error") or "Generation failed",
+                job_after.get("error") or "Generation failed",
+            )
+        if job_after.get("status") != "completed":
+            raise RuntimeError(
+                f"Generation finished in unexpected state: {job_after.get('status')}"
+            )
+
         logger.info(f"Completed planner job: {job_id}")
-        
+
         return create_response(
             data={"jobId": job_id, "status": "completed"},
-            message="Planner generation completed"
+            message="Planner generation completed",
         )
         
-    except gpc.PlannerGenerationError as e:
-        if job_id:
-            _update_planner_job(job_id, {
-                "status": "failed",
-                "progress_message": "Generation failed",
-                "error": e.user_message
-            })
-        return create_response(
-            success=False,
-            message='Generation failed',
-            error=e.user_message,
-            status_code=500
-        )
     except Exception as e:
+        gpc_mod = gpc or get_generate_planner_content()
+        user_msg = getattr(e, "user_message", None) or str(e)
+        if isinstance(e, gpc_mod.PlannerGenerationError):
+            if job_id:
+                _update_planner_job(job_id, {
+                    "status": "failed",
+                    "progress_message": "Generation failed",
+                    "error": user_msg,
+                })
+            return create_response(
+                success=False,
+                message='Generation failed',
+                error=user_msg,
+                status_code=500,
+            )
         logger.error(f"Error processing planner job: {e}")
         if job_id:
             _update_planner_job(job_id, {
                 "status": "failed",
                 "progress_message": "Generation failed",
-                "error": str(e)
+                "error": str(e),
             })
         return create_response(
             success=False,
             message='Generation failed',
             error=str(e),
-            status_code=500
+            status_code=500,
         )
 
 
-# @https_fn.on_request(memory=256, max_instances=20, timeout_sec=10, cpu=1)
-# def get_planner_job_status(req: https_fn.Request) -> https_fn.Response:
-#     """
-#     Get the status of a planner generation job.
-    
-#     GET /get_planner_job_status?jobId=plan_abc123
-#     POST /get_planner_job_status with body: {"jobId": "plan_abc123"}
-    
-#     Response: {
-#         "success": true,
-#         "data": {
-#             "jobId": "plan_abc123",
-#             "status": "processing",
-#             "progress": 45,
-#             "progressMessage": "Generating days 8-14...",
-#             "currentStage": "generating_days",
-#             "stagesCompleted": 2,
-#             "totalStages": 4,
-#             "estimatedSecondsRemaining": 60
-#         }
-#     }
-#     """
-#     if req.method == 'OPTIONS':
-#         return handle_preflight_request()
-    
-#     # Support query parameter, JSON body, and form data
-#     job_id = req.args.get('jobId') or req.args.get('job_id')
-    
-#     if not job_id:
-#         # Try to get from JSON body
-#         try:
-#             data = req.get_json(silent=True, force=True) or {}
-#             job_id = data.get('jobId') or data.get('job_id')
-#         except Exception:
-#             pass
-    
-#     if not job_id:
-#         # Try form data
-#         try:
-#             job_id = req.form.get('jobId') or req.form.get('job_id')
-#         except Exception:
-#             pass
-    
-#     if not job_id:
-#         return create_response(
-#             success=False,
-#             message='Missing jobId parameter',
-#             error='jobId is required (as query parameter or in JSON body)',
-#             status_code=400
-#         )
-    
-#     job = _get_planner_job(job_id)
-#     if not job:
-#         return create_response(
-#             success=False,
-#             message='Job not found',
-#             error=f'No job found with ID: {job_id}',
-#             status_code=404
-#         )
-    
-#     response_data = {
-#         "jobId": job["job_id"],
-#         "status": job["status"],
-#         "progress": job["progress"],
-#         "progressMessage": job["progress_message"],
-#         "currentStage": job["current_stage"],
-#         "stagesCompleted": job["stages_completed"],
-#         "totalStages": job["total_stages"],
-#         "estimatedSecondsRemaining": job["estimated_seconds_remaining"],
-#         "createdAt": job["created_at"],
-#         "updatedAt": job["updated_at"]
-#     }
-    
-#     if job["status"] == "failed":
-#         response_data["error"] = job["error"]
-    
-#     if job["status"] == "completed" and job.get("result"):
-#         result = job["result"]
-#         response_data["resultSummary"] = {
-#             "planName": result.get("planName"),
-#             "category": result.get("category"),
-#             "totalDays": result.get("totalDays"),
-#             "ready": True
-#         }
-    
-#     return create_response(data=response_data, message="Job status retrieved")
+def _extract_planner_job_id(req: https_fn.Request) -> Optional[str]:
+    job_id = req.args.get('jobId') or req.args.get('job_id')
+    if not job_id:
+        try:
+            data = req.get_json(silent=True, force=True) or {}
+            job_id = data.get('jobId') or data.get('job_id')
+        except Exception:
+            pass
+    if not job_id:
+        try:
+            job_id = req.form.get('jobId') or req.form.get('job_id')
+        except Exception:
+            pass
+    return job_id
 
 
-# @https_fn.on_request(memory=512, max_instances=10, timeout_sec=30, cpu=1)
-# def get_planner_job_result(req: https_fn.Request) -> https_fn.Response:
-#     """
-#     Get the full result of a completed planner generation job.
-    
-#     GET /get_planner_job_result?jobId=plan_abc123
-#     POST /get_planner_job_result with body: {"jobId": "plan_abc123"}
-#     Response: Full PlannerContent object
-#     """
-#     if req.method == 'OPTIONS':
-#         return handle_preflight_request()
-    
-#     job_id = req.args.get('jobId') or req.args.get('job_id')
-#     if not job_id:
-#         # Try to get from JSON body
-#         try:
-#             data = req.get_json(silent=True) or {}
-#             job_id = data.get('jobId')
-#         except Exception:
-#             pass
-    
-#     if not job_id:
-#         return create_response(
-#             success=False,
-#             message='Missing jobId parameter',
-#             error='jobId is required (as query parameter or in JSON body)',
-#             status_code=400
-#         )
-    
-#     job = _get_planner_job(job_id)
-#     if not job:
-#         return create_response(
-#             success=False,
-#             message='Job not found',
-#             error=f'No job found with ID: {job_id}',
-#             status_code=404
-#         )
-    
-#     if job["status"] != "completed":
-#         return create_response(
-#             success=False,
-#             message='Job not completed',
-#             error=f'Job is still {job["status"]}. Progress: {job["progress"]}%',
-#             status_code=400,
-#             data={
-#                 "status": job["status"],
-#                 "progress": job["progress"]
-#             }
-#         )
-    
-#     return create_response(
-#         data=job["result"],
-#         message="Planner content retrieved successfully"
-#     )
+@https_fn.on_request(memory=256, max_instances=20, timeout_sec=10, cpu=1)
+def get_planner_job_status(req: https_fn.Request) -> https_fn.Response:
+    """Get status/progress for an async planner generation job."""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+
+    job_id = _extract_planner_job_id(req)
+    if not job_id:
+        return create_response(
+            success=False,
+            message='Missing jobId parameter',
+            error='jobId is required (as query parameter or in JSON body)',
+            status_code=400,
+        )
+
+    job = _get_planner_job(job_id)
+    if not job:
+        return create_response(
+            success=False,
+            message='Job not found',
+            error=f'No job found with ID: {job_id}',
+            status_code=404,
+        )
+
+    response_data = {
+        "jobId": job["job_id"],
+        "status": job["status"],
+        "progress": job["progress"],
+        "progressMessage": job["progress_message"],
+        "currentStage": job["current_stage"],
+        "stagesCompleted": job["stages_completed"],
+        "totalStages": job["total_stages"],
+        "estimatedSecondsRemaining": job["estimated_seconds_remaining"],
+        "createdAt": job["created_at"],
+        "updatedAt": job["updated_at"],
+    }
+
+    if job["status"] == "failed":
+        response_data["error"] = job.get("error")
+
+    if job["status"] == "completed" and job.get("result"):
+        result = job["result"]
+        response_data["resultSummary"] = {
+            "planName": result.get("planName"),
+            "category": result.get("category"),
+            "totalDays": result.get("totalDays"),
+            "ready": True,
+        }
+
+    return create_response(data=response_data, message="Job status retrieved")
+
+
+@https_fn.on_request(memory=512, max_instances=10, timeout_sec=30, cpu=1)
+def get_planner_job_result(req: https_fn.Request) -> https_fn.Response:
+    """Get full PlannerContent for a completed async job."""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+
+    job_id = _extract_planner_job_id(req)
+    if not job_id:
+        return create_response(
+            success=False,
+            message='Missing jobId parameter',
+            error='jobId is required (as query parameter or in JSON body)',
+            status_code=400,
+        )
+
+    job = _get_planner_job(job_id)
+    if not job:
+        return create_response(
+            success=False,
+            message='Job not found',
+            error=f'No job found with ID: {job_id}',
+            status_code=404,
+        )
+
+    if job["status"] != "completed":
+        return create_response(
+            success=False,
+            message='Job not completed',
+            error=f'Job is still {job["status"]}. Progress: {job["progress"]}%',
+            status_code=400,
+            data={
+                "status": job["status"],
+                "progress": job["progress"],
+                "progressMessage": job.get("progress_message"),
+            },
+        )
+
+    return create_response(
+        data=job["result"],
+        message="Planner content retrieved successfully",
+    )
 
 
 @https_fn.on_request(memory=2048, max_instances=5, timeout_sec=540, cpu=2)  # 9 minutes timeout
 def generate_planner_content_async(req: https_fn.Request) -> https_fn.Response:
     """
-    Starts planner generation job and returns a job ID immediately.
-    Client should call process_planner_job to execute the job, then poll
-    job status endpoints (or read job record) for progress/result.
+    Starts planner generation in the background and returns a job ID immediately.
+    Poll get_planner_job_status, then fetch get_planner_job_result when completed.
     """
     if req.method == 'OPTIONS':
         return handle_preflight_request()
@@ -1212,39 +1220,40 @@ def generate_planner_content_async(req: https_fn.Request) -> https_fn.Response:
     job_id = None
     try:
         request_data = req.get_json() or {}
-        request_data.setdefault("fastMode", True)
         request_data.setdefault("skipContextExtraction", False)
         
-        # Validate and create job
         parsed = gpc.GeneratePlannerRequest(**request_data)
         job = _create_planner_job(parsed.model_dump())
         job_id = job["job_id"]
         
-        logger.info(f"Queued async generation job: {job_id}")
+        logger.info(f"Starting async generation job: {job_id}")
         
-        # Update status
         _update_planner_job(job_id, {
             "status": "pending",
-            "progress": 10,
-            "progress_message": "Job queued. Call process_planner_job to start generation.",
+            "progress": 5,
+            "progress_message": "Job queued — starting shortly...",
             "current_stage": "initializing",
-            "stages_completed": 0
+            "stages_completed": 0,
         })
+
+        # Do not run generation in a daemon thread here — Cloud Run stops CPU after this
+        # response returns and the job stays at 5% forever. The mobile app calls
+        # process_planner_job (kickoffPlannerJobProcessing) to run the worker.
 
         return create_response(
             data={
                 "jobId": job_id,
-                "status": "pending"
+                "status": "processing",
+                "estimatedSeconds": job["estimated_seconds_remaining"],
             },
-            message="Planner generation job queued",
+            message="Planner generation started",
             metadata={
                 "jobId": job_id,
-                "status": "pending",
+                "status": "processing",
                 "totalDays": parsed.totalDays,
                 "category": parsed.category,
                 "fastMode": parsed.fastMode,
-                "nextStep": "Call process_planner_job with this jobId to execute generation"
-            }
+            },
         )
         
     except ValidationError as ve:

@@ -35,6 +35,9 @@ class ModelType(Enum):
     GPT_5_MINI = "gpt-5-mini"
     GPT_5_1 = "gpt-5.1"
     GPT_5_2 = "gpt-5.2"
+    GPT_5_4 = "gpt-5.4"
+    GPT_5_4_MINI = "gpt-5.4-mini"
+    GPT_5_4_EXTRACT = "gpt-5.4-extract"
     
     GPT_4o_mini = "gpt-4o-mini"
     GPT_4o_turbo = "gpt-4o-turbo"
@@ -45,7 +48,7 @@ class ModelType(Enum):
 @dataclass
 class ChatConfig:
     """Configuration for chat requests"""
-    model: str = ModelType.GPT_5_1.value
+    model: str = ModelType.GPT_5_4_MINI.value
     temperature: float = 1.0
     top_p: float = 0.9
     max_completion_tokens: int = 1024  # Increased from 300 to allow fuller responses
