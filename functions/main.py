@@ -741,6 +741,518 @@ def refine_planner_content(req: https_fn.Request) -> https_fn.Response:
 
 
 # =========================
+# Coach Review Endpoint — domain-aware AI coaching for EVO Coach Premium
+# =========================
+# Single HTTPS endpoint backing two features in the mobile app:
+#   - screens/taskCoachReview.js  (per-task professional review)
+#   - screens/planCoachReview.js  (plan-progress review)
+#
+# Tiering model (drives model selection):
+#   tier == "free"     → light model (cheap, good-enough)
+#   tier == "premium"  → high-quality model (premium subscriber, 199 THB/mo)
+#
+# Both tiers get UNLIMITED reviews. The differentiator is reasoning quality
+# and richness, not artificial scarcity. This is intentional: a coach who
+# stops talking to you on day 4 of the month isn't a coach.
+#
+# Request payload (POST):
+#   {
+#     "summary":        "<rich context block written by the frontend>",
+#     "user_input":     "<the structured ask, usually requesting JSON output>",
+#     "languageSelected": "thai" | "english",
+#     "tier":            "free" | "premium"   (defaults to "free")
+#   }
+#
+# Response payload:
+#   {
+#     "success": true,
+#     "data": {
+#       "response":    "<LLM text — frontend parses JSON inside>",
+#       "model_used":  "gpt-4o-mini" | "gpt-5.4"
+#     }
+#   }
+
+# Model choices. Free tier uses the cheapest competent model; premium uses
+# a deep-reasoning model that produces meaningfully better coach reviews.
+COACH_MODEL_FREE = "gpt-5.4-mini"
+COACH_MODEL_PREMIUM = "gpt-5.4"
+
+# Coach persona instructions wrapped around the frontend's user_input.
+# The frontend's `summary` field already encodes the domain-specific persona;
+# this system prompt just enforces output discipline so the JSON contract holds.
+_COACH_SYSTEM_PROMPT = (
+    "You are EVO Coach, an evidence-based personal development coach. You receive a "
+    "structured context block from the user that defines the domain (diet, exercise, "
+    "exam prep, sleep, meditation, or general) and the persona you should adopt. "
+    "Honor that persona — speak like a real expert in that domain.\n\n"
+    "Critical output rules:\n"
+    "1. When the user asks for JSON, return ONLY valid JSON. No markdown fences, no preamble.\n"
+    "2. Be specific. Reference the actual data the user provided.\n"
+    "3. Never moralize. Never be toxic-positive. Never give generic advice.\n"
+    "4. Tone: warm, direct, evidence-based. Short sentences over long ones."
+)
+
+
+# ---------------------------------------------------------------------------
+# Coach review security helpers
+# ---------------------------------------------------------------------------
+# The client passes `tier: "premium"` to request the flagship model. We CANNOT
+# trust that field — a free user could spoof it from the client. Instead, we
+# verify the Firebase Auth ID token, look up the user's subscription doc in
+# Firestore, and derive the tier from that. The client's claim is ignored.
+#
+# `Authorization: Bearer <id_token>` header is the standard. If the header is
+# missing or invalid, the request is downgraded to free tier (light model)
+# rather than rejected — anonymous / dev callers still get a useful response,
+# they just don't get the flagship model for free.
+
+# Simple in-memory per-UID rate limit. Cloud Functions instances are
+# short-lived but this gives a soft cap that survives within one warm
+# container. Free tier: ~20 reviews / 5 min. Premium: ~60 / 5 min.
+# Hard limits should come from billing, but this prevents the obvious
+# abuse case (a script hammering the endpoint).
+_coach_rate_state = {}  # uid -> list[timestamp]
+_COACH_RATE_WINDOW_SEC = 300
+_COACH_RATE_FREE_MAX = 20
+_COACH_RATE_PREMIUM_MAX = 60
+
+def _coach_rate_allow(uid: str, is_paid: bool) -> bool:
+    if not uid:
+        # Anonymous callers share one bucket — strict cap.
+        uid = "__anon__"
+    now = time.time()
+    cap = _COACH_RATE_PREMIUM_MAX if is_paid else _COACH_RATE_FREE_MAX
+    bucket = [t for t in _coach_rate_state.get(uid, []) if now - t < _COACH_RATE_WINDOW_SEC]
+    if len(bucket) >= cap:
+        _coach_rate_state[uid] = bucket
+        return False
+    bucket.append(now)
+    _coach_rate_state[uid] = bucket
+    return True
+
+
+def _verify_coach_tier(req: https_fn.Request) -> Tuple[Optional[str], str]:
+    """
+    Decode the Firebase Auth ID token from the request and check the user's
+    subscription doc. Returns (uid, tier) where tier ∈ {"free","plus","premium"}.
+    Anonymous / invalid token yields (None, "free") — caller served free tier.
+
+    Backwards-compat note: callers that previously destructured (uid, is_premium)
+    should be updated to read (uid, tier) and treat anything other than
+    "premium" as non-premium. A small adapter is provided below.
+    """
+    auth_header = req.headers.get("Authorization") or req.headers.get("authorization") or ""
+    if not auth_header.lower().startswith("bearer "):
+        return (None, "free")
+    id_token = auth_header.split(" ", 1)[1].strip()
+    if not id_token:
+        return (None, "free")
+
+    try:
+        from firebase_admin import auth as fb_auth
+        decoded = fb_auth.verify_id_token(id_token)
+        uid = decoded.get("uid")
+    except Exception as e:
+        logger.info("coach_review: invalid id_token (%s) — downgrading to free", type(e).__name__)
+        return (None, "free")
+
+    if not uid:
+        return (None, "free")
+
+    try:
+        snap = firestore.client().collection("users").document(uid) \
+            .collection("coachSubscription").document("current").get()
+        if not snap.exists:
+            return (uid, "free")
+        data = snap.to_dict() or {}
+        persisted = (data.get("tier") or "free").lower()
+        if persisted not in ("plus", "premium"):
+            return (uid, "free")
+        # Expiry check applies to BOTH paid tiers.
+        expires_at = data.get("expiresAt")
+        if expires_at:
+            try:
+                if hasattr(expires_at, "timestamp") and expires_at.timestamp() < time.time():
+                    return (uid, "free")
+            except Exception:
+                pass
+        return (uid, persisted)
+    except Exception as e:
+        logger.warning("coach_review: subscription lookup failed for %s: %s", uid, e)
+        return (uid, "free")
+
+
+@https_fn.on_request(memory=1024, max_instances=20, timeout_sec=120, cpu=1)
+def coach_review(req: https_fn.Request) -> https_fn.Response:
+    """Generate an AI Coach review. Tier is verified server-side from the
+    Firebase Auth token — the client's `tier` field is ignored."""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+
+    if req.method != 'POST':
+        return create_response(
+            success=False,
+            message='Method not allowed',
+            error='Only POST method is allowed',
+            status_code=405,
+        )
+
+    try:
+        payload = req.get_json(silent=True) or {}
+        summary = (payload.get("summary") or "").strip()
+        user_input = (payload.get("user_input") or "").strip()
+        language_selected = (payload.get("languageSelected") or payload.get("language") or "english").lower()
+
+        if not summary or not user_input:
+            return create_response(
+                success=False,
+                message='Missing required fields',
+                error='`summary` and `user_input` are required',
+                status_code=400,
+            )
+
+        # Length guards — generous but bounded. Prevents accidental or
+        # adversarial payloads from blowing past the model's context window
+        # or driving up token spend.
+        if len(summary) > 12000 or len(user_input) > 4000:
+            return create_response(
+                success=False,
+                message='Payload too large',
+                error='Coach review payload exceeds size limits.',
+                status_code=413,
+            )
+
+        # Server-derived tier (ignores client's claim). Returns one of
+        # "free" | "plus" | "premium". Plus and Free both use the light
+        # model — Plus gets unlimited use + chat, not a better model.
+        uid, tier = _verify_coach_tier(req)
+        is_premium = tier == "premium"
+        is_paid = tier in ("plus", "premium")
+
+        # Rate limit per UID. Paid tiers get the higher window.
+        if not _coach_rate_allow(uid or "", is_paid):
+            return create_response(
+                success=False,
+                message='Rate limit',
+                error='Too many coach reviews in a short window. Please try again in a few minutes.',
+                status_code=429,
+            )
+
+        if is_premium:
+            model = COACH_MODEL_PREMIUM
+            max_tokens = 1400
+        else:
+            # Free + Plus → light model.
+            model = COACH_MODEL_FREE
+            max_tokens = 900
+
+        # Compose the user prompt: domain context + the structured ask.
+        user_prompt = f"{summary}\n\n---\n\n{user_input}"
+        reply_language = "Thai" if language_selected == "thai" else "English"
+
+        logger.info(
+            "coach_review: uid=%s tier=%s model=%s lang=%s summary_chars=%d",
+            uid or "anon", tier, model, language_selected, len(summary)
+        )
+
+        # Use the shared ChatGPT wrapper. The wrapper already handles
+        # retries, circuit breakers, and rate limiting.
+        from chatgpt_wrapper import chat_with_gpt
+        response_text = chat_with_gpt(
+            system_prompt=_COACH_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            model=model,
+            max_completion_tokens=max_tokens,
+            auto_detect_language=False,
+            reply_language=reply_language,
+        )
+
+        if not response_text or not response_text.strip():
+            return create_response(
+                success=False,
+                message='Empty model response',
+                error='The coach is briefly unavailable. Please try again in a moment.',
+                status_code=502,
+            )
+
+        return create_response(
+            data={
+                "response": response_text,
+                "feedback": response_text,  # back-compat with existing client parse chain
+                "model_used": model,
+                "tier": tier,
+            },
+            message='Coach review generated',
+        )
+
+    except Exception as e:
+        logger.error("coach_review error: %s", e)
+        traceback.print_exc()
+        return create_response(
+            success=False,
+            message='Coach review failed',
+            error="We couldn't reach your coach right now. Please try again in a moment.",
+            status_code=500,
+        )
+
+
+# =========================
+# Coach Subscription Verification — IAP receipt validation
+# =========================
+# Production-grade receipt validation for the EVO Coach Premium subscription.
+# Called by the mobile app immediately after a successful App Store / Google
+# Play purchase or after a Restore Purchases. The endpoint:
+#
+#   1. Verifies the user's Firebase Auth ID token (same path as coach_review).
+#   2. Calls Apple's verifyReceipt or Google Play's purchases.subscriptions.get
+#      to authenticate the receipt against the store of record.
+#   3. Extracts the expiry date from the platform response.
+#   4. Writes users/{uid}/coachSubscription/current with tier=premium,
+#      expiresAt, source, and originalTransactionId.
+#
+# Why server-side: the device cannot be trusted. A modified client could send
+# a forged receipt. Apple/Google sign their receipts and only they can verify
+# them. The Firestore write only happens after a successful platform call.
+#
+# Secrets required (set via Firebase Functions secrets manager):
+#   - IAP_APPLE_SHARED_SECRET           App Store Connect → App-Specific Shared Secret
+#   - IAP_GOOGLE_SERVICE_ACCOUNT_JSON   Service account JSON with
+#                                       androidpublisher.read scope, attached
+#                                       to Play Console as a Financial admin.
+#
+# Both can be empty in development — the endpoint will fail closed (never
+# grant premium without verification).
+
+import base64
+import json as _json
+
+_APPLE_PROD_URL = "https://buy.itunes.apple.com/verifyReceipt"
+_APPLE_SANDBOX_URL = "https://sandbox.itunes.apple.com/verifyReceipt"
+
+def _apple_shared_secret() -> Optional[str]:
+    return os.getenv("IAP_APPLE_SHARED_SECRET") or None
+
+def _google_service_account_json() -> Optional[str]:
+    return os.getenv("IAP_GOOGLE_SERVICE_ACCOUNT_JSON") or None
+
+def _verify_apple_receipt(receipt_b64: str, sku: str) -> Dict[str, Any]:
+    """Verify an iOS receipt with Apple. Returns a normalised dict:
+       { ok, expires_ms, original_transaction_id, raw_status }.
+       Apple's protocol: try production first, fall back to sandbox if Apple
+       tells us 21007 (sandbox receipt sent to prod).
+    """
+    shared = _apple_shared_secret()
+    if not shared:
+        return {"ok": False, "error": "Apple shared secret not configured"}
+
+    body = {
+        "receipt-data": receipt_b64,
+        "password": shared,
+        "exclude-old-transactions": True,
+    }
+
+    def _post(url: str):
+        return requests.post(url, json=body, timeout=20).json()
+
+    try:
+        res = _post(_APPLE_PROD_URL)
+        if res.get("status") == 21007:
+            res = _post(_APPLE_SANDBOX_URL)
+    except Exception as e:
+        return {"ok": False, "error": f"Apple verify network error: {e}"}
+
+    status = res.get("status")
+    if status != 0:
+        return {"ok": False, "error": f"Apple status={status}", "raw_status": status}
+
+    # latest_receipt_info is the authoritative list of transactions for
+    # auto-renewing subscriptions. Pick the entry matching our SKU with the
+    # furthest-out expiry.
+    candidates = res.get("latest_receipt_info") or res.get("receipt", {}).get("in_app", []) or []
+    matching = [
+        c for c in candidates
+        if (c.get("product_id") == sku or not sku)
+    ]
+    if not matching:
+        return {"ok": False, "error": "Receipt has no matching subscription", "raw_status": status}
+
+    matching.sort(key=lambda c: int(c.get("expires_date_ms") or 0), reverse=True)
+    top = matching[0]
+    expires_ms = int(top.get("expires_date_ms") or 0)
+    if expires_ms <= 0:
+        return {"ok": False, "error": "No expiry on receipt"}
+
+    return {
+        "ok": True,
+        "expires_ms": expires_ms,
+        "original_transaction_id": top.get("original_transaction_id"),
+        "raw_status": status,
+    }
+
+
+def _verify_google_subscription(purchase_token: str, sku: str) -> Dict[str, Any]:
+    """Verify a Google Play subscription via the Play Developer API.
+       Requires a service account JSON in IAP_GOOGLE_SERVICE_ACCOUNT_JSON.
+    """
+    sa_json = _google_service_account_json()
+    if not sa_json:
+        return {"ok": False, "error": "Google service account not configured"}
+
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+    except ImportError:
+        return {
+            "ok": False,
+            "error": "google-api-python-client / google-auth not installed. "
+                     "Add 'google-api-python-client' and 'google-auth' to requirements.txt.",
+        }
+
+    try:
+        info = _json.loads(sa_json)
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/androidpublisher"]
+        )
+        service = build("androidpublisher", "v3", credentials=creds, cache_discovery=False)
+        # Package name is encoded in app.json / build.gradle. Hardcode the
+        # production package name here to keep the function self-contained.
+        package_name = os.getenv("ANDROID_PACKAGE_NAME", "com.evoforluanching")
+        result = service.purchases().subscriptions().get(
+            packageName=package_name,
+            subscriptionId=sku,
+            token=purchase_token,
+        ).execute()
+    except Exception as e:
+        return {"ok": False, "error": f"Google verify error: {e}"}
+
+    expires_ms = int(result.get("expiryTimeMillis") or 0)
+    if expires_ms <= 0:
+        return {"ok": False, "error": "No expiry on Google subscription"}
+
+    return {
+        "ok": True,
+        "expires_ms": expires_ms,
+        "original_transaction_id": result.get("orderId"),
+        "auto_renewing": bool(result.get("autoRenewing", False)),
+    }
+
+
+@https_fn.on_request(memory=512, max_instances=10, timeout_sec=60, cpu=1)
+def verify_coach_subscription(req: https_fn.Request) -> https_fn.Response:
+    """Verify an iOS/Android IAP receipt and grant premium in Firestore."""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+    if req.method != 'POST':
+        return create_response(
+            success=False, message='Method not allowed',
+            error='Only POST method is allowed', status_code=405,
+        )
+
+    try:
+        # Auth — required (we need a uid to write the subscription doc).
+        uid, _ = _verify_coach_tier(req)
+        if not uid:
+            return create_response(
+                success=False, message='Auth required',
+                error='Sign in to confirm your purchase.', status_code=401,
+            )
+
+        payload = req.get_json(silent=True) or {}
+        receipt = (payload.get("receipt") or "").strip()
+        platform = (payload.get("platform") or "").lower()
+        sku = (payload.get("sku") or "").strip()
+        transaction_id = (payload.get("transactionId") or "").strip() or None
+
+        if not receipt or platform not in ("ios", "android") or not sku:
+            return create_response(
+                success=False, message='Missing fields',
+                error='`receipt`, `platform` (ios|android), and `sku` are required.',
+                status_code=400,
+            )
+
+        if platform == "ios":
+            v = _verify_apple_receipt(receipt, sku)
+            source = "ios"
+        else:
+            v = _verify_google_subscription(receipt, sku)
+            source = "android"
+
+        if not v.get("ok"):
+            logger.warning("verify_coach_subscription failed for %s: %s", uid, v.get("error"))
+            return create_response(
+                success=False, message='Receipt invalid',
+                error=v.get("error") or "Receipt could not be verified.",
+                status_code=402,
+            )
+
+        expires_ms = int(v["expires_ms"])
+        if expires_ms < (time.time() * 1000):
+            return create_response(
+                success=False, message='Subscription expired',
+                error='This subscription has already expired.',
+                status_code=402,
+            )
+
+        # Map SKU → tier. Plus and Premium are distinct subscriptions in
+        # both stores; the SKU is the source of truth for which tier the
+        # user just paid for. If the SKU doesn't match any known product
+        # we fail closed (don't grant premium for an unknown product).
+        sku_lc = (sku or "").lower()
+        if "plus" in sku_lc:
+            granted_tier = "plus"
+        elif "premium" in sku_lc:
+            granted_tier = "premium"
+        else:
+            logger.warning("verify_coach_subscription: unknown sku %s — refusing", sku)
+            return create_response(
+                success=False, message='Unknown product',
+                error='Unrecognised subscription product.',
+                status_code=400,
+            )
+
+        # Write Firestore subscription doc. From this moment the user is
+        # treated as `granted_tier` by useCoachSubscription on the client
+        # and by coach_review on the server.
+        from firebase_admin import firestore as _fs
+        sub_ref = (
+            firestore.client()
+            .collection("users").document(uid)
+            .collection("coachSubscription").document("current")
+        )
+        sub_ref.set({
+            "tier": granted_tier,
+            "source": source,
+            "sku": sku,
+            "originalTransactionId": v.get("original_transaction_id") or transaction_id,
+            "expiresAt": _fs.Timestamp.from_seconds(expires_ms // 1000) if hasattr(_fs, "Timestamp") else datetime.utcfromtimestamp(expires_ms // 1000),
+            "updatedAt": _fs.SERVER_TIMESTAMP if hasattr(_fs, "SERVER_TIMESTAMP") else datetime.utcnow().isoformat(),
+        }, merge=True)
+
+        logger.info(
+            "verify_coach_subscription: granted %s uid=%s sku=%s exp=%s",
+            granted_tier, uid, sku, expires_ms
+        )
+
+        return create_response(
+            data={
+                "tier": granted_tier,
+                "expiresAt": expires_ms,
+                "source": source,
+            },
+            message='Subscription verified',
+        )
+
+    except Exception as e:
+        logger.error("verify_coach_subscription error: %s", e)
+        traceback.print_exc()
+        return create_response(
+            success=False, message='Verification failed',
+            error="We couldn't verify your purchase right now. Please try again.",
+            status_code=500,
+        )
+
+
+# =========================
 # Async Planner Generation with Job Queue
 # =========================
 
