@@ -997,6 +997,611 @@ def coach_review(req: https_fn.Request) -> https_fn.Response:
 
 
 # =========================
+# Practice Card — interactive scenario generator
+# =========================
+# Generates a small "scenario card" the user opens on dateScreenFull to
+# rehearse the upcoming rep mentally before doing it. Format is fixed
+# (one situation + 3 choices + a non-judgmental note); variety comes from
+# scenario *content*, gated by an anti-repeat list passed from the client.
+#
+# Tiering — verified server-side via _verify_coach_tier:
+#   free    → 1 card / UTC day,   gpt-5.4-mini, no coachFollowUp
+#   plus    → unlimited,          gpt-5.4-mini, no coachFollowUp
+#   premium → unlimited,          gpt-5.4,      with coachFollowUp paragraph
+#
+# Cache: users/{uid}/practice/{taskId} with 24h TTL so repeat opens are
+# free. Cache write happens only for authenticated users.
+
+_PRACTICE_CACHE_TTL_SEC = 24 * 60 * 60
+_PRACTICE_HISTORY_LIMIT = 10
+
+# Semantic role of each scenario choice. Logged with the user's pick so the
+# coach loop can mine *what kind* of move a user makes under pressure — not
+# just which letter they tapped. The four cover the realistic responses to
+# a hard moment in a rep:
+#   recovery → reset/regroup, then continue (the plasticity-friendly move)
+#   persist  → push through as-is
+#   adjust   → change the approach or scope
+#   avoid    → disengage / escape
+_PRACTICE_INTENTS = {"recovery", "persist", "adjust", "avoid"}
+
+_PRACTICE_SYSTEM_PROMPT_BASE = (
+    "You generate ONE 'scenario card' for a user about to do a task in the "
+    "EVO app — a behavior-change tool grounded in neuroplasticity (consistent "
+    "recoverable repetition, not streaks).\n\n"
+    "Goal of the card: help the user mentally rehearse the rep before they do "
+    "it. There is NO correct answer; picking is the rep.\n\n"
+    "Voice: warm, direct, concrete. Second-person. No moralizing. No toxic "
+    "positivity. No emoji. No scores, no badges, no streaks.\n\n"
+    "Hard rules:\n"
+    "1. Return ONLY valid JSON. No markdown fences. No preamble.\n"
+    "2. `situation` is 1–2 sentences, concrete, grounded in the actual task.\n"
+    "3. `choices` MUST be exactly 3 items, each with keys 'key' (a/b/c), "
+    "'label' (under 90 chars, plausible real action, not a joke option), and "
+    "'intent'.\n"
+    "4. Each choice's `intent` MUST be EXACTLY one of: 'recovery' "
+    "(reset/regroup then continue), 'persist' (push through as-is), 'adjust' "
+    "(change the approach or scope), 'avoid' (disengage/escape). The three "
+    "choices SHOULD span different intents so the user's pick is informative — "
+    "never make all three the same intent.\n"
+    "5. `afterChoiceNote` is ONE short sentence reframing the activity as "
+    "noticing — not winning.\n"
+    "6. `scenarioId` is a kebab-case theme (e.g. 'distraction-at-15min', "
+    "'motivation-drop', 'unclear-next-step') — used for anti-repeat.\n"
+    "7. If the user state indicates a missed day, generate a GENTLER "
+    "return-rep scenario; do not shame.\n"
+    "8. Avoid scenario themes listed in `recent_scenarios`.\n"
+)
+
+_PRACTICE_SYSTEM_PROMPT_FREE = _PRACTICE_SYSTEM_PROMPT_BASE + (
+    "\nOutput JSON shape:\n"
+    "{\n"
+    '  "scenarioId": "<kebab-case>",\n'
+    '  "situation": "<1–2 sentences>",\n'
+    '  "choices": [\n'
+    '    {"key":"a","label":"...","intent":"recovery|persist|adjust|avoid"},\n'
+    '    {"key":"b","label":"...","intent":"recovery|persist|adjust|avoid"},\n'
+    '    {"key":"c","label":"...","intent":"recovery|persist|adjust|avoid"}\n'
+    "  ],\n"
+    '  "afterChoiceNote": "<one sentence>"\n'
+    "}\n"
+)
+
+_PRACTICE_SYSTEM_PROMPT_PREMIUM = _PRACTICE_SYSTEM_PROMPT_BASE + (
+    "\nOutput JSON shape (premium — include `coachFollowUp`):\n"
+    "{\n"
+    '  "scenarioId": "<kebab-case>",\n'
+    '  "situation": "<1–2 sentences>",\n'
+    '  "choices": [\n'
+    '    {"key":"a","label":"...","intent":"recovery|persist|adjust|avoid"},\n'
+    '    {"key":"b","label":"...","intent":"recovery|persist|adjust|avoid"},\n'
+    '    {"key":"c","label":"...","intent":"recovery|persist|adjust|avoid"}\n'
+    "  ],\n"
+    '  "afterChoiceNote": "<one sentence>",\n'
+    '  "coachFollowUp": "<2–3 sentences a coach would say AFTER the user '
+    "picks any option — point at what to notice during the rep, drawing on "
+    'the task context. Same voice rules.>"\n'
+    "}\n"
+)
+
+
+def _practice_today_doc_id() -> str:
+    """UTC date key for the daily-cap counter. UTC keeps the cap consistent
+    across timezones; daily-cap drift of a few hours is acceptable for
+    a free quota and avoids per-user timezone bookkeeping here."""
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+
+def _practice_daily_count_check_and_inc(uid: str) -> Tuple[bool, int]:
+    """Atomically increment the free-tier daily counter.
+    Returns (allowed, new_count). If the counter is already >= 1 before the
+    increment, returns (False, current_count) without writing."""
+    if not uid:
+        return (True, 0)  # anonymous goes through; rate-limit catches abuse
+    try:
+        db = firestore.client()
+        ref = (db.collection("users").document(uid)
+                 .collection("practice_usage").document(_practice_today_doc_id()))
+        transaction = db.transaction()
+
+        @firestore.transactional
+        def _txn(tx):
+            snap = ref.get(transaction=tx)
+            current = (snap.to_dict() or {}).get("count", 0) if snap.exists else 0
+            if current >= 1:
+                return (False, current)
+            tx.set(ref, {"count": current + 1, "updatedAt": firestore.SERVER_TIMESTAMP},
+                   merge=True)
+            return (True, current + 1)
+
+        return _txn(transaction)
+    except Exception as e:
+        logger.warning("practice daily counter failed for %s: %s — allowing", uid, e)
+        return (True, 0)
+
+
+def _practice_cache_get(uid: str, task_id: str) -> Optional[Dict[str, Any]]:
+    if not uid or not task_id:
+        return None
+    try:
+        db = firestore.client()
+        snap = (db.collection("users").document(uid)
+                  .collection("practice").document(task_id).get())
+        if not snap.exists:
+            return None
+        data = snap.to_dict() or {}
+        generated_at = data.get("generatedAt")
+        ts = None
+        if hasattr(generated_at, "timestamp"):
+            ts = generated_at.timestamp()
+        elif isinstance(generated_at, (int, float)):
+            ts = float(generated_at)
+        if ts is None or (time.time() - ts) > _PRACTICE_CACHE_TTL_SEC:
+            return None
+        return data
+    except Exception as e:
+        logger.warning("practice cache read failed for %s/%s: %s", uid, task_id, e)
+        return None
+
+
+def _practice_cache_set(uid: str, task_id: str, card: Dict[str, Any]) -> None:
+    if not uid or not task_id:
+        return
+    try:
+        db = firestore.client()
+        ref = (db.collection("users").document(uid)
+                 .collection("practice").document(task_id))
+        ref.set({**card,
+                 "generatedAt": firestore.SERVER_TIMESTAMP,
+                 "formatVersion": 1}, merge=True)
+    except Exception as e:
+        logger.warning("practice cache write failed for %s/%s: %s", uid, task_id, e)
+
+
+def _practice_history_append(uid: str, scenario_id: str) -> None:
+    """Roll the user's scenarioId history forward — last N kept for anti-repeat
+    on the server side as a safety net when the client doesn't send one."""
+    if not uid or not scenario_id:
+        return
+    try:
+        db = firestore.client()
+        ref = (db.collection("users").document(uid)
+                 .collection("practice_meta").document("history"))
+        snap = ref.get()
+        prev = (snap.to_dict() or {}).get("scenarioIds", []) if snap.exists else []
+        rolled = ([scenario_id] + [s for s in prev if s != scenario_id])[:_PRACTICE_HISTORY_LIMIT]
+        ref.set({"scenarioIds": rolled, "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True)
+    except Exception as e:
+        logger.warning("practice history append failed for %s: %s", uid, e)
+
+
+def _practice_strip_for_tier(card: Dict[str, Any], tier: str) -> Dict[str, Any]:
+    """Premium-only fields are removed before returning to non-premium callers,
+    even if the model produced them or the cache holds a richer copy."""
+    out = dict(card)
+    if tier != "premium":
+        out.pop("coachFollowUp", None)
+    return out
+
+
+@https_fn.on_request(memory=512, max_instances=20, timeout_sec=60, cpu=1)
+def generate_practice(req: https_fn.Request) -> https_fn.Response:
+    """Generate one scenario practice card for a task on dateScreenFull.
+    Tier verified server-side; free tier capped at 1/day."""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+
+    if req.method != 'POST':
+        return create_response(
+            success=False,
+            message='Method not allowed',
+            error='Only POST method is allowed',
+            status_code=405,
+        )
+
+    try:
+        payload = req.get_json(silent=True) or {}
+        task_id = (payload.get("taskId") or "").strip()
+        task_title = (payload.get("taskTitle") or "").strip()
+        task_category = (payload.get("taskCategory") or "").strip()
+        task_detail = (payload.get("taskDetail") or "").strip()
+        plan_day_number = payload.get("planDayNumber")
+        user_state = payload.get("userState") or {}
+        language_selected = (
+            payload.get("languageSelected") or payload.get("language") or "english"
+        ).lower()
+        force_refresh = bool(payload.get("forceRefresh", False))
+
+        if not task_id or not task_title:
+            return create_response(
+                success=False,
+                message='Missing required fields',
+                error='`taskId` and `taskTitle` are required',
+                status_code=400,
+            )
+
+        # Bound payload size — same safety net as coach_review.
+        if (len(task_title) > 400 or len(task_detail) > 4000
+                or len(task_category) > 120):
+            return create_response(
+                success=False,
+                message='Payload too large',
+                error='Practice card payload exceeds size limits.',
+                status_code=413,
+            )
+
+        uid, tier = _verify_coach_tier(req)
+        is_premium = tier == "premium"
+        is_paid = tier in ("plus", "premium")
+
+        if not _coach_rate_allow(uid or "", is_paid):
+            return create_response(
+                success=False,
+                message='Rate limit',
+                error='Too many practice cards in a short window. Try again soon.',
+                status_code=429,
+            )
+
+        # 1) Cache check — only for authenticated users, only when not forced.
+        if uid and not force_refresh:
+            cached = _practice_cache_get(uid, task_id)
+            if cached:
+                return create_response(
+                    data={
+                        "card": _practice_strip_for_tier(cached, tier),
+                        "tier": tier,
+                        "source": "cache",
+                    },
+                    message='Practice card (cached)',
+                )
+
+        # 2) Free-tier daily cap — only enforced on a fresh generation, not
+        #    on cache hits (above). A user who generated earlier today can
+        #    still re-open and read it; they just can't generate a new one.
+        if tier == "free":
+            allowed, _count = _practice_daily_count_check_and_inc(uid or "")
+            if not allowed:
+                return create_response(
+                    success=False,
+                    message='Daily cap reached',
+                    error='You have used today’s free practice card. Upgrade for unlimited reps.',
+                    status_code=402,
+                    metadata={"capReached": True, "tier": tier},
+                )
+
+        # 3) Build the model prompt.
+        if is_premium:
+            model = COACH_MODEL_PREMIUM
+            system_prompt = _PRACTICE_SYSTEM_PROMPT_PREMIUM
+            max_tokens = 700
+        else:
+            model = COACH_MODEL_FREE
+            system_prompt = _PRACTICE_SYSTEM_PROMPT_FREE
+            max_tokens = 400
+
+        recent_scenarios = user_state.get("recentScenarios") or []
+        if not isinstance(recent_scenarios, list):
+            recent_scenarios = []
+        recent_scenarios = [str(s) for s in recent_scenarios[:_PRACTICE_HISTORY_LIMIT]]
+
+        missed_yesterday = bool(user_state.get("missedYesterday", False))
+        rest_day = bool(user_state.get("restDayFlag", False))
+
+        user_prompt_lines = [
+            "TASK:",
+            f"- title: {task_title}",
+        ]
+        if task_category:
+            user_prompt_lines.append(f"- category: {task_category}")
+        if task_detail:
+            user_prompt_lines.append(f"- detail: {task_detail}")
+        if plan_day_number is not None:
+            user_prompt_lines.append(f"- plan_day_number: {plan_day_number}")
+
+        user_prompt_lines += [
+            "",
+            "USER STATE:",
+            f"- missed_yesterday: {missed_yesterday}",
+            f"- rest_day: {rest_day}",
+            f"- recent_scenarios (avoid these themes): {recent_scenarios}",
+            "",
+            "Generate ONE scenario card per the JSON contract.",
+        ]
+        user_prompt = "\n".join(user_prompt_lines)
+        reply_language = "Thai" if language_selected == "thai" else "English"
+
+        logger.info(
+            "generate_practice: uid=%s tier=%s model=%s lang=%s task_id=%s",
+            uid or "anon", tier, model, language_selected, task_id,
+        )
+
+        from chatgpt_wrapper import chat_with_gpt
+        response_text = chat_with_gpt(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            model=model,
+            max_completion_tokens=max_tokens,
+            auto_detect_language=False,
+            reply_language=reply_language,
+        )
+
+        if not response_text or not response_text.strip():
+            return create_response(
+                success=False,
+                message='Empty model response',
+                error='Could not generate a card right now. Try again in a moment.',
+                status_code=502,
+            )
+
+        # 4) Parse + validate. Strip fences just in case the model added them
+        #    despite the contract.
+        raw = response_text.strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.lower().startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        try:
+            card = json.loads(raw)
+        except Exception:
+            logger.warning("generate_practice: JSON parse failed for uid=%s", uid)
+            return create_response(
+                success=False,
+                message='Bad model output',
+                error='The card came back malformed. Try again.',
+                status_code=502,
+            )
+
+        if not isinstance(card, dict):
+            return create_response(success=False, message='Bad model output',
+                                   error='Card payload must be an object.',
+                                   status_code=502)
+        situation = (card.get("situation") or "").strip()
+        choices = card.get("choices") or []
+        if not situation or not isinstance(choices, list) or len(choices) != 3:
+            return create_response(success=False, message='Bad model output',
+                                   error='Card payload missing required fields.',
+                                   status_code=502)
+        scenario_id = (card.get("scenarioId") or "scenario").strip() or "scenario"
+        def _norm_intent(value: Any) -> str:
+            iv = str(value or "").strip().lower()
+            return iv if iv in _PRACTICE_INTENTS else "other"
+
+        normalized = {
+            "scenarioId": scenario_id,
+            "situation": situation,
+            "choices": [
+                {"key": str(c.get("key", "")).strip()[:2] or chr(ord("a") + i),
+                 "label": str(c.get("label", "")).strip()[:200],
+                 "intent": _norm_intent(c.get("intent"))}
+                for i, c in enumerate(choices[:3])
+            ],
+            "afterChoiceNote": (card.get("afterChoiceNote") or "").strip(),
+        }
+        if is_premium and card.get("coachFollowUp"):
+            normalized["coachFollowUp"] = str(card["coachFollowUp"]).strip()
+
+        # 5) Persist cache + roll history.
+        _practice_cache_set(uid or "", task_id, normalized)
+        _practice_history_append(uid or "", scenario_id)
+
+        return create_response(
+            data={
+                "card": _practice_strip_for_tier(normalized, tier),
+                "tier": tier,
+                "model_used": model,
+                "source": "fresh",
+            },
+            message='Practice card generated',
+        )
+
+    except Exception as e:
+        logger.error("generate_practice error: %s", e)
+        traceback.print_exc()
+        return create_response(
+            success=False,
+            message='Practice card failed',
+            error="We couldn't generate a card right now. Try again in a moment.",
+            status_code=500,
+        )
+
+
+# =========================
+# Practice outcomes — cross-user aggregation (the literal Q2)
+# =========================
+# "Which rehearsal patterns predict follow-through?" — i.e. do users who pick
+# a 'recovery' move complete the task more often than those who 'avoid'?
+# This is a CROSS-USER question, so it cannot run on a client (a user can't
+# read other users' data). It runs here with the Admin SDK over a collection
+# group scan of every users/{uid}/practice_log, and writes a single
+# aggregate doc to practice_aggregates/global.
+#
+# Privacy by construction:
+#   - Output is aggregate-only. No uid, taskId, or text ever leaves the
+#     function — only per-intent counts and rates.
+#   - k-anonymity floor: an intent's stat is published only when it draws on
+#     >= MIN_COHORT_USERS distinct users AND >= MIN_COHORT_DECIDED decided
+#     tasks. Otherwise it's suppressed and named in `suppressedIntents`.
+#
+# Trigger: Cloud Scheduler → HTTP (same pattern as the other jobs here).
+# Set PRACTICE_AGG_SECRET and have the scheduler send it as X-Agg-Secret so
+# the endpoint can't be triggered by arbitrary callers. If unset (dev), the
+# endpoint runs open.
+#
+# No Firestore index required: the collection-group query uses only a bounded
+# .limit() with no filter/order, which is an unordered scan. At larger scale
+# this should move to incremental aggregation; the MAX_SCAN cap is the
+# backstop until then (logged when hit).
+
+_PRACTICE_AGG_GRACE_SEC = 2 * 24 * 60 * 60
+_PRACTICE_AGG_MAX_SCAN = 50000
+_PRACTICE_AGG_MIN_COHORT_USERS = 10
+_PRACTICE_AGG_MIN_COHORT_DECIDED = 30
+
+
+@https_fn.on_request(memory=1024, max_instances=2, timeout_sec=540, cpu=1)
+def aggregate_practice_outcomes(req: https_fn.Request) -> https_fn.Response:
+    """Aggregate pick→completion outcomes across all users, by choice-intent
+    and tier, with a privacy floor. Writes practice_aggregates/global."""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+
+    expected = os.getenv("PRACTICE_AGG_SECRET")
+    if expected:
+        provided = req.headers.get("X-Agg-Secret") or req.args.get("secret")
+        if provided != expected:
+            return create_response(
+                success=False, message='Forbidden',
+                error='Invalid aggregation secret', status_code=403,
+            )
+
+    intents = ("recovery", "persist", "adjust", "avoid")
+
+    try:
+        db = firestore.client()
+        now = time.time()
+
+        # Collapse to one decision per (uid, taskId): a task counts as
+        # completed if ANY of its pick rows was stamped done; the latest
+        # pick's intent is the predictive move.
+        decisions = {}
+        scanned = 0
+        truncated = False
+        for snap in db.collection_group("practice_log").limit(_PRACTICE_AGG_MAX_SCAN).stream():
+            scanned += 1
+            data = snap.to_dict() or {}
+            try:
+                uid = snap.reference.parent.parent.id
+            except Exception:
+                continue
+            task_id = data.get("taskId")
+            intent = data.get("pickedIntent")
+            if not uid or not task_id or intent not in intents:
+                continue
+            ts = data.get("pickedAt")
+            ts_sec = ts.timestamp() if hasattr(ts, "timestamp") else 0
+            completed = data.get("completed") is True
+            tier = data.get("tier") or "free"
+            key = (uid, str(task_id))
+            cur = decisions.get(key)
+            if cur is None:
+                decisions[key] = {
+                    "ts": ts_sec, "intent": intent,
+                    "completed": completed, "tier": tier, "uid": uid,
+                }
+            else:
+                cur["completed"] = cur["completed"] or completed
+                if ts_sec >= cur["ts"]:
+                    cur["ts"] = ts_sec
+                    cur["intent"] = intent
+                    cur["tier"] = tier
+        if scanned >= _PRACTICE_AGG_MAX_SCAN:
+            truncated = True
+            logger.warning(
+                "aggregate_practice_outcomes: hit MAX_SCAN=%d — results truncated",
+                _PRACTICE_AGG_MAX_SCAN,
+            )
+
+        def new_bucket():
+            return {"completed": 0, "total": 0, "users": set()}
+
+        by_intent = {i: new_bucket() for i in intents}
+        by_tier_intent = {}
+
+        for d in decisions.values():
+            if d["completed"]:
+                outcome_completed = True
+            elif d["ts"] and (now - d["ts"]) > _PRACTICE_AGG_GRACE_SEC:
+                outcome_completed = False
+            else:
+                continue  # pending — not yet decided
+            intent = d["intent"]
+            tier = d["tier"] if d["tier"] in ("free", "plus", "premium") else "free"
+
+            b = by_intent[intent]
+            b["total"] += 1
+            b["users"].add(d["uid"])
+            if outcome_completed:
+                b["completed"] += 1
+
+            ti = by_tier_intent.setdefault(
+                tier, {i: new_bucket() for i in intents}
+            )[intent]
+            ti["total"] += 1
+            ti["users"].add(d["uid"])
+            if outcome_completed:
+                ti["completed"] += 1
+
+        def publish(bucket):
+            users = len(bucket["users"])
+            total = bucket["total"]
+            if users < _PRACTICE_AGG_MIN_COHORT_USERS or total < _PRACTICE_AGG_MIN_COHORT_DECIDED:
+                return None
+            return {
+                "completed": bucket["completed"],
+                "total": total,
+                "rate": round(bucket["completed"] / total, 4),
+                "users": users,
+            }
+
+        out_by_intent = {}
+        suppressed = []
+        for i in intents:
+            pub = publish(by_intent[i])
+            if pub:
+                out_by_intent[i] = pub
+            else:
+                suppressed.append(i)
+
+        out_by_tier = {}
+        for tier, m in by_tier_intent.items():
+            tier_out = {}
+            for i in intents:
+                pub = publish(m[i])
+                if pub:
+                    tier_out[i] = pub
+            if tier_out:
+                out_by_tier[tier] = tier_out
+
+        total_decided = sum(b["total"] for b in by_intent.values())
+        cohort_users = len({d["uid"] for d in decisions.values()})
+
+        result = {
+            "byIntent": out_by_intent,
+            "byTierIntent": out_by_tier,
+            "totalDecided": total_decided,
+            "cohortUsers": cohort_users,
+            "scanned": scanned,
+            "truncated": truncated,
+            "suppressedIntents": suppressed,
+            "minCohortUsers": _PRACTICE_AGG_MIN_COHORT_USERS,
+            "minCohortDecided": _PRACTICE_AGG_MIN_COHORT_DECIDED,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        }
+        db.collection("practice_aggregates").document("global").set(result)
+
+        logger.info(
+            "aggregate_practice_outcomes: scanned=%d decisions=%d decided=%d cohort=%d published=%s suppressed=%s",
+            scanned, len(decisions), total_decided, cohort_users,
+            list(out_by_intent.keys()), suppressed,
+        )
+
+        response_payload = dict(result)
+        response_payload.pop("updatedAt", None)  # don't echo the sentinel
+        return create_response(
+            data=response_payload, message="Practice outcomes aggregated"
+        )
+
+    except Exception as e:
+        logger.error("aggregate_practice_outcomes error: %s", e)
+        traceback.print_exc()
+        return create_response(
+            success=False, message='Aggregation failed',
+            error="Could not aggregate practice outcomes.", status_code=500,
+        )
+
+
+# =========================
 # Coach Subscription Verification — IAP receipt validation
 # =========================
 # Production-grade receipt validation for the EVO Coach Premium subscription.
