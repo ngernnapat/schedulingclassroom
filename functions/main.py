@@ -21,11 +21,15 @@ if current_dir not in sys.path:
 
 from firebase_functions import https_fn
 from firebase_functions.options import set_global_options
+from firebase_functions.params import SecretParam
+
+# Injected at deploy when bound on generate_task_content (see decorator below).
+_EVO_FIREBASE_SA_SECRET = SecretParam("EVO_FIREBASE_SERVICE_ACCOUNT_JSON")
 from firebase_admin import initialize_app, storage, firestore
 from fastapi import HTTPException
 from pydantic import BaseModel, Field, ValidationError
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timedelta
 # Load environment variables
 load_dotenv()
 
@@ -785,6 +789,12 @@ _COACH_SYSTEM_PROMPT = (
     "structured context block from the user that defines the domain (diet, exercise, "
     "exam prep, sleep, meditation, or general) and the persona you should adopt. "
     "Honor that persona — speak like a real expert in that domain.\n\n"
+    "EVO practice loop (align with this):\n"
+    "- Structured plan days may include Practice this step — AI drill material + an "
+    "optional quiz per step (not tips, not streaks). Coach reviews judge what the "
+    "user actually did; you may nudge them to run one step's material before the "
+    "next rep when data is thin.\n"
+    "- Missed days are information, not failure. Favor recoverable next actions.\n\n"
     "Critical output rules:\n"
     "1. When the user asks for JSON, return ONLY valid JSON. No markdown fences, no preamble.\n"
     "2. Be specific. Reference the actual data the user provided.\n"
@@ -1085,23 +1095,35 @@ _PRACTICE_SYSTEM_PROMPT_PREMIUM = _PRACTICE_SYSTEM_PROMPT_BASE + (
 )
 
 
-def _practice_today_doc_id() -> str:
-    """UTC date key for the daily-cap counter. UTC keeps the cap consistent
-    across timezones; daily-cap drift of a few hours is acceptable for
-    a free quota and avoids per-user timezone bookkeeping here."""
-    return datetime.utcnow().strftime("%Y-%m-%d")
+def _local_period_key(tz_offset_minutes: Any, fmt: str) -> str:
+    """Build a usage-counter doc id in the USER'S LOCAL time, so quota windows
+    reset on the user's calendar boundary (local midnight / 1st of the month)
+    rather than the UTC boundary.
+
+    `tz_offset_minutes` is the number of minutes to ADD to UTC to reach local
+    time — i.e. the client sends `-(new Date().getTimezoneOffset())` (e.g.
+    +420 for UTC+7). We clamp to ±14h (the real-world TZ range) so a spoofed
+    value can only shift the boundary by hours, never reset a quota mid-period.
+    A missing/invalid offset falls back to UTC (offset 0)."""
+    try:
+        offset = int(tz_offset_minutes)
+    except (TypeError, ValueError):
+        offset = 0
+    offset = max(-840, min(840, offset))
+    return (datetime.utcnow() + timedelta(minutes=offset)).strftime(fmt)
 
 
-def _practice_daily_count_check_and_inc(uid: str) -> Tuple[bool, int]:
-    """Atomically increment the free-tier daily counter.
-    Returns (allowed, new_count). If the counter is already >= 1 before the
-    increment, returns (False, current_count) without writing."""
+def _practice_daily_count_check_and_inc(uid: str, tz_offset_minutes: Any = 0) -> Tuple[bool, int]:
+    """Atomically increment the free-tier daily counter (in the user's local
+    day). Returns (allowed, new_count). If the counter is already >= 1 before
+    the increment, returns (False, current_count) without writing."""
     if not uid:
         return (True, 0)  # anonymous goes through; rate-limit catches abuse
     try:
         db = firestore.client()
         ref = (db.collection("users").document(uid)
-                 .collection("practice_usage").document(_practice_today_doc_id()))
+                 .collection("practice_usage")
+                 .document(_local_period_key(tz_offset_minutes, "%Y-%m-%d")))
         transaction = db.transaction()
 
         @firestore.transactional
@@ -1211,6 +1233,7 @@ def generate_practice(req: https_fn.Request) -> https_fn.Response:
             payload.get("languageSelected") or payload.get("language") or "english"
         ).lower()
         force_refresh = bool(payload.get("forceRefresh", False))
+        tz_offset_minutes = payload.get("tzOffsetMinutes", 0)
 
         if not task_id or not task_title:
             return create_response(
@@ -1259,7 +1282,7 @@ def generate_practice(req: https_fn.Request) -> https_fn.Response:
         #    on cache hits (above). A user who generated earlier today can
         #    still re-open and read it; they just can't generate a new one.
         if tier == "free":
-            allowed, _count = _practice_daily_count_check_and_inc(uid or "")
+            allowed, _count = _practice_daily_count_check_and_inc(uid or "", tz_offset_minutes)
             if not allowed:
                 return create_response(
                     success=False,
@@ -1598,6 +1621,528 @@ def aggregate_practice_outcomes(req: https_fn.Request) -> https_fn.Response:
         return create_response(
             success=False, message='Aggregation failed',
             error="Could not aggregate practice outcomes.", status_code=500,
+        )
+
+
+# =========================
+# Task learning content + quiz — for AI-generated plans
+# =========================
+# On dateScreenFull, tasks that belong to an AI-generated plan get a
+# "Learn + Quiz" button. It calls this endpoint, which returns:
+#   - `content`: a short, focused explainer about HOW to do this task well
+#   - `quiz`:    a few multiple-choice questions (with the correct answer +
+#                an explanation) that check understanding of that content.
+#
+# Tiering (a SEPARATE monthly quota from coach reviews — verified server-side):
+#   free    → 10 / month
+#   plus    → 30 / month
+#   premium → unlimited
+#
+# Cache: users/{uid}/taskContent/{taskId}. A cache hit is FREE — it never
+# spends a monthly credit. Only a fresh generation (first open, or an
+# explicit forceRefresh) spends one. Content about a task doesn't go stale,
+# so the cache has no TTL; regeneration is user-driven.
+
+_TASK_CONTENT_MONTHLY_CAP = {"free": 10, "plus": 30}  # premium → unlimited
+
+_TASK_CONTENT_SYSTEM_PROMPT = (
+    "You generate PRACTICE MATERIAL for a single step of a user's plan. The "
+    "user will WORK THROUGH whatever you produce — so output the actual "
+    "material to practice with, NOT an explanation of how to do the step and "
+    "NOT tips about technique.\n\n"
+    "What 'practice material' means by domain:\n"
+    "- language / study: the real items to drill — vocab lists with meanings, "
+    "example sentences, fill-in-the-blank or translation exercises, flashcard "
+    "pairs, short problems to solve.\n"
+    "- writing: a concrete writing prompt plus a short scaffold to write into.\n"
+    "- fitness / skill: the exact sets, reps, or drill sequence to perform now.\n"
+    "- general: a ready-to-do mini-exercise that realizes the step.\n\n"
+    "LANGUAGE: write the material in the SAME language as the practice step "
+    "text. If the step is about learning a target language, produce the "
+    "material IN that target language (a brief instruction line may be in the "
+    "user's language). Match the prompt — do not default to English.\n\n"
+    "Voice: direct and usable. No preamble, no meta commentary, no emoji.\n\n"
+    "Hard rules:\n"
+    "1. Return ONLY valid JSON. No markdown fences, no preamble.\n"
+    "2. `content`: the practice material itself, 60–160 words (a compact list "
+    "is fine). Ready to use immediately. Give the thing to practice — do NOT "
+    "explain how to do it or add tips.\n"
+    "3. `quiz`: 0 to 3 questions, included ONLY if checking the material helps "
+    "(recall, correct form, comprehension). For pure-doing material, return an "
+    "EMPTY array []. Each item MUST have: 'question', 'choices' (array of "
+    "EXACTLY 4 distinct strings), 'answerIndex' (integer 0–3), and "
+    "'explanation' (one sentence). The quiz MUST be in the same language as "
+    "`content`.\n"
+    "4. Questions must be answerable from `content`. Exactly one choice is "
+    "correct per question.\n\n"
+    "Output JSON shape (quiz may be empty):\n"
+    "{\n"
+    '  "content": "<practice material, 60–160 words>",\n'
+    '  "quiz": [\n'
+    '    {"question":"...","choices":["...","...","...","..."],'
+    '"answerIndex":0,"explanation":"..."}\n'
+    "  ]\n"
+    "}\n"
+)
+
+
+def _task_content_model_bundle(_tier: str = "free") -> Tuple[str, int, str]:
+    """All signed-in tiers use the flagship model for practice-step material.
+
+    Upsell is monthly credits (free 10 / plus 30 tasks per month, premium
+    unlimited), not model quality. Returns (model_id, max_completion_tokens, model_tier).
+    """
+    return COACH_MODEL_PREMIUM, 1400, "flagship"
+
+
+def _task_content_response_extras(
+    _tier: str,
+    model: Optional[str] = None,
+    model_tier: Optional[str] = None,
+) -> Dict[str, Any]:
+    bundle_model, _, bundle_tier = _task_content_model_bundle()
+    return {
+        "model_used": model or bundle_model,
+        "model_tier": model_tier or bundle_tier,
+        "quality_upsell": False,
+    }
+
+
+_TASK_CONTENT_CHARGED_MAP_MAX = 64  # bound Firestore doc size for premium months
+
+
+def _trim_charged_tasks_map(charged: Dict[str, Any]) -> Dict[str, Any]:
+    if not charged or len(charged) <= _TASK_CONTENT_CHARGED_MAP_MAX:
+        return charged or {}
+    # Keep the most recently inserted keys (Py3.7+ dict preserves insertion).
+    keys = list(charged.keys())[-_TASK_CONTENT_CHARGED_MAP_MAX:]
+    return {k: charged[k] for k in keys}
+
+
+def _evo_task_content_db():
+    """Firestore for EVO app user data (evoforluanching), not the scheduler project."""
+    try:
+        from evo_firebase import evo_firestore
+        db = evo_firestore()
+        if db is not None:
+            return db
+    except Exception as e:
+        logger.warning("EVO Firestore unavailable: %s", e)
+    return firestore.client()
+
+
+def _coach_tier_for_uid(uid: str) -> str:
+    """Read coachSubscription from the EVO app Firestore project."""
+    if not uid:
+        return "free"
+    try:
+        snap = (_evo_task_content_db().collection("users").document(uid)
+                .collection("coachSubscription").document("current").get())
+        if not snap.exists:
+            return "free"
+        data = snap.to_dict() or {}
+        persisted = (data.get("tier") or "free").lower()
+        if persisted not in ("plus", "premium"):
+            return "free"
+        expires_at = data.get("expiresAt")
+        if expires_at:
+            try:
+                if hasattr(expires_at, "timestamp") and expires_at.timestamp() < time.time():
+                    return "free"
+            except Exception:
+                pass
+        return persisted
+    except Exception as e:
+        logger.warning("task_content: subscription lookup failed for %s: %s", uid, e)
+        return "free"
+
+
+def _resolve_task_content_uid_tier(
+    req: https_fn.Request, payload: Dict[str, Any]
+) -> Tuple[Optional[str], str]:
+    """Resolve uid/tier for practice-step content (EVO app project).
+
+    The hosting CF project differs from evoforluanching, so default
+    verify_id_token often fails. We verify against EVO when configured,
+    else accept client uid when a Bearer token is present.
+    """
+    uid, tier = _verify_coach_tier(req)
+    if uid:
+        tier = _coach_tier_for_uid(uid)
+        return uid, tier
+
+    auth_header = req.headers.get("Authorization") or req.headers.get("authorization") or ""
+    if not auth_header.lower().startswith("bearer "):
+        return None, "free"
+    token = auth_header.split(" ", 1)[1].strip()
+    if not token:
+        return None, "free"
+
+    client_uid = (payload.get("uid") or "").strip()
+    evo_uid = None
+    try:
+        from evo_firebase import verify_evo_id_token
+        evo_uid = verify_evo_id_token(token)
+    except Exception as e:
+        logger.warning("EVO token verify import failed: %s", e)
+
+    if evo_uid:
+        return evo_uid, _coach_tier_for_uid(evo_uid)
+    if client_uid:
+        logger.info(
+            "task_content: client uid fallback for %s (set EVO_FIREBASE_SERVICE_ACCOUNT_JSON)",
+            client_uid[:8],
+        )
+        return client_uid, _coach_tier_for_uid(client_uid)
+    return None, "free"
+
+
+def _task_content_quota_peek(
+    uid: str, tier: str, tz_offset_minutes: Any = 0, task_quota_key: Optional[str] = None
+) -> Tuple[bool, int, Optional[int], bool]:
+    """Read monthly quota without spending a credit.
+
+    Returns (allowed, current_count, cap, already_charged_for_task).
+    Quota is PER TASK (task_quota_key), not per step."""
+    cap = _TASK_CONTENT_MONTHLY_CAP.get(tier)
+    is_unlimited = tier == "premium"
+    if not uid:
+        return (True, 0, cap, False)
+    task_key = (task_quota_key or "").strip() or "_unknown"
+    try:
+        db = _evo_task_content_db()
+        ref = (db.collection("users").document(uid)
+                 .collection("taskContent_usage")
+                 .document(_local_period_key(tz_offset_minutes, "%Y-%m")))
+        snap = ref.get()
+        data = snap.to_dict() if snap.exists else {}
+        current = int(data.get("count", 0) or 0)
+        charged = data.get("tasks") or {}
+        if charged.get(task_key):
+            return (True, current, cap, True)
+        if (not is_unlimited) and cap is not None and current >= cap:
+            return (False, current, cap, False)
+        return (True, current, cap, False)
+    except Exception as e:
+        logger.warning("task content quota peek failed for %s: %s — allowing", uid, e)
+        return (True, 0, cap, False)
+
+
+def _task_content_quota_commit(
+    uid: str, tier: str, tz_offset_minutes: Any = 0, task_quota_key: Optional[str] = None
+) -> Tuple[int, Optional[int]]:
+    """Spend one monthly credit for this task after a successful generation.
+    No-op if this task was already charged this month."""
+    cap = _TASK_CONTENT_MONTHLY_CAP.get(tier)
+    is_unlimited = tier == "premium"
+    if not uid:
+        return (0, cap)
+    task_key = (task_quota_key or "").strip() or "_unknown"
+    try:
+        db = _evo_task_content_db()
+        ref = (db.collection("users").document(uid)
+                 .collection("taskContent_usage")
+                 .document(_local_period_key(tz_offset_minutes, "%Y-%m")))
+        transaction = db.transaction()
+
+        @firestore.transactional
+        def _txn(tx):
+            snap = ref.get(transaction=tx)
+            data = snap.to_dict() if snap.exists else {}
+            current = int(data.get("count", 0) or 0)
+            charged = dict(data.get("tasks") or {})
+            if charged.get(task_key):
+                return (current, cap)
+            if (not is_unlimited) and cap is not None and current >= cap:
+                return (current, cap)
+            charged[task_key] = True
+            charged = _trim_charged_tasks_map(charged)
+            new_count = current + 1
+            tx.set(ref, {"count": new_count, "tier": tier, "tasks": charged,
+                         "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True)
+            return (new_count, cap)
+
+        return _txn(transaction)
+    except Exception as e:
+        logger.warning("task content quota commit failed for %s: %s", uid, e)
+        return (0, cap)
+
+
+def _task_content_cache_get(uid: str, task_id: str) -> Optional[Dict[str, Any]]:
+    if not uid or not task_id:
+        return None
+    try:
+        snap = (_evo_task_content_db().collection("users").document(uid)
+                  .collection("taskContent").document(task_id).get())
+        if not snap.exists:
+            return None
+        return snap.to_dict() or None
+    except Exception as e:
+        logger.warning("task content cache read failed for %s/%s: %s", uid, task_id, e)
+        return None
+
+
+def _task_content_cache_set(uid: str, task_id: str, payload: Dict[str, Any]) -> None:
+    if not uid or not task_id:
+        return
+    try:
+        (_evo_task_content_db().collection("users").document(uid)
+            .collection("taskContent").document(task_id)
+            .set({**payload, "generatedAt": firestore.SERVER_TIMESTAMP}, merge=True))
+    except Exception as e:
+        logger.warning("task content cache write failed for %s/%s: %s", uid, task_id, e)
+
+
+def _normalize_quiz(raw_quiz: Any) -> List[Dict[str, Any]]:
+    """Defensive server-side quiz validation. Drops malformed items; keeps
+    only questions with exactly 4 string choices and an in-range answerIndex."""
+    out = []
+    if not isinstance(raw_quiz, list):
+        return out
+    for q in raw_quiz[:4]:
+        if not isinstance(q, dict):
+            continue
+        question = str(q.get("question", "")).strip()
+        choices = q.get("choices")
+        if not question or not isinstance(choices, list) or len(choices) != 4:
+            continue
+        norm_choices = [str(c).strip()[:200] for c in choices]
+        if any(not c for c in norm_choices):
+            continue
+        try:
+            answer_index = int(q.get("answerIndex"))
+        except (TypeError, ValueError):
+            continue
+        if answer_index < 0 or answer_index > 3:
+            continue
+        out.append({
+            "question": question[:400],
+            "choices": norm_choices,
+            "answerIndex": answer_index,
+            "explanation": str(q.get("explanation", "")).strip()[:400],
+        })
+    return out
+
+
+@https_fn.on_request(
+    memory=1024,
+    max_instances=20,
+    timeout_sec=120,
+    cpu=1,
+    secrets=[_EVO_FIREBASE_SA_SECRET],
+)
+def generate_task_content(req: https_fn.Request) -> https_fn.Response:
+    """Generate practice-step drill material + optional quiz.
+
+    Tier + monthly quota verified server-side; per-task cache is free.
+    Model: flagship (gpt-5.4) for all tiers; Free/Plus are capped per month."""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+
+    if req.method != 'POST':
+        return create_response(
+            success=False, message='Method not allowed',
+            error='Only POST method is allowed', status_code=405,
+        )
+
+    try:
+        payload = req.get_json(silent=True) or {}
+        task_id = (payload.get("taskId") or "").strip()
+        # Real task id for quota accounting (one credit per task, not per
+        # step). Falls back to the cache id when the client doesn't send it.
+        task_quota_key = (payload.get("taskQuotaKey") or "").strip() or task_id
+        task_title = (payload.get("taskTitle") or "").strip()
+        task_category = (payload.get("taskCategory") or "").strip()
+        task_detail = (payload.get("taskDetail") or "").strip()
+        plan_name = (payload.get("planName") or "").strip()
+        language_selected = (
+            payload.get("languageSelected") or payload.get("language") or "english"
+        ).lower()
+        force_refresh = bool(payload.get("forceRefresh", False))
+        tz_offset_minutes = payload.get("tzOffsetMinutes", 0)
+        step_fingerprint = (payload.get("stepFingerprint") or "").strip()[:64]
+        plan_day_number = payload.get("planDayNumber")
+        user_state = payload.get("userState") if isinstance(payload.get("userState"), dict) else {}
+
+        if not task_id or not task_title:
+            return create_response(
+                success=False, message='Missing required fields',
+                error='`taskId` and `taskTitle` are required', status_code=400,
+            )
+        if (len(task_title) > 400 or len(task_detail) > 4000
+                or len(task_category) > 120 or len(plan_name) > 200):
+            return create_response(
+                success=False, message='Payload too large',
+                error='Task content payload exceeds size limits.', status_code=413,
+            )
+
+        uid, tier = _resolve_task_content_uid_tier(req, payload)
+        is_paid = tier in ("plus", "premium")
+
+        if not _coach_rate_allow(uid or "", is_paid):
+            return create_response(
+                success=False, message='Rate limit',
+                error='Too many requests in a short window. Try again soon.',
+                status_code=429,
+            )
+
+        # 1) Cache check — free, never spends quota.
+        if uid and not force_refresh:
+            cached = _task_content_cache_get(uid, task_id)
+            if cached and cached.get("content"):
+                cached_fp = (cached.get("stepFingerprint") or "").strip()
+                if not step_fingerprint or not cached_fp or cached_fp == step_fingerprint:
+                    _allowed, count, cap, _charged = _task_content_quota_peek(
+                        uid, tier, tz_offset_minutes, task_quota_key
+                    )
+                    return create_response(
+                        data={
+                            "content": cached.get("content"),
+                            "quiz": cached.get("quiz") or [],
+                            "tier": tier,
+                            "source": "cache",
+                            "used": count,
+                            "cap": cap,
+                            **_task_content_response_extras(
+                                tier,
+                                cached.get("model_used"),
+                                cached.get("model_tier"),
+                            ),
+                        },
+                        message='Task content (cached)',
+                    )
+
+        if not uid:
+            return create_response(
+                success=False, message='Sign in required',
+                error='Sign in to generate practice material for this step. '
+                      'Make sure you are logged in and try again.',
+                status_code=401,
+            )
+
+        # 2) Monthly quota peek — credit spent only after successful generation.
+        allowed, count, cap, _already_charged = _task_content_quota_peek(
+            uid, tier, tz_offset_minutes, task_quota_key
+        )
+        if not allowed:
+            return create_response(
+                success=False, message='Monthly limit reached',
+                error='You have used your task learning generations this month. '
+                      'Upgrade for more.',
+                status_code=402,
+                metadata={"capReached": True, "tier": tier, "cap": cap, "used": count},
+            )
+
+        # 3) Generate. Lead the prompt with the STEP TEXT so the language
+        #    detector (and the model) key off the practice step itself — the
+        #    output language follows the prompt, not the app's UI language.
+        model, max_tokens, model_tier = _task_content_model_bundle(tier)
+        user_prompt_lines = [f"PRACTICE STEP: {task_title}"]
+        if task_detail:
+            user_prompt_lines.append(task_detail)
+        if task_category:
+            user_prompt_lines.append(f"(category: {task_category})")
+        if plan_name:
+            user_prompt_lines.append(f"(plan: {plan_name})")
+        if plan_day_number is not None:
+            try:
+                user_prompt_lines.append(f"(plan day {int(plan_day_number)})")
+            except (TypeError, ValueError):
+                pass
+        if user_state.get("restDayFlag"):
+            user_prompt_lines.append(
+                "(recovery: rest day — shorter, lighter drill material; no guilt.)"
+            )
+        if user_state.get("missedYesterday"):
+            user_prompt_lines.append(
+                "(recovery: missed yesterday — gentle return rep; no streak shame.)"
+            )
+        user_prompt_lines.append("")
+        user_prompt_lines.append(
+            "Produce ready-to-use PRACTICE MATERIAL for this step (plus a quiz "
+            "only if it helps), in the same language as the step, per the JSON "
+            "contract."
+        )
+        user_prompt = "\n".join(user_prompt_lines)
+
+        logger.info(
+            "generate_task_content: uid=%s tier=%s model=%s task_id=%s peek_used=%s/%s",
+            uid, tier, model, task_id, count, cap if cap is not None else "∞",
+        )
+
+        from chatgpt_wrapper import chat_with_gpt
+        response_text = chat_with_gpt(
+            system_prompt=_TASK_CONTENT_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            model=model,
+            max_completion_tokens=max_tokens,
+            # Follow the step/prompt language (detected from user_prompt), not
+            # the UI language — so material matches what's being practiced.
+            auto_detect_language=True,
+        )
+
+        if not response_text or not response_text.strip():
+            return create_response(
+                success=False, message='Empty model response',
+                error='Could not generate content right now. Try again.',
+                status_code=502,
+            )
+
+        raw = response_text.strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.lower().startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            logger.warning("generate_task_content: JSON parse failed uid=%s", uid)
+            return create_response(
+                success=False, message='Bad model output',
+                error='The content came back malformed. Try again.', status_code=502,
+            )
+
+        content = (parsed.get("content") or "").strip() if isinstance(parsed, dict) else ""
+        quiz = _normalize_quiz(parsed.get("quiz") if isinstance(parsed, dict) else None)
+        if not content:
+            return create_response(
+                success=False, message='Bad model output',
+                error='No content produced. Try again.', status_code=502,
+            )
+
+        count, cap = _task_content_quota_commit(
+            uid, tier, tz_offset_minutes, task_quota_key
+        )
+        normalized = {
+            "content": content,
+            "quiz": quiz,
+            "stepFingerprint": step_fingerprint or None,
+            "model_used": model,
+            "model_tier": model_tier,
+        }
+        _task_content_cache_set(uid, task_id, normalized)
+
+        return create_response(
+            data={
+                "content": content,
+                "quiz": quiz,
+                "tier": tier,
+                "source": "fresh",
+                "used": count,
+                "cap": cap,
+                **_task_content_response_extras(tier, model, model_tier),
+            },
+            message='Task content generated',
+        )
+
+    except Exception as e:
+        logger.error("generate_task_content error: %s", e)
+        traceback.print_exc()
+        return create_response(
+            success=False, message='Task content failed',
+            error="We couldn't generate this right now. Try again in a moment.",
+            status_code=500,
         )
 
 
@@ -2647,12 +3192,21 @@ def encourage_in_the_morning(req: https_fn.Request) -> https_fn.Response:
         
         user_context = None
         month_context = None
+        morning_mode = data.get("morning_mode") or "todo_coach"
+        rag_queries = {
+            "todo_coach": "morning encouragement today tasks schedule",
+            "love_warmth": "morning warmth self compassion belonging",
+            "funny_boost": "morning humor playful encouragement",
+            "identity_cheer": "streak identity becoming growth morning",
+            "gentle_rest": "rest recovery gentle morning no pressure",
+        }
+        rag_query = rag_queries.get(str(morning_mode).strip().lower(), rag_queries["todo_coach"])
         user_id = data.get('user_id')
         if user_id and isinstance(user_id, str) and user_id.strip():
             user_id = user_id.strip()
             try:
                 from user_memory import retrieve_user_context
-                user_context = retrieve_user_context(user_id, "morning encouragement today tasks", top_k=5)
+                user_context = retrieve_user_context(user_id, rag_query, top_k=5)
             except Exception as e:
                 logger.warning("RAG retrieval failed in encourage_in_the_morning: %s", e)
             month_context = _month_context_for_user(user_id, data)
@@ -2665,6 +3219,7 @@ def encourage_in_the_morning(req: https_fn.Request) -> https_fn.Response:
             earned_runes=data.get('earned_runes'),
             behavior_stats=data.get('behavior_stats'),
             identity_context=data.get('identity_context'),
+            morning_mode=morning_mode,
         )
         return create_response(
             data={'response': response},

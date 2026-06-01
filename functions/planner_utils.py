@@ -3,7 +3,7 @@
 import logging
 import json
 import re
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import dataclass
 from enum import Enum
 
@@ -565,6 +565,45 @@ class PlannerUtils:
             logger.error(f"Failed to get todo information: {str(e)}")
             return "I'm here to help! Could you tell me more about what you'd like to know? 😊"
 
+    def _morning_mode_prompts(self, mode: str, language: str, total_tasks: int) -> Tuple[str, str]:
+        """Return (system_prompt, user_task_suffix) for a morning push personality."""
+        normalized = (mode or "todo_coach").strip().lower()
+        char_limit = "Your response MUST be 180 characters or less (including spaces and emojis)."
+        voice = (
+            "You are Evo — a warm, lively friend who texts the user at 8 AM. "
+            "Sound human, friendly, gently funny when appropriate, never preachy or corporate. "
+            "Use 1–2 emojis max. No lucky/auspicious colors. No guilt about streaks. "
+            f"{char_limit} Write entirely in the user's language ({language})."
+        )
+
+        mode_specs = {
+            "todo_coach": (
+                voice + " Energize them for today's tasks: mention task count and 1–2 times if they fit.",
+                "Give a punchy morning coach line about today's todos — practical, upbeat, zero nagging.",
+            ),
+            "love_warmth": (
+                voice + " Self-compassion and heart energy — like a kind friend, not a romance novel.",
+                "Write a warm morning love-note to the reader (self-love / gentle belonging). No task list required.",
+            ),
+            "funny_boost": (
+                voice + " Light, wholesome humor — playful, never sarcastic or mean. One tiny joke OK.",
+                "Make them smile this morning with gentle humor plus real encouragement.",
+            ),
+            "identity_cheer": (
+                voice + " Celebrate who they're becoming — streaks, runes, badges as proof of growth.",
+                "Cheer them on using identity/streak/rune context if provided; focus on becoming, not doing.",
+            ),
+            "gentle_rest": (
+                voice + " Cozy permission to breathe when the day is light — still hopeful, never lazy-shaming.",
+                "They may have few or no todos — validate rest, soft momentum, or a tiny optional step.",
+            ),
+        }
+
+        if normalized not in mode_specs:
+            normalized = "todo_coach"
+        system_extra, user_task = mode_specs[normalized]
+        return system_extra, user_task
+
     def morning_message(
         self,
         today_todo_list_data: List[Dict[str, Any]],
@@ -574,70 +613,46 @@ class PlannerUtils:
         earned_runes: Optional[List[Dict[str, Any]]] = None,
         behavior_stats: Optional[Dict[str, Any]] = None,
         identity_context: Optional[Dict[str, Any]] = None,
+        morning_mode: Optional[str] = "todo_coach",
     ) -> Optional[str]:
         """
-        Generate a compact morning message summarizing today's tasks for notification.
-        
-        Args:
-            today_todo_list_data: List of todo items for today
-            language: Language for the response
-            user_context: Optional RAG context (e.g. from user memory) to personalize the message
-            month_context: Optional previous/current/next month data to improve relevance
-        Returns:
-            Compact notification message with task summary, or None if no tasks
+        Generate a compact morning push message. ``morning_mode`` rotates personality:
+        todo_coach, love_warmth, funny_boost, identity_cheer, gentle_rest.
         """
         try:
-            if not today_todo_list_data:
-                logger.info("No tasks found for morning message")
-                return None
+            normalized_mode = (morning_mode or "todo_coach").strip().lower()
+            total_tasks = len(today_todo_list_data or [])
 
-            total_tasks = len(today_todo_list_data)
-            
-            # Build concise prompt
-            system_prompt = """You are Evo, a friendly AI assistant creating compact morning notifications for busy users.
+            if normalized_mode == "todo_coach" and total_tasks == 0:
+                logger.info("todo_coach mode with no tasks — falling back to gentle_rest tone")
+                normalized_mode = "gentle_rest"
 
-CRITICAL CONSTRAINT: Your response MUST be exactly 150 characters or less (including all spaces, emojis, and punctuation).
-
-OUTPUT FORMAT:
-- Start with a warm greeting or brief motivational phrase (5-15 chars)
-- Include the task count (e.g., "3 tasks today" or "5 todos")
-- Add 1-2 relevant emojis for visual appeal
-- Include today's auspicious color
-- Use clear, scannable language - no filler words
-
-PRIORITY ORDER (fit what you can within 150 chars):
-1. Greeting/motivation + task count (required)
-2. Task summary with schedule time (e.g., "Meeting 9AM, Report 2PM")
-3. Today's fate/fortune prediction with auspicious color (brief positive outlook)
-
-EXAMPLES OF GOOD OUTPUT:
-- "Good morning! 🌅 4 tasks: Meeting 9AM, Report 2PM. Fate: Productive day! Lucky color: Blue 💪"
-- "Hey! ☀️ 3 todos: Call 10AM, Review 3PM. Success awaits! Wear Green 🍀"
-- "Morning! ✨ 5 tasks starting 8AM. Great things coming! Auspicious color: Gold 🎉"
-
-Remember: Include task times, fate/fortune prediction, and auspicious color."""
-            
-            # Format tasks with minimal info
-            tasks_info = "\n".join([
-                f"• {task.get('title', 'Task')[:30]} - {task.get('detail', '')} - {task.get('start', '')}"
-                for task in today_todo_list_data  # Show only 2 tasks
-            ])
-
-            remaining = total_tasks - 2 if total_tasks > 2 else 0
-            if remaining:
-                tasks_info += f"\n• +{remaining} more"
-            
-            user_prompt = (
-                f"Morning notification for {total_tasks} tasks:\n{tasks_info}\n"
-                "Include task summary with schedule times, today's fate/fortune prediction, and auspicious color. Keep it concise but helpful. Include count and 1-2 emojis. Maximum 150 characters."
+            system_prompt, user_task = self._morning_mode_prompts(
+                normalized_mode, language, total_tasks
             )
+
+            tasks_info = ""
+            if total_tasks > 0:
+                tasks_info = "\n".join([
+                    f"• {task.get('title', 'Task')[:30]} - {task.get('start', '')}"
+                    for task in today_todo_list_data[:4]
+                ])
+                remaining = total_tasks - 4 if total_tasks > 4 else 0
+                if remaining:
+                    tasks_info += f"\n• +{remaining} more"
+
+            user_prompt = user_task
+            if total_tasks > 0:
+                user_prompt += f"\n\nToday's tasks ({total_tasks}):\n{tasks_info}"
+            else:
+                user_prompt += "\n\nToday's tasks: none or very light."
+
             if user_context:
-                context_block = "\n".join(f"• {c}" for c in user_context[:10])
+                context_block = "\n".join(f"• {c}" for c in user_context[:8])
                 user_prompt = (
-                    f"Relevant user context (use to personalize and suggest schedule optimization):\n{context_block}\n\n"
-                    f"TASK: {user_prompt} "
-                    "If context suggests a quick schedule tip (e.g. buffer time, best focus time) and it fits within 150 characters, include it."
+                    f"Relevant user context:\n{context_block}\n\n{user_prompt}"
                 )
+
             month_block = _format_month_context(month_context)
             if month_block:
                 user_prompt = f"{month_block}\n\n{user_prompt}"
@@ -646,40 +661,36 @@ Remember: Include task times, fate/fortune prediction, and auspicious color."""
             grounding_lines = []
             if earned:
                 grounding_lines.append(
-                    "Earned Elder Futhark identities (real unlocks): "
-                    + "; ".join(f"{e['name']} ({e['key']})" for e in earned[:10])
-                    + (" …" if len(earned) > 10 else "")
+                    "Earned rune identities: "
+                    + "; ".join(f"{e['name']} ({e['key']})" for e in earned[:8])
+                    + (" …" if len(earned) > 8 else "")
                 )
             if isinstance(behavior_stats, dict) and behavior_stats:
-                grounding_lines.append(
-                    "Behavior stats: " + json.dumps(behavior_stats, ensure_ascii=False)[:400]
-                )
+                streak = behavior_stats.get("current_streak")
+                if streak:
+                    grounding_lines.append(f"Current streak: {streak}")
             if isinstance(identity_context, dict) and identity_context:
                 id_block = _format_identity_context(identity_context)
                 if id_block.strip():
-                    grounding_lines.append("Identity profile:\n" + id_block[:900])
+                    grounding_lines.append("Identity profile:\n" + id_block[:600])
             if grounding_lines:
                 user_prompt = "\n".join(grounding_lines) + "\n\n" + user_prompt
-                system_prompt += (
-                    "\n\nWhen character budget is tight, prefer a nod to earned runes / streak "
-                    "over auspicious or lucky colors."
-                )
-            
-            # Make API call with optimized parameters
-            # Note: max_completion_tokens is for token limit, not character limit
-            # 150 characters needs ~100 tokens for English, ~200+ for Thai due to encoding
+
             response = self._safe_chat_call(
-                system_prompt, 
+                system_prompt,
                 user_prompt,
-                max_completion_tokens=300,  # Enough tokens for 150-char response in any language
-                temperature=1.0,  # Balance between creativity and consistency
-                language=language
+                max_completion_tokens=320,
+                temperature=1.05,
+                language=language,
             )
-            
-            
-            logger.info(f"Morning message generated successfully for {total_tasks} tasks")
+
+            logger.info(
+                "Morning message generated (mode=%s, tasks=%s)",
+                normalized_mode,
+                total_tasks,
+            )
             return response
-            
+
         except Exception as e:
             logger.error(f"Failed to generate morning message: {str(e)}")
             return None
@@ -1339,11 +1350,11 @@ Remember: Include task times, fate/fortune prediction, and auspicious color."""
                 )
 
             system_prompt = (
-                "You are Evo, a supportive rune guide. "
-                "Create a short daily message based on the user's todo context. "
+                "You are Evo, a warm rune guide texting the user at 8 AM. "
+                "Sound friendly, lightly mystical, never doom-y. "
                 f"{divination_instruction} "
                 "Do not mention colors or lucky colors. "
-                "Keep it concise but helpful. Include 1-2 emojis. Maximum 150 characters."
+                "Keep it lively and encouraging. Include 1-2 emojis. Maximum 180 characters."
             )
             ctx_bits = []
             if stats:
@@ -1370,7 +1381,9 @@ Remember: Include task times, fate/fortune prediction, and auspicious color."""
                 )
                 system_prompt += (
                     " You may nod briefly to one earned-identity theme when it fits; "
-                    "still give today's one-rune draw as instructed."
+                    "still give today's one-rune draw as instructed. "
+                    "If the user has structured plan todos, you may hint at doing one "
+                    "practice step (drill material) before the day ends — no streak guilt."
                 )
             if not todo_data:
                 user_prompt = (
@@ -1457,6 +1470,7 @@ def message_in_the_morning(
     earned_runes: Optional[List[Dict[str, Any]]] = None,
     behavior_stats: Optional[Dict[str, Any]] = None,
     identity_context: Optional[Dict[str, Any]] = None,
+    morning_mode: Optional[str] = "todo_coach",
 ) -> Optional[str]:
     """Backward compatibility function for message in the morning"""
     planner = get_default_planner()
@@ -1468,6 +1482,7 @@ def message_in_the_morning(
         earned_runes=earned_runes,
         behavior_stats=behavior_stats,
         identity_context=identity_context,
+        morning_mode=morning_mode,
     )
 
 def summarize_end_of_the_week_at_friday(
