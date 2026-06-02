@@ -1011,7 +1011,7 @@ def coach_review(req: https_fn.Request) -> https_fn.Response:
 # =========================
 # Generates a small "scenario card" the user opens on dateScreenFull to
 # rehearse the upcoming rep mentally before doing it. Format is fixed
-# (one situation + 3 choices + a non-judgmental note); variety comes from
+# (one situation + 5 choices + a non-judgmental note); variety comes from
 # scenario *content*, gated by an anti-repeat list passed from the client.
 #
 # Tiering — verified server-side via _verify_coach_tier:
@@ -1034,26 +1034,46 @@ _PRACTICE_HISTORY_LIMIT = 10
 #   adjust   → change the approach or scope
 #   avoid    → disengage / escape
 _PRACTICE_INTENTS = {"recovery", "persist", "adjust", "avoid"}
+_PRACTICE_CHOICE_COUNT = 5
+
+_PRACTICE_INTENT_ANALYSIS_SYSTEM = (
+    "You decide how to frame ONE practice scenario card before it is written.\n"
+    "Goal: help the user DEVELOP A NEW SKILL through mental rehearsal — a "
+    "specific micro-skill drawn from their planner arc, not generic motivation.\n"
+    "Return ONLY valid JSON (no markdown). Fields:\n"
+    "- replyLanguage: full language name for the card (e.g. English, Thai, "
+    "Chinese, Japanese, Korean, French). Infer from PLANNER CONTENT INTENT "
+    "(user_intent, arc_summary, identity_line, day_focus, task text) — the "
+    "language the user is practicing IN or learning toward. If the plan is "
+    "about learning a target language, write the card IN that target language. "
+    "Use UI locale ONLY when all content is language-neutral.\n"
+    "- practiceFocus: one short phrase naming the skill or micro-skill to "
+    "rehearse (e.g. 'recover after a missed rep without quitting', "
+    "'hold form under fatigue', 'use the new vocab in a real sentence').\n"
+    '{"replyLanguage":"...","practiceFocus":"..."}'
+)
 
 _PRACTICE_SYSTEM_PROMPT_BASE = (
     "You generate ONE 'scenario card' for a user about to do a task in the "
     "EVO app — a behavior-change tool grounded in neuroplasticity (consistent "
     "recoverable repetition, not streaks).\n\n"
-    "Goal of the card: help the user mentally rehearse the rep before they do "
-    "it. There is NO correct answer; picking is the rep.\n\n"
+    "Goal of the card: help the user DEVELOP A NEW SKILL by mentally rehearsing "
+    "a realistic moment before they do the rep. Ground the scenario in the "
+    "planner arc and the PRACTICE INTENT when provided. There is NO correct "
+    "answer; picking is the rep.\n\n"
     "Voice: warm, direct, concrete. Second-person. No moralizing. No toxic "
     "positivity. No emoji. No scores, no badges, no streaks.\n\n"
     "Hard rules:\n"
     "1. Return ONLY valid JSON. No markdown fences. No preamble.\n"
     "2. `situation` is 1–2 sentences, concrete, grounded in the actual task.\n"
-    "3. `choices` MUST be exactly 3 items, each with keys 'key' (a/b/c), "
-    "'label' (under 90 chars, plausible real action, not a joke option), and "
-    "'intent'.\n"
+    f"3. `choices` MUST be exactly {_PRACTICE_CHOICE_COUNT} items, each with "
+    "keys 'key' (a/b/c/d/e), 'label' (under 90 chars, plausible real action, "
+    "not a joke option), and 'intent'.\n"
     "4. Each choice's `intent` MUST be EXACTLY one of: 'recovery' "
     "(reset/regroup then continue), 'persist' (push through as-is), 'adjust' "
-    "(change the approach or scope), 'avoid' (disengage/escape). The three "
-    "choices SHOULD span different intents so the user's pick is informative — "
-    "never make all three the same intent.\n"
+    "(change the approach or scope), 'avoid' (disengage/escape). The five "
+    "choices SHOULD span different intents where possible so the user's pick "
+    "is informative — never make all five the same intent.\n"
     "5. `afterChoiceNote` is ONE short sentence reframing the activity as "
     "noticing — not winning.\n"
     "6. `scenarioId` is a kebab-case theme (e.g. 'distraction-at-15min', "
@@ -1063,15 +1083,26 @@ _PRACTICE_SYSTEM_PROMPT_BASE = (
     "8. Avoid scenario themes listed in `recent_scenarios`.\n"
 )
 
+def _practice_choice_key(index: int) -> str:
+    return chr(ord("a") + index)
+
+
+def _practice_choice_json_template() -> str:
+    keys = [_practice_choice_key(i) for i in range(_PRACTICE_CHOICE_COUNT)]
+    lines = [
+        f'    {{"key":"{k}","label":"...","intent":"recovery|persist|adjust|avoid"}},'
+        for k in keys
+    ]
+    return "\n".join(lines)
+
+
 _PRACTICE_SYSTEM_PROMPT_FREE = _PRACTICE_SYSTEM_PROMPT_BASE + (
     "\nOutput JSON shape:\n"
     "{\n"
     '  "scenarioId": "<kebab-case>",\n'
     '  "situation": "<1–2 sentences>",\n'
     '  "choices": [\n'
-    '    {"key":"a","label":"...","intent":"recovery|persist|adjust|avoid"},\n'
-    '    {"key":"b","label":"...","intent":"recovery|persist|adjust|avoid"},\n'
-    '    {"key":"c","label":"...","intent":"recovery|persist|adjust|avoid"}\n'
+    + _practice_choice_json_template() + "\n"
     "  ],\n"
     '  "afterChoiceNote": "<one sentence>"\n'
     "}\n"
@@ -1083,9 +1114,7 @@ _PRACTICE_SYSTEM_PROMPT_PREMIUM = _PRACTICE_SYSTEM_PROMPT_BASE + (
     '  "scenarioId": "<kebab-case>",\n'
     '  "situation": "<1–2 sentences>",\n'
     '  "choices": [\n'
-    '    {"key":"a","label":"...","intent":"recovery|persist|adjust|avoid"},\n'
-    '    {"key":"b","label":"...","intent":"recovery|persist|adjust|avoid"},\n'
-    '    {"key":"c","label":"...","intent":"recovery|persist|adjust|avoid"}\n'
+    + _practice_choice_json_template() + "\n"
     "  ],\n"
     '  "afterChoiceNote": "<one sentence>",\n'
     '  "coachFollowUp": "<2–3 sentences a coach would say AFTER the user '
@@ -1206,6 +1235,317 @@ def _practice_strip_for_tier(card: Dict[str, Any], tier: str) -> Dict[str, Any]:
     return out
 
 
+def _derive_practice_context_from_content_ai(
+    content_ai: Any, plan_doc: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """Backfill practiceContext for plans saved before the field existed."""
+    if not isinstance(content_ai, dict):
+        return None
+    raw_days = content_ai.get("days")
+    if not isinstance(raw_days, list) or not raw_days:
+        return None
+
+    def _tips_str(tips: Any) -> Optional[str]:
+        if not tips:
+            return None
+        if isinstance(tips, list):
+            joined = " • ".join(str(t).strip() for t in tips if str(t).strip())
+            return joined[:300] if joined else None
+        s = str(tips).strip()
+        return s[:300] if s else None
+
+    days_out = []
+    for i, day in enumerate(raw_days[:90]):
+        if not isinstance(day, dict):
+            continue
+        meta = day.get("aiDayMeta") if isinstance(day.get("aiDayMeta"), dict) else {}
+        day_num = day.get("dayNumber") or meta.get("dayNumber") or (i + 1)
+        title = str(
+            meta.get("title") or day.get("title")
+            or (day.get("planDetail") or {}).get("headLine") or ""
+        ).strip()[:160]
+        summary = str(
+            meta.get("summary") or day.get("summary") or ""
+        ).strip()[:400]
+        tasks = day.get("tasks") or day.get("structuredTasks") or []
+        task_labels = []
+        if isinstance(tasks, list):
+            for t in tasks[:12]:
+                if not isinstance(t, dict):
+                    continue
+                label = str(t.get("text") or t.get("label") or "").strip()[:160]
+                if label:
+                    task_labels.append(label)
+        if not (title or summary or task_labels):
+            continue
+        days_out.append({
+            "dayNumber": int(day_num) if str(day_num).isdigit() else (i + 1),
+            "title": title,
+            "summary": summary,
+            "tips": _tips_str(meta.get("tips") or day.get("tips")),
+            "taskLabels": task_labels,
+        })
+
+    summary_obj = content_ai.get("summary")
+    plan_summary = ""
+    if isinstance(summary_obj, dict):
+        if summary_obj.get("overview"):
+            plan_summary = str(summary_obj["overview"])[:600]
+    elif isinstance(summary_obj, str):
+        plan_summary = summary_obj[:600]
+
+    coaching = plan_doc.get("coachingAttachment") or {}
+    becoming = None
+    if isinstance(coaching, dict) and coaching.get("becomingPhrase"):
+        becoming = str(coaching["becomingPhrase"])[:200]
+
+    return {
+        "version": 1,
+        "planName": str(content_ai.get("planName") or plan_doc.get("planName") or "")[:120],
+        "category": str(content_ai.get("category") or plan_doc.get("category") or "")[:60],
+        "totalDays": int(content_ai.get("totalDays") or len(days_out) or 0),
+        "planSummary": plan_summary or str(plan_doc.get("planDescription") or "")[:600],
+        "tags": [str(t)[:40] for t in (content_ai.get("tags") or [])[:12]],
+        "difficultyLevel": str(content_ai.get("difficultyLevel") or "")[:40] or None,
+        "detailPrompt": "",
+        "becomingPhrase": becoming,
+        "days": days_out,
+    }
+
+
+def _load_practice_plan_context(
+    uid: Optional[str], plan_id: str, plan_day_number: Any
+) -> Optional[Dict[str, Any]]:
+    """Load practiceContext from Firestore by planId (user plan, then newsfeed)."""
+    plan_id = (plan_id or "").strip()
+    if not plan_id:
+        return None
+    try:
+        db = firestore.client()
+        plan_doc: Optional[Dict[str, Any]] = None
+        if uid:
+            snap = (db.collection("users").document(uid)
+                      .collection("lifestyle-plans").document(plan_id).get())
+            if snap.exists:
+                plan_doc = snap.to_dict() or {}
+        if plan_doc is None:
+            snap = db.collection("lifestyle-plans-NewsFeed").document(plan_id).get()
+            if snap.exists:
+                plan_doc = snap.to_dict() or {}
+        if not plan_doc:
+            return None
+
+        ctx = plan_doc.get("practiceContext")
+        if not isinstance(ctx, dict) or not ctx.get("days"):
+            ctx = _derive_practice_context_from_content_ai(
+                plan_doc.get("contentAI"), plan_doc
+            )
+        if not isinstance(ctx, dict):
+            return None
+
+        try:
+            day_num = int(plan_day_number) if plan_day_number is not None else None
+        except (TypeError, ValueError):
+            day_num = None
+
+        day_slice = None
+        days = ctx.get("days") if isinstance(ctx.get("days"), list) else []
+        if day_num is not None and days:
+            for d in days:
+                if isinstance(d, dict) and d.get("dayNumber") == day_num:
+                    day_slice = d
+                    break
+            if day_slice is None and 1 <= day_num <= len(days):
+                candidate = days[day_num - 1]
+                if isinstance(candidate, dict):
+                    day_slice = candidate
+
+        return {
+            "planName": str(ctx.get("planName") or plan_doc.get("planName") or "")[:120],
+            "category": str(ctx.get("category") or plan_doc.get("category") or "")[:60],
+            "totalDays": int(ctx.get("totalDays") or len(days) or 0),
+            "planSummary": str(ctx.get("planSummary") or "")[:600],
+            "becomingPhrase": ctx.get("becomingPhrase"),
+            "difficultyLevel": ctx.get("difficultyLevel"),
+            "detailPrompt": str(ctx.get("detailPrompt") or "")[:400],
+            "dayNumber": day_num,
+            "day": day_slice,
+        }
+    except Exception as e:
+        logger.warning(
+            "practice plan context load failed plan_id=%s uid=%s: %s",
+            plan_id, uid or "anon", e,
+        )
+        return None
+
+
+def _format_practice_plan_context_block(plan_ctx: Dict[str, Any]) -> str:
+    """Turn loaded plan context into prompt lines for the LLM."""
+    lines = [
+        "PLAN CONTEXT (ground scenarios in this arc — do not invent unrelated goals):",
+        f"- plan: {plan_ctx.get('planName') or 'unnamed'}",
+        f"- category: {plan_ctx.get('category') or 'general'}",
+    ]
+    total = plan_ctx.get("totalDays")
+    if total:
+        lines.append(f"- total_days: {total}")
+    if plan_ctx.get("difficultyLevel"):
+        lines.append(f"- difficulty: {plan_ctx['difficultyLevel']}")
+    if plan_ctx.get("planSummary"):
+        lines.append(f"- arc_summary: {plan_ctx['planSummary']}")
+    if plan_ctx.get("becomingPhrase"):
+        lines.append(f"- identity_line: {plan_ctx['becomingPhrase']}")
+    if plan_ctx.get("detailPrompt"):
+        lines.append(f"- user_intent: {plan_ctx['detailPrompt']}")
+
+    day = plan_ctx.get("day")
+    day_num = plan_ctx.get("dayNumber")
+    if isinstance(day, dict):
+        lines.append(f"- today_is_plan_day: {day_num or day.get('dayNumber')}")
+        if day.get("title"):
+            lines.append(f"- day_title: {day['title']}")
+        if day.get("summary"):
+            lines.append(f"- day_focus: {day['summary']}")
+        if day.get("tips"):
+            lines.append(f"- day_tips: {day['tips']}")
+        labels = day.get("taskLabels") or []
+        if isinstance(labels, list) and labels:
+            lines.append(f"- day_steps: {labels[:8]}")
+    elif day_num is not None:
+        lines.append(f"- plan_day_number: {day_num}")
+
+    return "\n".join(lines)
+
+
+def _practice_analysis_blob(
+    task_title: str,
+    task_category: str,
+    task_detail: str,
+    plan_context_block: str,
+    plan_context: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Text bundle for intent analysis — planner intent fields first."""
+    lines: List[str] = []
+    if isinstance(plan_context, dict):
+        if plan_context.get("detailPrompt"):
+            lines.append(f"user_intent: {plan_context['detailPrompt']}")
+        if plan_context.get("becomingPhrase"):
+            lines.append(f"identity_line: {plan_context['becomingPhrase']}")
+        if plan_context.get("planSummary"):
+            lines.append(f"arc_summary: {plan_context['planSummary']}")
+        if plan_context.get("category"):
+            lines.append(f"plan_category: {plan_context['category']}")
+        day = plan_context.get("day")
+        if isinstance(day, dict):
+            if day.get("title"):
+                lines.append(f"day_title: {day['title']}")
+            if day.get("summary"):
+                lines.append(f"day_focus: {day['summary']}")
+            if day.get("tips"):
+                lines.append(f"day_tips: {day['tips']}")
+    if task_title:
+        lines.append(f"task_title: {task_title}")
+    if task_category:
+        lines.append(f"task_category: {task_category}")
+    if task_detail:
+        lines.append(f"task_detail: {task_detail}")
+    if plan_context_block:
+        lines.append(plan_context_block)
+    return "\n".join(p.strip() for p in lines if p and p.strip())
+
+
+def _practice_reply_language_fallback(
+    analysis_blob: str, language_selected: str
+) -> str:
+    """Detect language from content; UI locale is only a weak fallback."""
+    try:
+        from chatgpt_wrapper import LanguageDetector
+        if len(analysis_blob.strip()) >= 12:
+            code = LanguageDetector.detect_language(analysis_blob)
+            name = LanguageDetector.get_language_name(code)
+            if name and len(name) > 1 and name.lower() != code.lower():
+                return name
+    except Exception as e:
+        logger.warning("practice language detect fallback: %s", e)
+    if language_selected == "thai":
+        return "Thai"
+    return "English"
+
+
+def _analyze_practice_intent(
+    analysis_blob: str,
+    language_selected: str,
+    plan_context: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, str]:
+    """Pre-pass: infer reply language + skill focus from planner/task content."""
+    practice_focus = ""
+    reply_language = _practice_reply_language_fallback(
+        analysis_blob, language_selected
+    )
+    if len(analysis_blob.strip()) < 8:
+        return reply_language, practice_focus
+
+    planner_intent_lines: List[str] = []
+    if isinstance(plan_context, dict):
+        if plan_context.get("detailPrompt"):
+            planner_intent_lines.append(
+                f"- user_intent: {plan_context['detailPrompt']}"
+            )
+        if plan_context.get("becomingPhrase"):
+            planner_intent_lines.append(
+                f"- identity_line: {plan_context['becomingPhrase']}"
+            )
+        if plan_context.get("planSummary"):
+            planner_intent_lines.append(
+                f"- arc_summary: {plan_context['planSummary']}"
+            )
+        day = plan_context.get("day")
+        if isinstance(day, dict) and day.get("summary"):
+            planner_intent_lines.append(f"- day_focus: {day['summary']}")
+
+    try:
+        from chatgpt_wrapper import chat_with_gpt
+        intent_user_lines = [
+            "Decide card language from PLANNER CONTENT INTENT below — not the "
+            "app UI unless content is language-neutral.",
+            f"UI locale (weak fallback only): {language_selected}",
+        ]
+        if planner_intent_lines:
+            intent_user_lines += ["", "PLANNER CONTENT INTENT:"] + planner_intent_lines
+        intent_user_lines += [
+            "",
+            "FULL TASK + PLAN CONTEXT:",
+            analysis_blob[:3500],
+        ]
+        raw = chat_with_gpt(
+            system_prompt=_PRACTICE_INTENT_ANALYSIS_SYSTEM,
+            user_prompt="\n".join(intent_user_lines),
+            model=COACH_MODEL_FREE,
+            max_completion_tokens=120,
+            auto_detect_language=False,
+            reply_language="English",
+        )
+        if raw and raw.strip():
+            parsed_raw = raw.strip()
+            if parsed_raw.startswith("```"):
+                parsed_raw = parsed_raw.strip("`")
+                if parsed_raw.lower().startswith("json"):
+                    parsed_raw = parsed_raw[4:]
+                parsed_raw = parsed_raw.strip()
+            parsed = json.loads(parsed_raw)
+            if isinstance(parsed, dict):
+                lang = (parsed.get("replyLanguage") or "").strip()
+                if lang and len(lang) <= 40:
+                    reply_language = lang
+                focus = (parsed.get("practiceFocus") or "").strip()
+                if focus:
+                    practice_focus = focus[:200]
+    except Exception as e:
+        logger.info("practice intent analysis skipped, using detect: %s", e)
+
+    return reply_language, practice_focus
+
+
 @https_fn.on_request(memory=512, max_instances=20, timeout_sec=60, cpu=1)
 def generate_practice(req: https_fn.Request) -> https_fn.Response:
     """Generate one scenario practice card for a task on dateScreenFull.
@@ -1227,6 +1567,7 @@ def generate_practice(req: https_fn.Request) -> https_fn.Response:
         task_title = (payload.get("taskTitle") or "").strip()
         task_category = (payload.get("taskCategory") or "").strip()
         task_detail = (payload.get("taskDetail") or "").strip()
+        plan_id = (payload.get("planId") or "").strip()
         plan_day_number = payload.get("planDayNumber")
         user_state = payload.get("userState") or {}
         language_selected = (
@@ -1256,6 +1597,10 @@ def generate_practice(req: https_fn.Request) -> https_fn.Response:
         uid, tier = _verify_coach_tier(req)
         is_premium = tier == "premium"
         is_paid = tier in ("plus", "premium")
+
+        plan_context = None
+        if plan_id:
+            plan_context = _load_practice_plan_context(uid, plan_id, plan_day_number)
 
         if not _coach_rate_allow(uid or "", is_paid):
             return create_response(
@@ -1296,11 +1641,26 @@ def generate_practice(req: https_fn.Request) -> https_fn.Response:
         if is_premium:
             model = COACH_MODEL_PREMIUM
             system_prompt = _PRACTICE_SYSTEM_PROMPT_PREMIUM
-            max_tokens = 700
+            max_tokens = 900
         else:
             model = COACH_MODEL_FREE
             system_prompt = _PRACTICE_SYSTEM_PROMPT_FREE
-            max_tokens = 400
+            max_tokens = 550
+
+        plan_context_block = (
+            _format_practice_plan_context_block(plan_context)
+            if plan_context else ""
+        )
+        analysis_blob = _practice_analysis_blob(
+            task_title,
+            task_category,
+            task_detail,
+            plan_context_block,
+            plan_context,
+        )
+        reply_language, practice_focus = _analyze_practice_intent(
+            analysis_blob, language_selected, plan_context
+        )
 
         recent_scenarios = user_state.get("recentScenarios") or []
         if not isinstance(recent_scenarios, list):
@@ -1327,15 +1687,30 @@ def generate_practice(req: https_fn.Request) -> https_fn.Response:
             f"- missed_yesterday: {missed_yesterday}",
             f"- rest_day: {rest_day}",
             f"- recent_scenarios (avoid these themes): {recent_scenarios}",
+        ]
+        if plan_context_block:
+            user_prompt_lines += ["", plan_context_block]
+        if practice_focus:
+            user_prompt_lines += [
+                "",
+                "PRACTICE INTENT (from planner content analysis — develop this skill):",
+                f"- skill_to_rehearse: {practice_focus}",
+            ]
+        user_prompt_lines += [
             "",
-            "Generate ONE scenario card per the JSON contract.",
+            f"LANGUAGE: write the entire card in {reply_language} — this was "
+            f"chosen from planner/task content intent, not the UI locale.",
+            "",
+            f"Generate ONE scenario card with exactly {_PRACTICE_CHOICE_COUNT} "
+            "choices per the JSON contract.",
         ]
         user_prompt = "\n".join(user_prompt_lines)
-        reply_language = "Thai" if language_selected == "thai" else "English"
 
         logger.info(
-            "generate_practice: uid=%s tier=%s model=%s lang=%s task_id=%s",
-            uid or "anon", tier, model, language_selected, task_id,
+            "generate_practice: uid=%s tier=%s model=%s reply_lang=%s ui_lang=%s "
+            "task_id=%s plan_id=%s has_plan_ctx=%s",
+            uid or "anon", tier, model, reply_language, language_selected,
+            task_id, plan_id or "-", bool(plan_context),
         )
 
         from chatgpt_wrapper import chat_with_gpt
@@ -1381,9 +1756,11 @@ def generate_practice(req: https_fn.Request) -> https_fn.Response:
                                    status_code=502)
         situation = (card.get("situation") or "").strip()
         choices = card.get("choices") or []
-        if not situation or not isinstance(choices, list) or len(choices) != 3:
+        if (not situation or not isinstance(choices, list)
+                or len(choices) != _PRACTICE_CHOICE_COUNT):
             return create_response(success=False, message='Bad model output',
-                                   error='Card payload missing required fields.',
+                                   error=f'Card must have situation and '
+                                   f'{_PRACTICE_CHOICE_COUNT} choices.',
                                    status_code=502)
         scenario_id = (card.get("scenarioId") or "scenario").strip() or "scenario"
         def _norm_intent(value: Any) -> str:
@@ -1394,10 +1771,10 @@ def generate_practice(req: https_fn.Request) -> https_fn.Response:
             "scenarioId": scenario_id,
             "situation": situation,
             "choices": [
-                {"key": str(c.get("key", "")).strip()[:2] or chr(ord("a") + i),
+                {"key": str(c.get("key", "")).strip()[:2] or _practice_choice_key(i),
                  "label": str(c.get("label", "")).strip()[:200],
                  "intent": _norm_intent(c.get("intent"))}
-                for i, c in enumerate(choices[:3])
+                for i, c in enumerate(choices[:_PRACTICE_CHOICE_COUNT])
             ],
             "afterChoiceNote": (card.get("afterChoiceNote") or "").strip(),
         }
@@ -1630,8 +2007,8 @@ def aggregate_practice_outcomes(req: https_fn.Request) -> https_fn.Response:
 # On dateScreenFull, tasks that belong to an AI-generated plan get a
 # "Learn + Quiz" button. It calls this endpoint, which returns:
 #   - `content`: a short, focused explainer about HOW to do this task well
-#   - `quiz`:    a few multiple-choice questions (with the correct answer +
-#                an explanation) that check understanding of that content.
+#   - `quiz`:    up to 5 multiple-choice questions (built in batches of 2 —
+#                first pass with content, then lightweight top-up passes)
 #
 # Tiering (a SEPARATE monthly quota from coach reviews — verified server-side):
 #   free    → 10 / month
@@ -1644,6 +2021,13 @@ def aggregate_practice_outcomes(req: https_fn.Request) -> https_fn.Response:
 # so the cache has no TTL; regeneration is user-driven.
 
 _TASK_CONTENT_MONTHLY_CAP = {"free": 10, "plus": 30}  # premium → unlimited
+# Quiz is built in batches — 5 total is too heavy for one LLM call alongside
+# practice material. First pass: content + _FIRST_BATCH questions; top-up
+# passes add _TOPUP_BATCH at a time until _QUIZ_TARGET (free on cache re-open).
+_TASK_CONTENT_QUIZ_TARGET = 5
+_TASK_CONTENT_QUIZ_FIRST_BATCH = 2
+_TASK_CONTENT_QUIZ_TOPUP_BATCH = 2
+_TASK_CONTENT_QUIZ_TOPUP_MAX_ATTEMPTS = 3
 
 _TASK_CONTENT_SYSTEM_PROMPT = (
     "You generate PRACTICE MATERIAL for a single step of a user's plan. The "
@@ -1667,12 +2051,13 @@ _TASK_CONTENT_SYSTEM_PROMPT = (
     "2. `content`: the practice material itself, 60–160 words (a compact list "
     "is fine). Ready to use immediately. Give the thing to practice — do NOT "
     "explain how to do it or add tips.\n"
-    "3. `quiz`: 0 to 3 questions, included ONLY if checking the material helps "
-    "(recall, correct form, comprehension). For pure-doing material, return an "
-    "EMPTY array []. Each item MUST have: 'question', 'choices' (array of "
-    "EXACTLY 4 distinct strings), 'answerIndex' (integer 0–3), and "
-    "'explanation' (one sentence). The quiz MUST be in the same language as "
-    "`content`.\n"
+    f"3. `quiz`: EXACTLY {_TASK_CONTENT_QUIZ_FIRST_BATCH} questions when checking "
+    "the material helps (recall, correct form, comprehension). More questions "
+    "are added in separate passes — do NOT try to fit all five here. For "
+    "pure-doing material with nothing to check, return an EMPTY array []. "
+    "Each item MUST have: 'question', 'choices' (array of EXACTLY 4 distinct "
+    "strings), 'answerIndex' (integer 0–3), and 'explanation' (one sentence). "
+    "The quiz MUST be in the same language as `content`.\n"
     "4. Questions must be answerable from `content`. Exactly one choice is "
     "correct per question.\n\n"
     "Output JSON shape (quiz may be empty):\n"
@@ -1684,6 +2069,29 @@ _TASK_CONTENT_SYSTEM_PROMPT = (
     "  ]\n"
     "}\n"
 )
+
+_TASK_CONTENT_QUIZ_TOPUP_SYSTEM = (
+    "You write ADDITIONAL multiple-choice quiz questions for practice material "
+    "the user already has. Return ONLY valid JSON — no markdown fences.\n\n"
+    "Hard rules:\n"
+    "1. Output shape: {\"quiz\": [ ... ]} — do NOT include a `content` field.\n"
+    "2. Each new question MUST have: 'question', 'choices' (EXACTLY 4 distinct "
+    "strings), 'answerIndex' (integer 0–3), 'explanation' (one sentence).\n"
+    "3. Every question must be answerable from the PRACTICE MATERIAL below.\n"
+    "4. Do NOT repeat or lightly rephrase any question listed under EXISTING "
+    "QUESTIONS — test different facts or angles.\n"
+    "5. Write in the SAME language as the practice material.\n"
+)
+
+
+def _strip_json_fence(raw: str) -> str:
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+        text = text.strip()
+    return text
 
 
 def _task_content_model_bundle(_tier: str = "free") -> Tuple[str, int, str]:
@@ -1893,13 +2301,17 @@ def _task_content_cache_set(uid: str, task_id: str, payload: Dict[str, Any]) -> 
         logger.warning("task content cache write failed for %s/%s: %s", uid, task_id, e)
 
 
-def _normalize_quiz(raw_quiz: Any) -> List[Dict[str, Any]]:
+def _normalize_quiz(
+    raw_quiz: Any,
+    max_items: int = _TASK_CONTENT_QUIZ_TARGET,
+) -> List[Dict[str, Any]]:
     """Defensive server-side quiz validation. Drops malformed items; keeps
     only questions with exactly 4 string choices and an in-range answerIndex."""
     out = []
     if not isinstance(raw_quiz, list):
         return out
-    for q in raw_quiz[:4]:
+    cap = max(1, min(int(max_items), _TASK_CONTENT_QUIZ_TARGET))
+    for q in raw_quiz[:cap]:
         if not isinstance(q, dict):
             continue
         question = str(q.get("question", "")).strip()
@@ -1922,6 +2334,146 @@ def _normalize_quiz(raw_quiz: Any) -> List[Dict[str, Any]]:
             "explanation": str(q.get("explanation", "")).strip()[:400],
         })
     return out
+
+
+def _quiz_question_key(question: str) -> str:
+    return " ".join(str(question or "").lower().split())[:240]
+
+
+def _merge_quiz_lists(
+    existing: List[Dict[str, Any]],
+    new_items: List[Dict[str, Any]],
+    target: int = _TASK_CONTENT_QUIZ_TARGET,
+) -> List[Dict[str, Any]]:
+    seen = {_quiz_question_key(q.get("question")) for q in existing}
+    merged = list(existing)
+    for q in new_items:
+        if len(merged) >= target:
+            break
+        key = _quiz_question_key(q.get("question"))
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        merged.append(q)
+    return merged[:target]
+
+
+def _format_existing_quiz_for_prompt(quiz: List[Dict[str, Any]]) -> str:
+    lines = []
+    for i, q in enumerate(quiz, 1):
+        lines.append(f"{i}. {q.get('question', '')}")
+    return "\n".join(lines) if lines else "(none yet)"
+
+
+def _task_content_generate_quiz_batch(
+    content: str,
+    existing_quiz: List[Dict[str, Any]],
+    count: int,
+    model: str,
+    task_title: str,
+    task_detail: str,
+) -> List[Dict[str, Any]]:
+    """One lightweight LLM pass — quiz only, no practice material."""
+    count = max(1, min(int(count), _TASK_CONTENT_QUIZ_TOPUP_BATCH))
+    user_lines = [
+        f"Write EXACTLY {count} NEW quiz question(s) for this practice material.",
+        "",
+        "PRACTICE MATERIAL:",
+        content[:2000],
+        "",
+        "EXISTING QUESTIONS (do not repeat):",
+        _format_existing_quiz_for_prompt(existing_quiz),
+    ]
+    if task_title:
+        user_lines += ["", f"STEP CONTEXT: {task_title}"]
+    if task_detail and task_detail != task_title:
+        user_lines.append(task_detail[:800])
+    user_lines += [
+        "",
+        'Return JSON: {"quiz":[...]} per the contract.',
+    ]
+    try:
+        from chatgpt_wrapper import chat_with_gpt
+        response_text = chat_with_gpt(
+            system_prompt=_TASK_CONTENT_QUIZ_TOPUP_SYSTEM,
+            user_prompt="\n".join(user_lines),
+            model=model,
+            max_completion_tokens=700,
+            auto_detect_language=True,
+        )
+        if not response_text or not response_text.strip():
+            return []
+        parsed = json.loads(_strip_json_fence(response_text))
+        raw_quiz = parsed.get("quiz") if isinstance(parsed, dict) else None
+        return _normalize_quiz(raw_quiz, max_items=count)
+    except Exception as e:
+        logger.info("task_content quiz top-up skipped: %s", e)
+        return []
+
+
+def _task_content_ensure_quiz_target(
+    content: str,
+    quiz: List[Dict[str, Any]],
+    model: str,
+    task_title: str,
+    task_detail: str,
+) -> List[Dict[str, Any]]:
+    """Grow quiz to _TASK_CONTENT_QUIZ_TARGET via batched top-up calls."""
+    quiz = _normalize_quiz(quiz, max_items=_TASK_CONTENT_QUIZ_TARGET)
+    if not quiz:
+        return quiz
+    attempts = 0
+    while (
+        len(quiz) < _TASK_CONTENT_QUIZ_TARGET
+        and attempts < _TASK_CONTENT_QUIZ_TOPUP_MAX_ATTEMPTS
+    ):
+        need = min(
+            _TASK_CONTENT_QUIZ_TOPUP_BATCH,
+            _TASK_CONTENT_QUIZ_TARGET - len(quiz),
+        )
+        batch = _task_content_generate_quiz_batch(
+            content, quiz, need, model, task_title, task_detail
+        )
+        if not batch:
+            break
+        merged = _merge_quiz_lists(quiz, batch, _TASK_CONTENT_QUIZ_TARGET)
+        if len(merged) <= len(quiz):
+            break
+        quiz = merged
+        attempts += 1
+    return quiz
+
+
+def _task_content_maybe_topup_cached_quiz(
+    uid: str,
+    task_id: str,
+    cached: Dict[str, Any],
+    tier: str,
+    task_title: str,
+    task_detail: str,
+    step_fingerprint: str,
+) -> List[Dict[str, Any]]:
+    """Backfill older caches (<5 questions) without spending monthly quota."""
+    content = (cached.get("content") or "").strip()
+    quiz = _normalize_quiz(cached.get("quiz"), max_items=_TASK_CONTENT_QUIZ_TARGET)
+    if not content or not quiz or len(quiz) >= _TASK_CONTENT_QUIZ_TARGET:
+        return quiz
+    model, _, _ = _task_content_model_bundle(tier)
+    expanded = _task_content_ensure_quiz_target(
+        content, quiz, model, task_title, task_detail
+    )
+    if len(expanded) > len(quiz):
+        _task_content_cache_set(uid, task_id, {
+            **cached,
+            "content": content,
+            "quiz": expanded,
+            "stepFingerprint": step_fingerprint or cached.get("stepFingerprint"),
+        })
+        logger.info(
+            "generate_task_content: quiz top-up cache uid=%s task=%s %d→%d",
+            uid, task_id, len(quiz), len(expanded),
+        )
+    return expanded
 
 
 @https_fn.on_request(
@@ -1992,13 +2544,22 @@ def generate_task_content(req: https_fn.Request) -> https_fn.Response:
             if cached and cached.get("content"):
                 cached_fp = (cached.get("stepFingerprint") or "").strip()
                 if not step_fingerprint or not cached_fp or cached_fp == step_fingerprint:
+                    quiz = _task_content_maybe_topup_cached_quiz(
+                        uid,
+                        task_id,
+                        cached,
+                        tier,
+                        task_title,
+                        task_detail,
+                        step_fingerprint,
+                    )
                     _allowed, count, cap, _charged = _task_content_quota_peek(
                         uid, tier, tz_offset_minutes, task_quota_key
                     )
                     return create_response(
                         data={
                             "content": cached.get("content"),
-                            "quiz": cached.get("quiz") or [],
+                            "quiz": quiz,
                             "tier": tier,
                             "source": "cache",
                             "used": count,
@@ -2059,9 +2620,10 @@ def generate_task_content(req: https_fn.Request) -> https_fn.Response:
             )
         user_prompt_lines.append("")
         user_prompt_lines.append(
-            "Produce ready-to-use PRACTICE MATERIAL for this step (plus a quiz "
-            "only if it helps), in the same language as the step, per the JSON "
-            "contract."
+            f"Produce ready-to-use PRACTICE MATERIAL for this step plus exactly "
+            f"{_TASK_CONTENT_QUIZ_FIRST_BATCH} quiz questions when a quiz helps "
+            "(more are added later), in the same language as the step, per the "
+            "JSON contract."
         )
         user_prompt = "\n".join(user_prompt_lines)
 
@@ -2088,12 +2650,7 @@ def generate_task_content(req: https_fn.Request) -> https_fn.Response:
                 status_code=502,
             )
 
-        raw = response_text.strip()
-        if raw.startswith("```"):
-            raw = raw.strip("`")
-            if raw.lower().startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
+        raw = _strip_json_fence(response_text)
         try:
             parsed = json.loads(raw)
         except Exception:
@@ -2104,11 +2661,23 @@ def generate_task_content(req: https_fn.Request) -> https_fn.Response:
             )
 
         content = (parsed.get("content") or "").strip() if isinstance(parsed, dict) else ""
-        quiz = _normalize_quiz(parsed.get("quiz") if isinstance(parsed, dict) else None)
+        quiz = _normalize_quiz(
+            parsed.get("quiz") if isinstance(parsed, dict) else None,
+            max_items=_TASK_CONTENT_QUIZ_FIRST_BATCH,
+        )
         if not content:
             return create_response(
                 success=False, message='Bad model output',
                 error='No content produced. Try again.', status_code=502,
+            )
+
+        if quiz:
+            quiz = _task_content_ensure_quiz_target(
+                content, quiz, model, task_title, task_detail
+            )
+            logger.info(
+                "generate_task_content: quiz batched uid=%s task=%s count=%d",
+                uid, task_id, len(quiz),
             )
 
         count, cap = _task_content_quota_commit(
