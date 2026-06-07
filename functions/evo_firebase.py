@@ -11,6 +11,7 @@ Optional: EVO_FIREBASE_PROJECT_ID (default evoforluanching).
 
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import os
@@ -26,15 +27,54 @@ _EVO_APP_NAME = "evoforluanching"
 _evo_app: Optional[Any] = None
 
 
+def _load_sa_dict() -> Optional[dict]:
+    """Service-account credentials for evoforluanching.
+
+    Preference order:
+      1. EVO_FIREBASE_SERVICE_ACCOUNT_JSON (Secret Manager / env) — production.
+      2. EVO_FIREBASE_SERVICE_ACCOUNT_FILE (explicit path).
+      3. Any bundled evoforluanching-firebase-adminsdk-*.json deployed beside
+         this module — guarantees plan-context loads even when the secret
+         was never set, which is what silently starved generate_task_content
+         of planner intent.
+    """
+    raw = os.getenv("EVO_FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
+    if raw:
+        try:
+            return json.loads(raw)
+        except Exception as e:
+            logger.error("EVO_FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON: %s", e)
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = []
+    explicit = os.getenv("EVO_FIREBASE_SERVICE_ACCOUNT_FILE", "").strip()
+    if explicit:
+        candidates.append(explicit)
+    candidates.extend(
+        sorted(glob.glob(os.path.join(here, "evoforluanching-firebase-adminsdk-*.json")))
+    )
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            logger.info("EVO Firebase credentials loaded from file %s", os.path.basename(path))
+            return data
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            logger.error("EVO Firebase credentials file %s unreadable: %s", path, e)
+    return None
+
+
 def get_evo_app():
     global _evo_app
     if _evo_app is not None:
         return _evo_app
     project_id = os.getenv("EVO_FIREBASE_PROJECT_ID", "evoforluanching").strip()
-    raw = os.getenv("EVO_FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
+    sa = _load_sa_dict()
     try:
-        if raw:
-            cred = credentials.Certificate(json.loads(raw))
+        if sa:
+            cred = credentials.Certificate(sa)
             _evo_app = firebase_admin.initialize_app(
                 cred,
                 name=_EVO_APP_NAME,
@@ -42,8 +82,10 @@ def get_evo_app():
             )
         else:
             logger.warning(
-                "EVO_FIREBASE_SERVICE_ACCOUNT_JSON not set — EVO token verify "
-                "and Firestore may be unavailable on task-content endpoints"
+                "No EVO service-account credentials found (set "
+                "EVO_FIREBASE_SERVICE_ACCOUNT_JSON or bundle the adminsdk JSON) "
+                "— EVO token verify and Firestore are unavailable, so "
+                "generate_task_content cannot load planner intent"
             )
             return None
         logger.info("EVO Firebase Admin ready (project=%s)", project_id)

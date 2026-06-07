@@ -29,7 +29,7 @@ from firebase_admin import initialize_app, storage, firestore
 from fastapi import HTTPException
 from pydantic import BaseModel, Field, ValidationError
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 # Load environment variables
 load_dotenv()
 
@@ -843,13 +843,12 @@ def _coach_rate_allow(uid: str, is_paid: bool) -> bool:
 
 def _verify_coach_tier(req: https_fn.Request) -> Tuple[Optional[str], str]:
     """
-    Decode the Firebase Auth ID token from the request and check the user's
-    subscription doc. Returns (uid, tier) where tier ∈ {"free","plus","premium"}.
-    Anonymous / invalid token yields (None, "free") — caller served free tier.
+    Decode Firebase Auth ID token → (uid, tier).
 
-    Backwards-compat note: callers that previously destructured (uid, is_premium)
-    should be updated to read (uid, tier) and treat anything other than
-    "premium" as non-premium. A small adapter is provided below.
+    schedulingclassroom CF runs in a *different* GCP/Firebase project than the
+    EVO mobile app (evoforluanching). App users' tokens must be verified via
+    verify_evo_id_token + coachSubscription read from EVO Firestore
+    (_coach_tier_for_uid). Default verify_id_token is only a fallback.
     """
     auth_header = req.headers.get("Authorization") or req.headers.get("authorization") or ""
     if not auth_header.lower().startswith("bearer "):
@@ -858,41 +857,32 @@ def _verify_coach_tier(req: https_fn.Request) -> Tuple[Optional[str], str]:
     if not id_token:
         return (None, "free")
 
+    uid = None
     try:
-        from firebase_admin import auth as fb_auth
-        decoded = fb_auth.verify_id_token(id_token)
-        uid = decoded.get("uid")
+        from evo_firebase import verify_evo_id_token
+        uid = verify_evo_id_token(id_token)
     except Exception as e:
-        logger.info("coach_review: invalid id_token (%s) — downgrading to free", type(e).__name__)
-        return (None, "free")
+        logger.warning("EVO token verify import failed: %s", e)
+
+    if not uid:
+        try:
+            from firebase_admin import auth as fb_auth
+            decoded = fb_auth.verify_id_token(id_token)
+            uid = decoded.get("uid")
+        except Exception as e:
+            logger.info("coach_tier: invalid id_token (%s)", type(e).__name__)
+            return (None, "free")
 
     if not uid:
         return (None, "free")
 
-    try:
-        snap = firestore.client().collection("users").document(uid) \
-            .collection("coachSubscription").document("current").get()
-        if not snap.exists:
-            return (uid, "free")
-        data = snap.to_dict() or {}
-        persisted = (data.get("tier") or "free").lower()
-        if persisted not in ("plus", "premium"):
-            return (uid, "free")
-        # Expiry check applies to BOTH paid tiers.
-        expires_at = data.get("expiresAt")
-        if expires_at:
-            try:
-                if hasattr(expires_at, "timestamp") and expires_at.timestamp() < time.time():
-                    return (uid, "free")
-            except Exception:
-                pass
-        return (uid, persisted)
-    except Exception as e:
-        logger.warning("coach_review: subscription lookup failed for %s: %s", uid, e)
-        return (uid, "free")
+    return (uid, _coach_tier_for_uid(uid))
 
 
-@https_fn.on_request(memory=1024, max_instances=20, timeout_sec=120, cpu=1)
+@https_fn.on_request(
+    memory=1024, max_instances=20, timeout_sec=120, cpu=1,
+    secrets=[_EVO_FIREBASE_SA_SECRET],
+)
 def coach_review(req: https_fn.Request) -> https_fn.Response:
     """Generate an AI Coach review. Tier is verified server-side from the
     Firebase Auth token — the client's `tier` field is ignored."""
@@ -1024,6 +1014,10 @@ def coach_review(req: https_fn.Request) -> https_fn.Response:
 
 _PRACTICE_CACHE_TTL_SEC = 24 * 60 * 60
 _PRACTICE_HISTORY_LIMIT = 10
+# Bump when the card prompt/logic changes enough to invalidate cached cards
+# (alongside the 24h TTL). v2: per-category scenario guidance, thin-step
+# grounding, and practice-language output guard.
+_PRACTICE_FORMAT_VERSION = 2
 
 # Semantic role of each scenario choice. Logged with the user's pick so the
 # coach loop can mine *what kind* of move a user makes under pressure — not
@@ -1040,17 +1034,19 @@ _PRACTICE_INTENT_ANALYSIS_SYSTEM = (
     "You decide how to frame ONE practice scenario card before it is written.\n"
     "Goal: help the user DEVELOP A NEW SKILL through mental rehearsal — a "
     "specific micro-skill drawn from their planner arc, not generic motivation.\n"
+    "The card will be written primarily in the user's SELECTED RESPONSE LANGUAGE "
+    "(provided in the user message). Your job is to find the PLANNER language "
+    "to blend in — not to pick the response language.\n"
     "Return ONLY valid JSON (no markdown). Fields:\n"
-    "- replyLanguage: full language name for the card (e.g. English, Thai, "
-    "Chinese, Japanese, Korean, French). Infer from PLANNER CONTENT INTENT "
-    "(user_intent, arc_summary, identity_line, day_focus, task text) — the "
-    "language the user is practicing IN or learning toward. If the plan is "
-    "about learning a target language, write the card IN that target language. "
-    "Use UI locale ONLY when all content is language-neutral.\n"
+    "- plannerLanguage: full language name for the TARGET language being "
+    "practiced/learned — infer primarily from main_goal (planName) and PLANNER "
+    "CONTENT INTENT (user_intent, arc_summary, day_steps). e.g. planName "
+    "'Learn Chinese 30 days' → Chinese. Do NOT return the response/UI "
+    "language unless the user is actually learning that language.\n"
     "- practiceFocus: one short phrase naming the skill or micro-skill to "
     "rehearse (e.g. 'recover after a missed rep without quitting', "
     "'hold form under fatigue', 'use the new vocab in a real sentence').\n"
-    '{"replyLanguage":"...","practiceFocus":"..."}'
+    '{"plannerLanguage":"...","practiceFocus":"..."}'
 )
 
 _PRACTICE_SYSTEM_PROMPT_BASE = (
@@ -1058,29 +1054,37 @@ _PRACTICE_SYSTEM_PROMPT_BASE = (
     "EVO app — a behavior-change tool grounded in neuroplasticity (consistent "
     "recoverable repetition, not streaks).\n\n"
     "Goal of the card: help the user DEVELOP A NEW SKILL by mentally rehearsing "
-    "a realistic moment before they do the rep. Ground the scenario in the "
-    "planner arc and the PRACTICE INTENT when provided. There is NO correct "
-    "answer; picking is the rep.\n\n"
+    "a realistic moment before they do the rep. Embed one concrete learning "
+    "hook from the task (a term, form cue, phrase, or constraint) in the "
+    "scenario. Ground the card in the planner arc and PRACTICE INTENT when "
+    "provided. There is NO correct answer; picking is the rep.\n\n"
     "Voice: warm, direct, concrete. Second-person. No moralizing. No toxic "
     "positivity. No emoji. No scores, no badges, no streaks.\n\n"
     "Hard rules:\n"
     "1. Return ONLY valid JSON. No markdown fences. No preamble.\n"
-    "2. `situation` is 1–2 sentences, concrete, grounded in the actual task.\n"
+    "2. `situation` is 2–3 sentences: a concrete moment grounded in the actual "
+    "task, including one specific detail the user will face during the rep.\n"
     f"3. `choices` MUST be exactly {_PRACTICE_CHOICE_COUNT} items, each with "
-    "keys 'key' (a/b/c/d/e), 'label' (under 90 chars, plausible real action, "
-    "not a joke option), and 'intent'.\n"
+    "keys 'key' (a/b/c/d/e), 'label' (under 90 chars, plausible real action "
+    "using vocabulary/phrasing from the task when relevant — not a joke "
+    "option), and 'intent'.\n"
     "4. Each choice's `intent` MUST be EXACTLY one of: 'recovery' "
     "(reset/regroup then continue), 'persist' (push through as-is), 'adjust' "
     "(change the approach or scope), 'avoid' (disengage/escape). The five "
     "choices SHOULD span different intents where possible so the user's pick "
     "is informative — never make all five the same intent.\n"
-    "5. `afterChoiceNote` is ONE short sentence reframing the activity as "
-    "noticing — not winning.\n"
+    "5. `afterChoiceNote` is 2–3 sentences that TEACH: (1) every choice is a "
+    "valid rehearsal — noticing matters more than picking the 'right' one; "
+    "(2) what the intent patterns reveal about building this skill; (3) one "
+    "actionable takeaway for the rep ahead.\n"
     "6. `scenarioId` is a kebab-case theme (e.g. 'distraction-at-15min', "
     "'motivation-drop', 'unclear-next-step') — used for anti-repeat.\n"
     "7. If the user state indicates a missed day, generate a GENTLER "
     "return-rep scenario; do not shame.\n"
     "8. Avoid scenario themes listed in `recent_scenarios`.\n"
+    "9. Follow the LANGUAGE instruction in the user message exactly — the card "
+    "language comes from taskTitle/taskDetail; weave in the practice/target "
+    "language for speech being rehearsed. Never default to English.\n"
 )
 
 def _practice_choice_key(index: int) -> str:
@@ -1104,7 +1108,7 @@ _PRACTICE_SYSTEM_PROMPT_FREE = _PRACTICE_SYSTEM_PROMPT_BASE + (
     '  "choices": [\n'
     + _practice_choice_json_template() + "\n"
     "  ],\n"
-    '  "afterChoiceNote": "<one sentence>"\n'
+    '  "afterChoiceNote": "<2–3 teaching sentences>"\n'
     "}\n"
 )
 
@@ -1112,14 +1116,15 @@ _PRACTICE_SYSTEM_PROMPT_PREMIUM = _PRACTICE_SYSTEM_PROMPT_BASE + (
     "\nOutput JSON shape (premium — include `coachFollowUp`):\n"
     "{\n"
     '  "scenarioId": "<kebab-case>",\n'
-    '  "situation": "<1–2 sentences>",\n'
+    '  "situation": "<2–3 sentences>",\n'
     '  "choices": [\n'
     + _practice_choice_json_template() + "\n"
     "  ],\n"
-    '  "afterChoiceNote": "<one sentence>",\n'
-    '  "coachFollowUp": "<2–3 sentences a coach would say AFTER the user '
-    "picks any option — point at what to notice during the rep, drawing on "
-    'the task context. Same voice rules.>"\n'
+    '  "afterChoiceNote": "<2–3 teaching sentences>",\n'
+    '  "coachFollowUp": "<3–4 sentences a coach would say AFTER the user '
+    "picks any option — name the micro-skill, link it to the plan arc, what "
+    "to try in the next 60 seconds, and one thing to notice after picking. "
+    'Same voice rules.>"\n'
     "}\n"
 )
 
@@ -1139,7 +1144,7 @@ def _local_period_key(tz_offset_minutes: Any, fmt: str) -> str:
     except (TypeError, ValueError):
         offset = 0
     offset = max(-840, min(840, offset))
-    return (datetime.utcnow() + timedelta(minutes=offset)).strftime(fmt)
+    return (datetime.now(timezone.utc) + timedelta(minutes=offset)).strftime(fmt)
 
 
 def _practice_daily_count_check_and_inc(uid: str, tz_offset_minutes: Any = 0) -> Tuple[bool, int]:
@@ -1181,6 +1186,10 @@ def _practice_cache_get(uid: str, task_id: str) -> Optional[Dict[str, Any]]:
         if not snap.exists:
             return None
         data = snap.to_dict() or {}
+        # Cards from an older prompt/logic version are treated as a miss so the
+        # next open regenerates with the improved grounding.
+        if int(data.get("formatVersion") or 0) < _PRACTICE_FORMAT_VERSION:
+            return None
         generated_at = data.get("generatedAt")
         ts = None
         if hasattr(generated_at, "timestamp"):
@@ -1204,7 +1213,7 @@ def _practice_cache_set(uid: str, task_id: str, card: Dict[str, Any]) -> None:
                  .collection("practice").document(task_id))
         ref.set({**card,
                  "generatedAt": firestore.SERVER_TIMESTAMP,
-                 "formatVersion": 1}, merge=True)
+                 "formatVersion": _PRACTICE_FORMAT_VERSION}, merge=True)
     except Exception as e:
         logger.warning("practice cache write failed for %s/%s: %s", uid, task_id, e)
 
@@ -1321,7 +1330,14 @@ def _load_practice_plan_context(
     if not plan_id:
         return None
     try:
-        db = firestore.client()
+        from evo_firebase import evo_firestore
+        db = evo_firestore()
+        if db is None:
+            logger.warning(
+                "practice plan context: EVO Firestore unavailable plan_id=%s",
+                plan_id,
+            )
+            return None
         plan_doc: Optional[Dict[str, Any]] = None
         if uid:
             snap = (db.collection("users").document(uid)
@@ -1379,11 +1395,25 @@ def _load_practice_plan_context(
         return None
 
 
+def _resolve_task_content_plan_name(
+    plan_name: str, plan_context: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Main goal label — prefer client planName, else loaded plan context."""
+    name = (plan_name or "").strip()
+    if name:
+        return name[:200]
+    if isinstance(plan_context, dict):
+        name = str(plan_context.get("planName") or "").strip()
+        if name:
+            return name[:200]
+    return ""
+
+
 def _format_practice_plan_context_block(plan_ctx: Dict[str, Any]) -> str:
     """Turn loaded plan context into prompt lines for the LLM."""
     lines = [
-        "PLAN CONTEXT (ground scenarios in this arc — do not invent unrelated goals):",
-        f"- plan: {plan_ctx.get('planName') or 'unnamed'}",
+        "PLAN ARC (supports the MAIN GOAL — do not invent unrelated goals):",
+        f"- main_goal (planName): {plan_ctx.get('planName') or 'unnamed'}",
         f"- category: {plan_ctx.get('category') or 'general'}",
     ]
     total = plan_ctx.get("totalDays")
@@ -1423,9 +1453,15 @@ def _practice_analysis_blob(
     task_detail: str,
     plan_context_block: str,
     plan_context: Optional[Dict[str, Any]] = None,
+    plan_name: str = "",
 ) -> str:
-    """Text bundle for intent analysis — planner intent fields first."""
+    """Text bundle for intent analysis — main goal first, then step to practice."""
     lines: List[str] = []
+    main_goal = (plan_name or "").strip()
+    if not main_goal and isinstance(plan_context, dict):
+        main_goal = str(plan_context.get("planName") or "").strip()
+    if main_goal:
+        lines.append(f"main_goal (planName): {main_goal}")
     if isinstance(plan_context, dict):
         if plan_context.get("detailPrompt"):
             lines.append(f"user_intent: {plan_context['detailPrompt']}")
@@ -1444,20 +1480,44 @@ def _practice_analysis_blob(
             if day.get("tips"):
                 lines.append(f"day_tips: {day['tips']}")
     if task_title:
-        lines.append(f"task_title: {task_title}")
+        lines.append(f"step_to_practice: {task_title}")
+    if task_detail and task_detail.strip() != (task_title or "").strip():
+        lines.append(f"parent_task: {task_detail}")
     if task_category:
         lines.append(f"task_category: {task_category}")
-    if task_detail:
-        lines.append(f"task_detail: {task_detail}")
     if plan_context_block:
         lines.append(plan_context_block)
     return "\n".join(p.strip() for p in lines if p and p.strip())
 
 
-def _practice_reply_language_fallback(
+_UI_LANGUAGE_NAMES = {
+    "english": "English",
+    "thai": "Thai",
+    "chinese": "Chinese",
+    "mandarin": "Chinese",
+    "japanese": "Japanese",
+    "korean": "Korean",
+    "french": "French",
+    "german": "German",
+    "spanish": "Spanish",
+    "vietnamese": "Vietnamese",
+    "indonesian": "Indonesian",
+}
+
+
+def _ui_language_name(language_selected: str) -> str:
+    key = (language_selected or "english").lower().strip()
+    return _UI_LANGUAGE_NAMES.get(key, key.title() or "English")
+
+
+def _practice_languages_same(a: str, b: str) -> bool:
+    return (a or "").strip().lower() == (b or "").strip().lower()
+
+
+def _practice_planner_language_fallback(
     analysis_blob: str, language_selected: str
 ) -> str:
-    """Detect language from content; UI locale is only a weak fallback."""
+    """Detect planner/practice language from task and plan text."""
     try:
         from chatgpt_wrapper import LanguageDetector
         if len(analysis_blob.strip()) >= 12:
@@ -1467,25 +1527,109 @@ def _practice_reply_language_fallback(
                 return name
     except Exception as e:
         logger.warning("practice language detect fallback: %s", e)
-    if language_selected == "thai":
+    return _ui_language_name(language_selected)
+
+
+def _language_name_to_chat_code(name: str) -> str:
+    """Map display language name to chatgpt_wrapper language code."""
+    key = (name or "").strip().lower()
+    return {
+        "english": "en",
+        "thai": "th",
+        "chinese": "zh",
+        "japanese": "ja",
+        "korean": "ko",
+        "french": "fr",
+        "german": "de",
+        "spanish": "es",
+        "vietnamese": "vi",
+        "indonesian": "id",
+    }.get(key, key or "en")
+
+
+def _sanitize_planner_target_language(
+    candidate: str,
+    blob: str,
+    instruction_language: str,
+    reply_language: str,
+) -> str:
+    """Drop UI/instruction language mistaken as the language being practiced."""
+    hint = _task_content_practice_language_from_hints(blob)
+    if hint:
+        return hint
+    cand = (candidate or "").strip()
+    if not cand or len(cand) > 40:
+        return ""
+    if _practice_languages_same(cand, instruction_language):
+        return ""
+    if _practice_languages_same(cand, reply_language):
+        return ""
+    if cand.lower() == "english" and _text_has_thai_script(blob):
+        return ""
+    return cand
+
+
+def _task_content_coaching_language(
+    instruction_language: str,
+    reply_language: str,
+    practice_language: str,
+    category_key: str,
+    task_title: str = "",
+    task_detail: str = "",
+) -> str:
+    """One coaching language for quiz, notes, and explanations — no EN/TH mix."""
+    instr = (instruction_language or "").strip() or "English"
+    respond = (reply_language or instr).strip()
+    practice = (practice_language or "").strip()
+    step_blob = f"{task_title} {task_detail}"
+    is_foreign_drill = (
+        category_key == "learning_language"
+        or (
+            category_key in ("learning", "other")
+            and practice
+            and not _practice_languages_same(instr, practice)
+        )
+    )
+    # Thai planner steps → coach in Thai even when the app sent languageSelected=english.
+    if instr == "Thai" or _text_has_thai_script(step_blob):
         return "Thai"
-    return "English"
+    if is_foreign_drill and instr == "Thai":
+        return "Thai"
+    # A non-English instruction language wins over an English app-UI default:
+    # the user authored the step in `instr`, so coach in `instr`, never leak
+    # English into a non-English step.
+    if (
+        instr
+        and not _practice_languages_same(instr, "English")
+        and _practice_languages_same(respond, "English")
+    ):
+        return instr
+    return respond
 
 
 def _analyze_practice_intent(
     analysis_blob: str,
     language_selected: str,
     plan_context: Optional[Dict[str, Any]] = None,
+    instruction_language: str = "",
+    plan_name: str = "",
 ) -> Tuple[str, str]:
-    """Pre-pass: infer reply language + skill focus from planner/task content."""
+    """Pre-pass: infer planner practice language + skill focus for mixing."""
     practice_focus = ""
-    reply_language = _practice_reply_language_fallback(
+    reply_language = _ui_language_name(language_selected)
+    instr = (instruction_language or "").strip()
+    blob_lower = (analysis_blob or "").lower()
+    hint_lang = _task_content_practice_language_from_hints(blob_lower)
+    planner_language = hint_lang or _practice_planner_language_fallback(
         analysis_blob, language_selected
     )
     if len(analysis_blob.strip()) < 8:
-        return reply_language, practice_focus
+        return planner_language, practice_focus
 
     planner_intent_lines: List[str] = []
+    main_goal = _resolve_task_content_plan_name(plan_name, plan_context)
+    if main_goal:
+        planner_intent_lines.append(f"- main_goal (planName): {main_goal}")
     if isinstance(plan_context, dict):
         if plan_context.get("detailPrompt"):
             planner_intent_lines.append(
@@ -1499,16 +1643,35 @@ def _analyze_practice_intent(
             planner_intent_lines.append(
                 f"- arc_summary: {plan_context['planSummary']}"
             )
+        if plan_context.get("category"):
+            planner_intent_lines.append(
+                f"- plan_category: {plan_context['category']}"
+            )
         day = plan_context.get("day")
-        if isinstance(day, dict) and day.get("summary"):
-            planner_intent_lines.append(f"- day_focus: {day['summary']}")
+        if isinstance(day, dict):
+            if day.get("title"):
+                planner_intent_lines.append(f"- day_title: {day['title']}")
+            if day.get("summary"):
+                planner_intent_lines.append(f"- day_focus: {day['summary']}")
+            labels = day.get("taskLabels") or []
+            if isinstance(labels, list) and labels:
+                planner_intent_lines.append(
+                    f"- day_steps: {', '.join(str(x) for x in labels[:8])}"
+                )
 
     try:
         from chatgpt_wrapper import chat_with_gpt
         intent_user_lines = [
-            "Decide card language from PLANNER CONTENT INTENT below — not the "
-            "app UI unless content is language-neutral.",
-            f"UI locale (weak fallback only): {language_selected}",
+            f"SELECTED RESPONSE LANGUAGE (app UI — quiz/coaching only, NOT "
+            f"plannerLanguage): {reply_language}",
+            "main_goal (planName) is the user's overall plan goal. "
+            "step_to_practice is what they do on THIS step — not the main goal.",
+            "Instruction language comes from step_to_practice — not planName "
+            "and not the app UI setting.",
+            "Decide plannerLanguage from main_goal + PLANNER CONTENT INTENT — "
+            "the target language being practiced (e.g. Chinese when planName "
+            "is a Chinese plan). plannerLanguage must NOT be the response/UI "
+            "language unless the user is actually learning that language.",
         ]
         if planner_intent_lines:
             intent_user_lines += ["", "PLANNER CONTENT INTENT:"] + planner_intent_lines
@@ -1534,21 +1697,38 @@ def _analyze_practice_intent(
                 parsed_raw = parsed_raw.strip()
             parsed = json.loads(parsed_raw)
             if isinstance(parsed, dict):
-                lang = (parsed.get("replyLanguage") or "").strip()
+                lang = (
+                    parsed.get("plannerLanguage")
+                    or parsed.get("contentLanguage")
+                    or parsed.get("targetLanguage")
+                    or ""
+                ).strip()
                 if lang and len(lang) <= 40:
-                    reply_language = lang
+                    sanitized = _sanitize_planner_target_language(
+                        lang, blob_lower, instr, reply_language,
+                    )
+                    if sanitized:
+                        planner_language = sanitized
+                    elif hint_lang:
+                        planner_language = hint_lang
                 focus = (parsed.get("practiceFocus") or "").strip()
                 if focus:
                     practice_focus = focus[:200]
     except Exception as e:
         logger.info("practice intent analysis skipped, using detect: %s", e)
 
-    return reply_language, practice_focus
+    return planner_language, practice_focus
 
 
-@https_fn.on_request(memory=512, max_instances=20, timeout_sec=60, cpu=1)
+@https_fn.on_request(
+    memory=512, max_instances=20, timeout_sec=60, cpu=1,
+    secrets=[_EVO_FIREBASE_SA_SECRET],
+)
 def generate_practice(req: https_fn.Request) -> https_fn.Response:
     """Generate one scenario practice card for a task on dateScreenFull.
+
+    Responds in languageSelected; language-learning cards weave in the
+    practice/target language (e.g. Chinese pinyin with Thai pronunciation).
     Tier verified server-side; free tier capped at 1/day."""
     if req.method == 'OPTIONS':
         return handle_preflight_request()
@@ -1601,6 +1781,13 @@ def generate_practice(req: https_fn.Request) -> https_fn.Response:
         plan_context = None
         if plan_id:
             plan_context = _load_practice_plan_context(uid, plan_id, plan_day_number)
+            if plan_context is None:
+                logger.warning(
+                    "generate_practice: plan_id=%s sent but plan context did "
+                    "NOT load (uid=%s, day=%s) — card will not be grounded in "
+                    "planner intent",
+                    plan_id, uid or "anon", plan_day_number,
+                )
 
         if not _coach_rate_allow(uid or "", is_paid):
             return create_response(
@@ -1641,25 +1828,66 @@ def generate_practice(req: https_fn.Request) -> https_fn.Response:
         if is_premium:
             model = COACH_MODEL_PREMIUM
             system_prompt = _PRACTICE_SYSTEM_PROMPT_PREMIUM
-            max_tokens = 900
+            max_tokens = 1100
         else:
             model = COACH_MODEL_FREE
             system_prompt = _PRACTICE_SYSTEM_PROMPT_FREE
-            max_tokens = 550
+            max_tokens = 700
 
         plan_context_block = (
             _format_practice_plan_context_block(plan_context)
             if plan_context else ""
         )
+        plan_name = ((plan_context or {}).get("planName") or "").strip()
         analysis_blob = _practice_analysis_blob(
             task_title,
             task_category,
             task_detail,
             plan_context_block,
             plan_context,
+            plan_name,
         )
-        reply_language, practice_focus = _analyze_practice_intent(
-            analysis_blob, language_selected, plan_context
+        reply_language = _ui_language_name(language_selected)
+
+        instruction_language = _task_content_instruction_language(
+            task_title, task_detail, language_selected,
+        )
+        category_key = _task_content_category_key(
+            task_category, task_title, task_detail, plan_name, plan_context,
+        )
+        planner_language, practice_focus = _analyze_practice_intent(
+            analysis_blob, language_selected, plan_context, instruction_language,
+            plan_name,
+        )
+        practice_language = _task_content_practice_language(
+            task_title,
+            task_detail,
+            plan_context,
+            plan_name,
+            language_selected,
+            planner_language,
+            instruction_language,
+        )
+        coaching_language = _task_content_coaching_language(
+            instruction_language,
+            reply_language,
+            practice_language,
+            category_key,
+            task_title,
+            task_detail,
+        )
+        language_instruction = _task_content_language_mix_instruction(
+            instruction_language,
+            practice_language,
+            category_key,
+            artifact="practice_card",
+            reply_language=coaching_language,
+        )
+        grounding_instruction = _task_content_grounding_instruction(
+            plan_name, task_title, practice_focus, task_detail,
+        )
+        pronunciation_guidance = _task_content_pronunciation_guidance(
+            instruction_language, practice_language, reply_language,
         )
 
         recent_scenarios = user_state.get("recentScenarios") or []
@@ -1670,17 +1898,58 @@ def generate_practice(req: https_fn.Request) -> https_fn.Response:
         missed_yesterday = bool(user_state.get("missedYesterday", False))
         rest_day = bool(user_state.get("restDayFlag", False))
 
-        user_prompt_lines = [
-            "TASK:",
-            f"- title: {task_title}",
+        user_prompt_lines: List[str] = []
+        if plan_name:
+            user_prompt_lines += [
+                "MAIN GOAL (planName — overall purpose of this plan):",
+                f"- planName: {plan_name}",
+                "",
+            ]
+        user_prompt_lines += [
+            "THIS STEP — what to practice now (step description):",
+            f"- step: {task_title}",
         ]
+        if task_detail and task_detail.strip() != (task_title or "").strip():
+            user_prompt_lines.append(f"- parent_task: {task_detail}")
+        user_prompt_lines += [
+            "",
+            f"SELECTED RESPONSE LANGUAGE (languageSelected): {reply_language}",
+            f"TASK TEXT LANGUAGE (taskTitle/taskDetail): {instruction_language}",
+            f"PRACTICE/TARGET LANGUAGE (what the user drills): "
+            f"{practice_language}",
+            language_instruction,
+            "",
+            grounding_instruction,
+        ]
+        if _task_content_step_is_thin(task_title, task_detail):
+            user_prompt_lines += [
+                "",
+                _task_content_thin_step_directive(
+                    plan_name,
+                    task_title,
+                    has_plan_context=bool(plan_context),
+                    practice_language=practice_language,
+                    artifact="practice_card",
+                ),
+            ]
+        # Category guidance for EVERY category (not just language) so the
+        # scenario embeds a concrete, on-plan skill hook instead of generic
+        # motivation. The card adapts it — it does not output a drill list.
+        category_guidance = _TASK_CONTENT_CATEGORY_GUIDANCE.get(category_key)
+        if category_guidance:
+            user_prompt_lines += [
+                "",
+                "CATEGORY GUIDANCE (use the concrete-skill focus and the "
+                "WRONG/RIGHT specificity bar; adapt it into the scenario — do "
+                "NOT output a drill list or the literal structure):",
+                category_guidance,
+            ]
+        if pronunciation_guidance:
+            user_prompt_lines += ["", pronunciation_guidance]
         if task_category:
-            user_prompt_lines.append(f"- category: {task_category}")
-        if task_detail:
-            user_prompt_lines.append(f"- detail: {task_detail}")
+            user_prompt_lines += ["", f"- taskCategory: {task_category}"]
         if plan_day_number is not None:
             user_prompt_lines.append(f"- plan_day_number: {plan_day_number}")
-
         user_prompt_lines += [
             "",
             "USER STATE:",
@@ -1693,24 +1962,24 @@ def generate_practice(req: https_fn.Request) -> https_fn.Response:
         if practice_focus:
             user_prompt_lines += [
                 "",
-                "PRACTICE INTENT (from planner content analysis — develop this skill):",
-                f"- skill_to_rehearse: {practice_focus}",
+                "PLANNER INTENT FOCUS (from planName + step + plan arc):",
+                f"- {practice_focus}",
             ]
         user_prompt_lines += [
             "",
-            f"LANGUAGE: write the entire card in {reply_language} — this was "
-            f"chosen from planner/task content intent, not the UI locale.",
-            "",
             f"Generate ONE scenario card with exactly {_PRACTICE_CHOICE_COUNT} "
-            "choices per the JSON contract.",
+            "choices per the JSON contract. Teach one concrete skill hook from "
+            "the step, aligned with planName; reinforce it in afterChoiceNote.",
         ]
         user_prompt = "\n".join(user_prompt_lines)
 
         logger.info(
-            "generate_practice: uid=%s tier=%s model=%s reply_lang=%s ui_lang=%s "
-            "task_id=%s plan_id=%s has_plan_ctx=%s",
-            uid or "anon", tier, model, reply_language, language_selected,
-            task_id, plan_id or "-", bool(plan_context),
+            "generate_practice: uid=%s tier=%s model=%s category=%s "
+            "reply_lang=%s instr_lang=%s practice_lang=%s task_id=%s "
+            "plan_id=%s has_plan_ctx=%s",
+            uid or "anon", tier, model, category_key, reply_language,
+            instruction_language, practice_language, task_id, plan_id or "-",
+            bool(plan_context),
         )
 
         from chatgpt_wrapper import chat_with_gpt
@@ -1719,8 +1988,10 @@ def generate_practice(req: https_fn.Request) -> https_fn.Response:
             user_prompt=user_prompt,
             model=model,
             max_completion_tokens=max_tokens,
+            # Mixed-language layout is specified in prompts — do not let the
+            # wrapper append "Please reply in X" and force a single language.
             auto_detect_language=False,
-            reply_language=reply_language,
+            reply_language=None,
         )
 
         if not response_text or not response_text.strip():
@@ -1762,6 +2033,73 @@ def generate_practice(req: https_fn.Request) -> https_fn.Response:
                                    error=f'Card must have situation and '
                                    f'{_PRACTICE_CHOICE_COUNT} choices.',
                                    status_code=502)
+
+        # Output-quality guard: a language card must actually weave in the
+        # practice/target language (e.g. Chinese phrases to rehearse), not just
+        # describe the situation in Thai. Regenerate once if the target script
+        # is absent for a script-distinct language.
+        def _card_text(c: Dict[str, Any], ch: List[Any]) -> str:
+            return " ".join([
+                str(c.get("situation") or ""),
+                " ".join(str(x.get("label") or "") for x in ch if isinstance(x, dict)),
+                str(c.get("afterChoiceNote") or ""),
+                str(c.get("coachFollowUp") or ""),
+            ])
+
+        if (
+            _task_content_needs_practice_script_check(
+                instruction_language, practice_language
+            )
+            and not _task_content_drill_uses_practice_language(
+                _card_text(card, choices), practice_language
+            )
+        ):
+            logger.warning(
+                "generate_practice: card missing %s script — regenerating once "
+                "uid=%s task=%s",
+                practice_language, uid or "anon", task_id,
+            )
+            correction = _task_content_practice_script_correction(
+                practice_language, coaching_language
+            )
+            try:
+                retry_text = chat_with_gpt(
+                    system_prompt=system_prompt,
+                    user_prompt=f"{user_prompt}\n\n{correction}",
+                    model=model,
+                    max_completion_tokens=max_tokens,
+                    auto_detect_language=False,
+                    reply_language=None,
+                )
+                retry_raw = _strip_json_fence(retry_text or "")
+                retry_card = json.loads(retry_raw)
+                if isinstance(retry_card, dict):
+                    r_sit = (retry_card.get("situation") or "").strip()
+                    r_choices = retry_card.get("choices") or []
+                    if (
+                        r_sit
+                        and isinstance(r_choices, list)
+                        and len(r_choices) == _PRACTICE_CHOICE_COUNT
+                        and _task_content_drill_uses_practice_language(
+                            _card_text(retry_card, r_choices), practice_language
+                        )
+                    ):
+                        card, situation, choices = retry_card, r_sit, r_choices
+                        logger.info(
+                            "generate_practice: correction succeeded uid=%s task=%s",
+                            uid or "anon", task_id,
+                        )
+                    else:
+                        logger.warning(
+                            "generate_practice: correction still missing %s "
+                            "script uid=%s", practice_language, uid or "anon",
+                        )
+            except Exception as e:
+                logger.warning(
+                    "generate_practice: card correction failed uid=%s: %s",
+                    uid or "anon", e,
+                )
+
         scenario_id = (card.get("scenarioId") or "scenario").strip() or "scenario"
         def _norm_intent(value: Any) -> str:
             iv = str(value or "").strip().lower()
@@ -1776,10 +2114,10 @@ def generate_practice(req: https_fn.Request) -> https_fn.Response:
                  "intent": _norm_intent(c.get("intent"))}
                 for i, c in enumerate(choices[:_PRACTICE_CHOICE_COUNT])
             ],
-            "afterChoiceNote": (card.get("afterChoiceNote") or "").strip(),
+            "afterChoiceNote": (card.get("afterChoiceNote") or "").strip()[:700],
         }
         if is_premium and card.get("coachFollowUp"):
-            normalized["coachFollowUp"] = str(card["coachFollowUp"]).strip()
+            normalized["coachFollowUp"] = str(card["coachFollowUp"]).strip()[:900]
 
         # 5) Persist cache + roll history.
         _practice_cache_set(uid or "", task_id, normalized)
@@ -2006,7 +2344,8 @@ def aggregate_practice_outcomes(req: https_fn.Request) -> https_fn.Response:
 # =========================
 # On dateScreenFull, tasks that belong to an AI-generated plan get a
 # "Learn + Quiz" button. It calls this endpoint, which returns:
-#   - `content`: a short, focused explainer about HOW to do this task well
+#   - `content`: category-shaped practice material (language learning includes
+#                reading guides + learn-how); facts embedded for the quiz
 #   - `quiz`:    up to 5 multiple-choice questions (built in batches of 2 —
 #                first pass with content, then lightweight top-up passes)
 #
@@ -2029,40 +2368,249 @@ _TASK_CONTENT_QUIZ_FIRST_BATCH = 2
 _TASK_CONTENT_QUIZ_TOPUP_BATCH = 2
 _TASK_CONTENT_QUIZ_TOPUP_MAX_ATTEMPTS = 3
 
+# Bump whenever the generation logic/prompt changes in a way that should
+# invalidate previously cached content (e.g. fixing off-target drills). Cached
+# entries stamped below this version are regenerated when quota allows — for
+# free when the task was already charged this month — and otherwise served
+# as-is so a user at their cap never loses access to existing material.
+#   v2: translate-don't-copy drill rule + thin-step + language fixes.
+_TASK_CONTENT_LOGIC_VERSION = 2
+
+_TASK_CONTENT_PLAN_CATEGORIES = frozenset({
+    "learning", "exercise", "travel", "finance", "health",
+    "personal_development", "other",
+})
+
+_TASK_CONTENT_CATEGORY_ALIASES = {
+    "fitness": "exercise",
+    "workout": "exercise",
+    "sport": "exercise",
+    "study": "learning",
+    "education": "learning",
+    "language": "learning",
+    "wellness": "health",
+    "growth": "personal_development",
+    "self_improvement": "personal_development",
+    "personaldevelopment": "personal_development",
+    "money": "finance",
+    "financial": "finance",
+    "trip": "travel",
+    "tourism": "travel",
+}
+
+_LANGUAGE_LEARNING_HINTS = (
+    "language", "vocab", "vocabulary", "grammar", "phrase", "sentences",
+    "sentence", "pronunciation", "fluent", "flashcard", "translation",
+    "kanji", "hiragana", "katakana", "pinyin", "romaji", "jlpt", "toefl",
+    "ielts", "hsk", "topik", "japanese", "chinese", "korean", "thai",
+    "english", "spanish", "french", "german", "mandarin", "cantonese",
+    "arabic", "hindi", "中文", "日本語", "한국어",
+    "ภาษา", "คำศัพท์", "ไวยากรณ์", "แปล", "อ่าน", "พินอิน", "โทนเสียง",
+    "แมนดาริน", "ฮั่นจื้อ",
+)
+
+# Target language being practiced (distinct from the instruction language of the step).
+_PRACTICE_TARGET_LANGUAGE_HINTS: Dict[str, Tuple[str, ...]] = {
+    "Chinese": (
+        "chinese", "mandarin", "cantonese", "pinyin", "hanzi", "hsk",
+        "汉语", "拼音", "中文", "普通话", "汉字",
+        "จีน", "ภาษาจีน", "ภาษาจีนกลาง", "จีนกลาง", "แมนดาริน",
+        "พินอิน", "โทนเสียง", "เขียนพินอิน", "เสียงที่", "ตัวอักษรจีน", "ฮั่นจื้อ",
+    ),
+    "Japanese": (
+        "japanese", "jlpt", "kanji", "hiragana", "katakana", "romaji", "日本語",
+        "ญี่ปุ่น", "ภาษาญี่ปุ่น", "ฮิรางานะ", "คาตาคานะ", "คันจิ",
+    ),
+    "Korean": (
+        "korean", "hangul", "topik", "한국어",
+        "เกาหลี", "ภาษาเกาหลี", "ฮันกึล",
+    ),
+    "Thai": ("thai", "ภาษาไทย", "ไทย"),
+    "English": ("english", "ภาษาอังกฤษ", "อังกฤษ", "toefl", "ielts"),
+    "French": ("french", "ภาษาฝรั่งเศส", "ฝรั่งเศส"),
+    "German": ("german", "ภาษาเยอรมัน", "เยอรมัน"),
+    "Spanish": ("spanish", "ภาษาสเปน", "สเปน"),
+}
+
+# When instruction language ≠ practice language, how to spell pronunciation
+# for the learner (e.g. Thai phonetics for Chinese pinyin).
+_PRONUNCIATION_GUIDANCE_BY_PAIR: Dict[Tuple[str, str], str] = {
+    ("Thai", "Chinese"): (
+        "PRONUNCIATION (required): Thai learners need คำอ่านภาษาไทย for every "
+        "pinyin item. Per word/syllable use this line format:\n"
+        "  pinyin (คำอ่านไทย) โทน N — ความหมาย: ...\n"
+        "Example: mā (มา) โทน 1 — ความหมาย: มา | má (ม้า) โทน 2 — ความหมาย: ม้า\n"
+        "Always pair pinyin with Thai phonetic in parentheses. Label tone "
+        "โทน 1–4 in Thai. Add 汉字 only when it helps. Never show bare pinyin "
+        "or Chinese without the Thai pronunciation guide."
+    ),
+    ("Thai", "Japanese"): (
+        "PRONUNCIATION (required): add คำอ่านภาษาไทย for every Japanese item "
+        "(hiragana/katakana/kanji). Format: 日本語 (คำอ่านไทย) — ความหมาย: ..."
+    ),
+    ("Thai", "Korean"): (
+        "PRONUNCIATION (required): add คำอ่านภาษาไทย for every Korean item. "
+        "Format: hangul (คำอ่านไทย) — ความหมาย: ..."
+    ),
+    ("Thai", "English"): (
+        "PRONUNCIATION (required): add คำอ่านภาษาไทย for English words the "
+        "user must say aloud. Format: word (คำอ่านไทย) — ความหมาย: ..."
+    ),
+}
+
+
+def _task_content_pronunciation_guidance(
+    instruction_language: str,
+    practice_language: str,
+    reply_language: str = "",
+) -> str:
+    """Extra pronunciation rules when learner needs phonetics in their language."""
+    practice = (practice_language or "").strip()
+    for learner in (
+        (instruction_language or "").strip(),
+        (reply_language or "").strip(),
+    ):
+        if not learner:
+            continue
+        guidance = _PRONUNCIATION_GUIDANCE_BY_PAIR.get((learner, practice), "")
+        if guidance:
+            return guidance
+    return ""
+
+
+_TASK_CONTENT_CATEGORY_GUIDANCE: Dict[str, str] = {
+    "learning_language": (
+        "CATEGORY: language learning — output a DRILL SHEET, not study advice.\n"
+        "planName states the MAIN GOAL (e.g. learn Chinese for travel). The step "
+        "text says what to practice NOW — your job is to supply the actual "
+        "pinyin/words to drill, NOT to repeat the step in Thai.\n"
+        "WRONG `content`: 'ฝึกโทนเสียง 1-4 ด้วยคำตัวอย่าง...' (copies the step)\n"
+        "RIGHT `content`: 'mā (มา) โทน 1 — มา | má (ม้า) โทน 2 — ม้า | ...' "
+        "(lists real items)\n"
+        "Pull drill items from the step topic and planName; keep them aligned.\n"
+        "Structure `content` as a compact list (100–320 words). For each word:\n"
+        "- pinyin / target form in the PRACTICE language (required)\n"
+        "- pronunciation in the response language (e.g. คำอ่านไทย) — MANDATORY\n"
+        "- tone or reading note when relevant (โทน 1–4, long/short vowel, etc.)\n"
+        "- meaning and part of speech in the instruction language\n"
+        "- learn-how: one line on how to practice (read aloud, shadow, "
+        "notice tone) in the instruction language\n"
+        "For each sentence:\n"
+        "- sentence in practice language + pronunciation line in instruction "
+        "language + brief breakdown in instruction language\n"
+        "Quiz should test tones, pronunciation distinctions, meaning, or "
+        "usage details present in the material."
+    ),
+    "learning": (
+        "CATEGORY: learning (non-language) — concepts, formulas, or skills.\n"
+        "Output the actual STUDY MATERIAL for this step, grounded in planName "
+        "and the step topic — not generic study advice.\n"
+        "WRONG: 'review the concept and take notes' (advice, no content)\n"
+        "RIGHT: the concept itself, e.g. 'Compound interest: A = P(1+r/n)^(nt). "
+        "Worked: ฿10,000 at 6%/yr for 2y → …'\n"
+        "Structure `content` (90–220 words): key term → plain definition → one "
+        "worked mini-example with real numbers/steps → one common mistake → one "
+        "recall prompt or practice problem to do now. Use the step's specific "
+        "topic; never substitute a generic textbook example. Quiz tests the "
+        "definitions, steps, or distinctions embedded in the material."
+    ),
+    "exercise": (
+        "CATEGORY: fitness / exercise.\n"
+        "Output the exact workout to perform NOW for this step, matched to "
+        "planName's goal and difficulty — not 'remember to exercise'.\n"
+        "WRONG: 'do a good leg workout today' (vague)\n"
+        "RIGHT: 'Goblet squat 3×10 @ tempo 3-1-1, rest 60s — cue: chest up, "
+        "knees track toes; Walking lunge 3×12/leg …'\n"
+        "Structure `content` (80–180 words): named movements, sets × reps, "
+        "tempo, rest, form cues, and breathing. Scale to the plan's stated "
+        "level. Quiz may test form cues, rep counts, or safety details."
+    ),
+    "travel": (
+        "CATEGORY: travel.\n"
+        "Output material usable for THIS trip/destination from planName — real "
+        "phrases, names, numbers — not generic travel tips.\n"
+        "WRONG: 'research local transport options' (homework, not material)\n"
+        "RIGHT: actual lines/facts, e.g. 'BTS Skytrain: 17–62฿, runs 06:00–"
+        "24:00; say \"ขอไป… / one ticket to …\"'\n"
+        "Structure `content` (80–200 words): useful phrases or local terms, "
+        "concrete logistics (transit, timing, cost), one cultural note, and one "
+        "mini scenario to rehearse. Quiz tests the phrases/facts in the material."
+    ),
+    "finance": (
+        "CATEGORY: finance.\n"
+        "Output the concrete money step to do NOW for this plan's goal, with "
+        "real numbers — not generic 'save more money' advice.\n"
+        "WRONG: 'start budgeting and track spending' (vague)\n"
+        "RIGHT: '50/30/20 on ฿30,000 income → needs ฿15,000, wants ฿9,000, "
+        "save ฿6,000. List your 3 biggest \"wants\" to cut ฿1,000 this week.'\n"
+        "Structure `content` (80–200 words): today's money action, a concrete "
+        "number or formula, a worked example, and what to track. Quiz tests the "
+        "numbers, terms, or habit logic in the material."
+    ),
+    "health": (
+        "CATEGORY: health / wellness.\n"
+        "Output the specific protocol to do NOW for this plan's goal — exact "
+        "action, dose, duration — not 'be healthier'.\n"
+        "WRONG: 'drink more water and sleep well' (generic)\n"
+        "RIGHT: 'Box breathing 4-4-4-4 × 5 min: inhale 4s, hold 4s, exhale 4s, "
+        "hold 4s. Cue: relax shoulders on each exhale.'\n"
+        "Structure `content` (80–200 words): the specific action, duration or "
+        "dosage, a mindfulness or body cue, and one reflection check-in. Avoid "
+        "medical claims; keep it safe and general. Quiz tests the action details."
+    ),
+    "personal_development": (
+        "CATEGORY: personal development.\n"
+        "Output a concrete, do-it-now exercise tied to this plan's goal — not a "
+        "motivational paragraph.\n"
+        "WRONG: 'believe in yourself and stay consistent' (platitude)\n"
+        "RIGHT: 'Eisenhower matrix: list today's 5 tasks, mark each "
+        "Urgent/Important, do the 1 Important-not-Urgent first for 25 min.'\n"
+        "Structure `content` (80–200 words): the habit or skill cue, a short "
+        "reflection prompt, a concrete 2-minute action, and what to notice "
+        "afterward. Quiz tests the framework or cues in the material."
+    ),
+    "other": (
+        "CATEGORY: general.\n"
+        "Output a ready-to-do mini-exercise that realizes THIS step toward "
+        "planName's goal, with concrete specifics — never generic filler or a "
+        "restatement of the step.\n"
+        "Structure `content` (80–200 words) with steps the user performs now "
+        "and concrete details the quiz can test."
+    ),
+}
+
 _TASK_CONTENT_SYSTEM_PROMPT = (
     "You generate PRACTICE MATERIAL for a single step of a user's plan. The "
-    "user will WORK THROUGH whatever you produce — so output the actual "
-    "material to practice with, NOT an explanation of how to do the step and "
-    "NOT tips about technique.\n\n"
-    "What 'practice material' means by domain:\n"
-    "- language / study: the real items to drill — vocab lists with meanings, "
-    "example sentences, fill-in-the-blank or translation exercises, flashcard "
-    "pairs, short problems to solve.\n"
-    "- writing: a concrete writing prompt plus a short scaffold to write into.\n"
-    "- fitness / skill: the exact sets, reps, or drill sequence to perform now.\n"
-    "- general: a ready-to-do mini-exercise that realizes the step.\n\n"
-    "LANGUAGE: write the material in the SAME language as the practice step "
-    "text. If the step is about learning a target language, produce the "
-    "material IN that target language (a brief instruction line may be in the "
-    "user's language). Match the prompt — do not default to English.\n\n"
+    "user will WORK THROUGH whatever you produce — output the actual material "
+    "to practice with, shaped by the CATEGORY GUIDANCE in the user message.\n\n"
+    "QUIZ SUPPORT: when you include a quiz, `content` must carry every fact "
+    "the questions test — woven into the practice material itself. A careful "
+    "reader should find every correct answer in `content`.\n\n"
+    "Hierarchy: planName = the user's MAIN GOAL for the whole plan. The step "
+    "text = what to practice on THIS step only. Ground drill material in the "
+    "step while advancing the planName goal.\n\n"
+    "`content` must be a DRILL SHEET listing real practice-language items "
+    "(pinyin syllables/words line by line). NEVER output only a coaching-language "
+    "summary of what to do — that paraphrases the step and is WRONG.\n\n"
+    "Follow the LANGUAGE instruction in the user message — for language "
+    "learning, the step describes the task; drill items use the practice/target "
+    "language (e.g. Chinese pinyin). Coaching language is ONE language for "
+    "quiz, meanings, and notes — never mix English with Thai.\n\n"
     "Voice: direct and usable. No preamble, no meta commentary, no emoji.\n\n"
     "Hard rules:\n"
     "1. Return ONLY valid JSON. No markdown fences, no preamble.\n"
-    "2. `content`: the practice material itself, 60–160 words (a compact list "
-    "is fine). Ready to use immediately. Give the thing to practice — do NOT "
-    "explain how to do it or add tips.\n"
-    f"3. `quiz`: EXACTLY {_TASK_CONTENT_QUIZ_FIRST_BATCH} questions when checking "
-    "the material helps (recall, correct form, comprehension). More questions "
-    "are added in separate passes — do NOT try to fit all five here. For "
-    "pure-doing material with nothing to check, return an EMPTY array []. "
-    "Each item MUST have: 'question', 'choices' (array of EXACTLY 4 distinct "
-    "strings), 'answerIndex' (integer 0–3), and 'explanation' (one sentence). "
-    "The quiz MUST be in the same language as `content`.\n"
-    "4. Questions must be answerable from `content`. Exactly one choice is "
-    "correct per question.\n\n"
+    "2. `content`: follow the CATEGORY GUIDANCE word range and structure. "
+    "Ready to use immediately.\n"
+    f"3. `quiz`: EXACTLY {_TASK_CONTENT_QUIZ_FIRST_BATCH} questions when "
+    "checking the material helps. More are added later. For pure-doing steps "
+    "with nothing to check, return []. Each item: 'question', 'choices' "
+    "(EXACTLY 4 strings), 'answerIndex' (0–3), 'explanation' (2–3 sentences "
+    "that TEACH: why correct using a detail from `content`; why others miss; "
+    "one takeaway). Quiz text follows the LANGUAGE instruction.\n"
+    "4. Questions answerable from `content` alone. Exactly one correct choice.\n\n"
     "Output JSON shape (quiz may be empty):\n"
     "{\n"
-    '  "content": "<practice material, 60–160 words>",\n'
+    '  "content": "<practice material>",\n'
     '  "quiz": [\n'
     '    {"question":"...","choices":["...","...","...","..."],'
     '"answerIndex":0,"explanation":"..."}\n'
@@ -2075,13 +2623,534 @@ _TASK_CONTENT_QUIZ_TOPUP_SYSTEM = (
     "the user already has. Return ONLY valid JSON — no markdown fences.\n\n"
     "Hard rules:\n"
     "1. Output shape: {\"quiz\": [ ... ]} — do NOT include a `content` field.\n"
-    "2. Each new question MUST have: 'question', 'choices' (EXACTLY 4 distinct "
-    "strings), 'answerIndex' (integer 0–3), 'explanation' (one sentence).\n"
-    "3. Every question must be answerable from the PRACTICE MATERIAL below.\n"
-    "4. Do NOT repeat or lightly rephrase any question listed under EXISTING "
-    "QUESTIONS — test different facts or angles.\n"
-    "5. Write in the SAME language as the practice material.\n"
+    "2. Each new question: 'question', 'choices' (EXACTLY 4 strings), "
+    "'answerIndex' (0–3), 'explanation' (2–3 teaching sentences).\n"
+    "3. Every question answerable from the PRACTICE MATERIAL alone.\n"
+    "4. Do NOT repeat EXISTING QUESTIONS — test different facts in the "
+    "material.\n"
+    "5. Follow the LANGUAGE instruction in the user message for quiz text.\n"
 )
+
+
+def _normalize_task_content_category(raw: str) -> str:
+    key = (raw or "").lower().strip().replace(" ", "_").replace("-", "_")
+    if key in _TASK_CONTENT_PLAN_CATEGORIES:
+        return key
+    return _TASK_CONTENT_CATEGORY_ALIASES.get(key, "other")
+
+
+def _task_content_category_key(
+    task_category: str,
+    task_title: str,
+    task_detail: str,
+    plan_name: str = "",
+    plan_context: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Map task/plan signals to a content-template key."""
+    blob = f"{plan_name} {task_category} {task_title} {task_detail}".lower()
+    if isinstance(plan_context, dict):
+        for field in ("detailPrompt", "planSummary", "category"):
+            val = plan_context.get(field)
+            if val:
+                blob += f" {val}"
+        day = plan_context.get("day")
+        if isinstance(day, dict):
+            for field in ("title", "summary", "tips"):
+                val = day.get(field)
+                if val:
+                    blob += f" {val}"
+            labels = day.get("taskLabels") or []
+            if isinstance(labels, list):
+                blob += " " + " ".join(str(x) for x in labels[:12] if x)
+    if any(h in blob for h in _LANGUAGE_LEARNING_HINTS):
+        return "learning_language"
+    if _task_content_practice_language_from_hints(blob):
+        return "learning_language"
+    base = _normalize_task_content_category(task_category)
+    if base == "other" and isinstance(plan_context, dict):
+        base = _normalize_task_content_category(
+            str(plan_context.get("category") or "")
+        )
+    if base in _TASK_CONTENT_CATEGORY_GUIDANCE:
+        return base
+    return "other"
+
+
+def _task_content_analysis_blob(
+    task_title: str,
+    task_category: str,
+    task_detail: str,
+    plan_name: str,
+    plan_context: Optional[Dict[str, Any]] = None,
+    plan_context_block: str = "",
+) -> str:
+    """Blend planName goal, step text, and planner intent for language + focus."""
+    return _practice_analysis_blob(
+        task_title,
+        task_category,
+        task_detail,
+        plan_context_block,
+        plan_context,
+        plan_name,
+    )
+
+
+def _task_content_grounding_instruction(
+    plan_name: str = "",
+    step_text: str = "",
+    content_focus: str = "",
+    parent_task: str = "",
+) -> str:
+    """Anchor material in planName goal + this step's practice task."""
+    lines = [
+        "CONTENT GROUNDING: planName is the MAIN GOAL. The step text is what "
+        "the user practices RIGHT NOW. Every drill item must (a) fulfill the "
+        "step description and (b) advance the planName goal — not generic "
+        "textbook material. If the step names specific words or topics, use "
+        "those exactly.",
+    ]
+    if plan_name:
+        lines.append(f"Main goal (planName): {plan_name}")
+    if step_text:
+        lines.append(f"Step to practice now: {step_text}")
+    if parent_task and parent_task.strip() != (step_text or "").strip():
+        lines.append(f"Parent task context: {parent_task}")
+    if content_focus:
+        lines.append(f"Skill/topic focus for this step: {content_focus}")
+    return "\n".join(lines)
+
+
+# Generic verb-only steps that carry no drill specifics on their own.
+_THIN_STEP_GENERIC_TOKENS = (
+    "review", "practice", "study", "revise", "recap", "warm up", "warmup",
+    "continue", "keep going", "do it", "train", "exercise", "read", "listen",
+    "ทบทวน", "ฝึก", "ฝึกฝน", "อ่าน", "ทำต่อ", "เรียน", "ออกกำลัง", "ฟัง", "พูด",
+)
+
+
+def _task_content_step_is_thin(task_title: str, task_detail: str = "") -> bool:
+    """True when the step text is too brief to specify the drill on its own.
+
+    Thin steps (e.g. 'ทบทวน', 'practice speaking') must be resolved from the
+    planner context, not invented — otherwise the model produces off-plan,
+    misleading material.
+    """
+    step = (task_title or "").strip()
+    if not step:
+        return True
+    has_digit = any(c.isdigit() for c in step)
+    if _text_has_thai_script(step):
+        # Thai has no word spaces — judge by character length. A specific step
+        # ('ฝึกออกเสียงพินอิน 5 คำ') is longer than a bare verb ('ทบทวน').
+        if has_digit and len(step) >= 12:
+            return False
+        return len(step) < 18
+    words = step.split()
+    if has_digit and len(words) >= 3:
+        return False
+    lower = step.lower()
+    only_generic = lower in _THIN_STEP_GENERIC_TOKENS or all(
+        w.strip(".,!?;:").lower() in _THIN_STEP_GENERIC_TOKENS or len(w) <= 2
+        for w in words
+    )
+    return len(words) < 4 and (only_generic or len(step) < 22)
+
+
+def _task_content_thin_step_directive(
+    plan_name: str,
+    step_text: str,
+    has_plan_context: bool,
+    practice_language: str = "",
+    artifact: str = "content",
+) -> str:
+    """Force a brief step to be resolved from planner intent, not guesswork.
+
+    artifact: 'content' for a drill sheet, 'practice_card' for a scenario card.
+    """
+    practice = (practice_language or "").strip()
+    practice_foreign = bool(practice) and not _practice_languages_same(practice, "English")
+    if artifact == "practice_card":
+        drill_clause = (
+            f"a scenario that rehearses the next sensible {practice} sub-skill "
+            "for this goal"
+            if practice_foreign
+            else "a scenario that rehearses the next sensible sub-skill for this goal"
+        )
+    else:
+        drill_clause = (
+            f"the next sensible {practice} drill items for this goal"
+            if practice_foreign
+            else "the next sensible drill for this goal"
+        )
+    lines = [
+        "THIN STEP NOTICE: the step text above is brief and does NOT fully "
+        "specify what to practice. Do NOT guess a generic topic or invent "
+        "material unrelated to the plan.",
+    ]
+    if has_plan_context:
+        lines.append(
+            "Resolve the step from the PLAN ARC / day context below "
+            f"(main_goal, day_focus, day_steps) and produce {drill_clause}. "
+            "The drill MUST stay inside the planName goal's domain and match "
+            "where the user is in the plan."
+        )
+    else:
+        goal = (plan_name or "").strip()
+        lines.append(
+            f"Stay strictly inside the MAIN GOAL"
+            + (f" ('{goal}')" if goal else "")
+            + f" and produce {drill_clause}. Choose the most plausible next "
+            "sub-skill for that goal rather than generic filler, and keep it "
+            "concrete enough to actually practice."
+        )
+    return "\n".join(lines)
+
+
+def _task_content_drill_sheet_requirements(
+    step_text: str,
+    plan_name: str,
+    practice_language: str,
+    coaching_language: str,
+) -> str:
+    """Step-specific rules so output lists real drill items, not step paraphrase."""
+    step = (step_text or "").strip()
+    goal = (plan_name or "").strip()
+    blob = f"{goal} {step}".lower()
+    practice = (practice_language or "Chinese").strip()
+    coach = (coaching_language or "Thai").strip()
+    lines = [
+        "DRILL SHEET (CRITICAL — read before writing `content`):",
+        f"- planName goal: {goal or '(see above)'}",
+        f"- step task: {step or '(see above)'}",
+        f"- `content` MUST list real {practice} items (pinyin/words) the user "
+        f"reads aloud — one item per line or bullet.",
+        f"- FORBIDDEN: a {coach} paragraph that only explains what to do "
+        f"(rephrasing the step). That is NOT practice material.",
+        f"- REQUIRED: every drill line has {practice} form + {coach} คำอ่าน "
+        f"+ meaning when relevant.",
+    ]
+    if not _practice_languages_same(practice, coach):
+        translate_rule = (
+            f"- CRITICAL — TRANSLATE, DON'T COPY: any example words in the step "
+            f"(e.g. after 'เช่น' / 'such as' / 'e.g.' / ':') are written in "
+            f"{coach} and name the MEANINGS to teach — they are NOT the drill "
+            f"items. For each, output the {practice} word the user must learn, "
+            f"plus its {coach} pronunciation, plus the {coach} meaning. Drilling "
+            f"the {coach} word itself (e.g. a line like '{coach} word — คำอ่าน: "
+            f"same {coach} word — meaning: English') is WRONG and useless: the "
+            f"user is learning {practice}, not {coach}."
+        )
+        lines.append(translate_rule)
+        if _practice_languages_same(practice, "Chinese"):
+            lines.append(
+                "  Worked example — step 'เช่น เนื้อ ไก่ หมู' (Thai meanings) "
+                "MUST become Chinese drill items: '牛肉 niúròu (หนิว โร่ว) — "
+                "เนื้อ | 鸡肉 jīròu (จี โร่ว) — ไก่ | 猪肉 zhūròu (จู โร่ว) — หมู'. "
+                "Never list 'เนื้อ — คำอ่าน: เนื้อ'."
+            )
+    if "โทน" in step or "tone" in blob:
+        lines.append(
+            "- Step targets TONES: include ≥4 minimal pairs with tone labels "
+            "(e.g. mā (มา) โทน 1, má (ม้า) โทน 2, mǎ (ม้า) โทน 3, mà (มา) โทน 4)."
+        )
+    if "พินอิน" in step or "pinyin" in blob:
+        if any(n in step for n in ("6", "๖", "หก", "six")):
+            lines.append(
+                "- Step asks for 6 sounds: list EXACTLY 6 pinyin syllables with "
+                "คำอ่าน (e.g. bō, pō, mō, fō, dō, tō or the set implied by the step)."
+            )
+        elif any(n in step for n in ("5", "๕", "ห้า", "five")):
+            lines.append(
+                "- Step asks for 5 items: list EXACTLY 5 pinyin words/syllables."
+            )
+        else:
+            lines.append(
+                "- Include ≥5 distinct pinyin syllables/words from the step topic."
+            )
+    if "จับคู่" in step or "match" in blob:
+        lines.append(
+            "- Matching exercise: 5 pinyin items with clear sound/spelling pairs."
+        )
+    if "ทักทาย" in step or "greet" in blob or "ท่องเที่ยว" in goal:
+        lines.append(
+            "- Travel/survival focus: include greeting phrases "
+            "(e.g. nǐ hǎo, xièxie, zàijiàn, duìbuqǐ) with คำอ่าน + meaning."
+        )
+    return "\n".join(lines)
+
+
+def _text_has_thai_script(text: str) -> bool:
+    return any("\u0e00" <= c <= "\u0e7f" for c in (text or ""))
+
+
+# Unicode ranges that prove a drill actually contains the target language, for
+# script-distinct languages where copying the instruction language is
+# unambiguous. (Latin-script targets like French can't be checked this way.)
+_PRACTICE_SCRIPT_RANGES: Dict[str, Tuple[Tuple[int, int], ...]] = {
+    "Chinese": ((0x4E00, 0x9FFF), (0x3400, 0x4DBF)),               # CJK ideographs
+    "Japanese": ((0x3040, 0x30FF), (0x4E00, 0x9FFF)),              # kana + kanji
+    "Korean": ((0xAC00, 0xD7A3), (0x1100, 0x11FF)),               # hangul
+}
+# Toned pinyin vowels \u2014 count as Chinese content even without \u6c49\u5b57.
+_PINYIN_TONE_CHARS = frozenset("\u0101\u00e1\u01ce\u00e0\u0113\u00e9\u011b\u00e8\u012b\u00ed\u01d0\u00ec\u014d\u00f3\u01d2\u00f2\u016b\u00fa\u01d4\u00f9\u01d6\u01d8\u01da\u01dc")
+
+
+def _text_has_script(text: str, ranges: Tuple[Tuple[int, int], ...]) -> bool:
+    for c in (text or ""):
+        o = ord(c)
+        if any(lo <= o <= hi for lo, hi in ranges):
+            return True
+    return False
+
+
+def _task_content_needs_practice_script_check(
+    instruction_language: str, practice_language: str
+) -> bool:
+    """True when we can reliably verify the drill is in the practice language."""
+    practice = (practice_language or "").strip()
+    return (
+        practice in _PRACTICE_SCRIPT_RANGES
+        and not _practice_languages_same(instruction_language, practice)
+    )
+
+
+def _task_content_drill_uses_practice_language(
+    content: str, practice_language: str
+) -> bool:
+    """Heuristic: does `content` actually contain practice-language material?
+
+    Catches the failure where the model copies instruction-language example
+    words instead of drilling the target language (e.g. listing Thai '\u0e40\u0e19\u0e37\u0e49\u0e2d'
+    rather than Chinese '\u725b\u8089'). Only judges script-distinct targets; returns
+    True (assume fine) for languages we can't check this way.
+    """
+    practice = (practice_language or "").strip()
+    ranges = _PRACTICE_SCRIPT_RANGES.get(practice)
+    if not ranges:
+        return True
+    text = content or ""
+    if _text_has_script(text, ranges):
+        return True
+    if practice == "Chinese" and any(ch in _PINYIN_TONE_CHARS for ch in text):
+        return True
+    return False
+
+
+def _task_content_practice_script_correction(
+    practice_language: str, coaching_language: str
+) -> str:
+    """Forceful corrective appended on a regen when the first drill missed."""
+    practice = (practice_language or "the target language").strip()
+    coach = (coaching_language or "Thai").strip()
+    extra = ""
+    if practice == "Chinese":
+        extra = (
+            " Every drill line MUST start with \u6c49\u5b57 + pinyin (with tone marks), "
+            "e.g. '\u725b\u8089 ni\u00far\u00f2u (\u0e2b\u0e19\u0e34\u0e27 \u0e42\u0e23\u0e48\u0e27) \u2014 \u0e40\u0e19\u0e37\u0e49\u0e2d'."
+        )
+    elif practice == "Japanese":
+        extra = " Every drill line MUST contain Japanese script (\u304b\u306a/\u6f22\u5b57)."
+    elif practice == "Korean":
+        extra = " Every drill line MUST contain Hangul (\ud55c\uae00)."
+    return (
+        f"CORRECTION \u2014 your previous attempt drilled {coach} words instead of "
+        f"{practice}. That is WRONG and unusable. The user is learning "
+        f"{practice}. Output the actual {practice} word/phrase for each item, "
+        f"with {coach} pronunciation and meaning. Do NOT list {coach} words as "
+        f"the drill items.{extra}"
+    )
+
+
+def _task_content_instruction_language(
+    task_title: str,
+    task_detail: str,
+    language_selected: str,
+) -> str:
+    """Language of the step description (what to practice now), not planName."""
+    step_blob = (task_title or "").strip()
+    if not step_blob:
+        step_blob = "\n".join(
+            p for p in (task_detail,) if p and p.strip()
+        ).strip()
+    if _text_has_thai_script(step_blob):
+        return "Thai"
+    if len(step_blob) >= 4:
+        return _practice_planner_language_fallback(step_blob, language_selected)
+    return _ui_language_name(language_selected)
+
+
+def _task_content_practice_language_blob(
+    task_title: str,
+    task_detail: str,
+    plan_context: Optional[Dict[str, Any]],
+    plan_name: str,
+) -> str:
+    parts: List[str] = []
+    if plan_name:
+        parts.append(plan_name)
+    parts.extend(p for p in (task_title, task_detail) if p and p.strip())
+    if isinstance(plan_context, dict):
+        for field in (
+            "detailPrompt", "planSummary", "category", "becomingPhrase", "planName",
+        ):
+            val = plan_context.get(field)
+            if val:
+                parts.append(str(val))
+        day = plan_context.get("day")
+        if isinstance(day, dict):
+            for field in ("title", "summary", "tips"):
+                val = day.get(field)
+                if val:
+                    parts.append(str(val))
+            labels = day.get("taskLabels") or []
+            if isinstance(labels, list):
+                parts.extend(str(x) for x in labels[:12] if x)
+    return " ".join(p for p in parts if p).lower()
+
+
+def _task_content_practice_language_from_hints(blob: str) -> Optional[str]:
+    """Detect target language from step/planner text — skip Thai as practice target."""
+    for lang_name, hints in _PRACTICE_TARGET_LANGUAGE_HINTS.items():
+        if lang_name == "Thai":
+            continue
+        if any(h in blob for h in hints):
+            return lang_name
+    return None
+
+
+def _task_content_practice_language(
+    task_title: str,
+    task_detail: str,
+    plan_context: Optional[Dict[str, Any]],
+    plan_name: str,
+    language_selected: str,
+    planner_language: str = "",
+    instruction_language: str = "",
+) -> str:
+    """Target language being practiced (e.g. Chinese), NOT the task title language."""
+    blob = _task_content_practice_language_blob(
+        task_title, task_detail, plan_context, plan_name,
+    )
+    hint_lang = _task_content_practice_language_from_hints(blob)
+    if hint_lang:
+        return hint_lang
+    instr = (
+        (instruction_language or "").strip()
+        or _task_content_instruction_language(
+            task_title, task_detail, language_selected,
+        )
+    )
+    reply_language = _ui_language_name(language_selected)
+    sanitized = _sanitize_planner_target_language(
+        planner_language, blob, instr, reply_language,
+    )
+    if sanitized:
+        return sanitized
+    return instr
+
+
+def _task_content_planner_intent_note(
+    instruction_language: str,
+    practice_language: str,
+    category_key: str,
+    task_title: str,
+    task_detail: str,
+    plan_name: str = "",
+) -> str:
+    """Clarify planName goal vs step task for foreign-language drills."""
+    instr = (instruction_language or "").strip()
+    practice = (practice_language or "").strip()
+    blob = f"{plan_name} {task_title} {task_detail}".lower()
+    foreign_step = (
+        not _practice_languages_same(instr, practice)
+        or _task_content_practice_language_from_hints(blob) is not None
+        or category_key == "learning_language"
+    )
+    if not foreign_step:
+        return ""
+    goal_line = (
+        f"planName main goal: {plan_name}. " if plan_name else ""
+    )
+    return (
+        f"PLANNER INTENT: {goal_line}The step text is in {instr} — it describes "
+        f"WHAT to practice {practice} on this step, not the language of the "
+        f"drill items. `content` MUST include real {practice} practice items "
+        f"(pinyin, tone pairs, words, sentences). A coaching-only paraphrase "
+        f"with no {practice} material is WRONG. Quiz must test {practice} "
+        f"details from `content`. Questions and explanations use the coaching "
+        f"language only (no English mixed in)."
+    )
+
+
+def _task_content_language_mix_instruction(
+    instruction_language: str,
+    practice_language: str,
+    category_key: str = "other",
+    artifact: str = "content",
+    reply_language: Optional[str] = None,
+) -> str:
+    """Instruction lang from task text; practice lang = target language learned.
+
+    artifact: 'content' for generate_task_content, 'practice_card' for
+    generate_practice. reply_language (languageSelected) is the responding
+    language for quiz/coaching; drill items use practice_language.
+    """
+    instr = (instruction_language or "English").strip()
+    practice = (practice_language or instr).strip()
+    respond = (reply_language or instr).strip()
+    if artifact == "practice_card":
+        output_desc = (
+            "card (`situation`, choice `label`s, `afterChoiceNote`, "
+            "`coachFollowUp`)"
+        )
+        mixed_output = (
+            f"Write `situation` in {respond} (languageSelected) with "
+            f"{practice} phrases to rehearse. Write choice `label`s in {respond} "
+            f"(with {practice} terms and pronunciation in {respond} where "
+            f"spoken). Write `afterChoiceNote` and `coachFollowUp` entirely in "
+            f"{respond}."
+        )
+    else:
+        output_desc = "`content` and quiz"
+        mixed_output = (
+            f"The `content` drill list MUST contain real {practice} items "
+            f"(pinyin, tones, words — not a paraphrase of the step). "
+            f"Write meanings, learn-how, grammar notes, quiz questions, "
+            f"choices, and explanations ONLY in {respond}. "
+            f"Do NOT mix English with {respond}. English is forbidden unless "
+            f"{respond} is English."
+        )
+    is_foreign_language_drill = (
+        category_key == "learning_language"
+        or (
+            category_key in ("learning", "other")
+            and not _practice_languages_same(instr, practice)
+        )
+    )
+    if is_foreign_language_drill:
+        if _practice_languages_same(respond, practice):
+            return (
+                f"LANGUAGE: write {output_desc} in {respond}. Include actual "
+                f"{practice} drill material from the step intent — not only "
+                f"instructions about studying. Do NOT default to English."
+            )
+        pron = _task_content_pronunciation_guidance(instr, practice, respond)
+        base = (
+            f"LANGUAGE (mixed — CRITICAL): the step text is in {instr} — it "
+            f"describes what to practice. planName sets the main goal. The user "
+            f"is practicing {practice}. Coaching language is {respond} — use it "
+            f"for ALL quiz text, "
+            f"explanations, meanings, and pronunciation guides. "
+            f"Drill items stay in {practice}. {mixed_output} "
+            f"Every {practice} syllable/word MUST include pronunciation in "
+            f"{respond} (e.g. Thai คำอ่าน for Chinese pinyin)."
+        )
+        return f"{base}\n{pron}" if pron else base
+    return (
+        f"LANGUAGE: write {output_desc} entirely in {respond}. "
+        f"Ground in planName (main goal) and the step text (practice task). "
+        f"Do NOT use English unless languageSelected is English."
+    )
 
 
 def _strip_json_fence(raw: str) -> str:
@@ -2094,13 +3163,16 @@ def _strip_json_fence(raw: str) -> str:
     return text
 
 
-def _task_content_model_bundle(_tier: str = "free") -> Tuple[str, int, str]:
+def _task_content_model_bundle(
+    _tier: str = "free", category_key: str = "other",
+) -> Tuple[str, int, str]:
     """All signed-in tiers use the flagship model for practice-step material.
 
     Upsell is monthly credits (free 10 / plus 30 tasks per month, premium
     unlimited), not model quality. Returns (model_id, max_completion_tokens, model_tier).
     """
-    return COACH_MODEL_PREMIUM, 1400, "flagship"
+    tokens = 2100 if category_key == "learning_language" else 1700
+    return COACH_MODEL_PREMIUM, tokens, "flagship"
 
 
 def _task_content_response_extras(
@@ -2203,6 +3275,13 @@ def _resolve_task_content_uid_tier(
         )
         return client_uid, _coach_tier_for_uid(client_uid)
     return None, "free"
+
+
+def _resolve_evo_authenticated_uid_tier(
+    req: https_fn.Request, payload: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[str], str]:
+    """EVO app auth for write endpoints (subscription)."""
+    return _resolve_task_content_uid_tier(req, payload or {})
 
 
 def _task_content_quota_peek(
@@ -2331,7 +3410,7 @@ def _normalize_quiz(
             "question": question[:400],
             "choices": norm_choices,
             "answerIndex": answer_index,
-            "explanation": str(q.get("explanation", "")).strip()[:400],
+            "explanation": str(q.get("explanation", "")).strip()[:700],
         })
     return out
 
@@ -2372,6 +3451,8 @@ def _task_content_generate_quiz_batch(
     model: str,
     task_title: str,
     task_detail: str,
+    language_instruction: str = "",
+    coaching_language: str = "",
 ) -> List[Dict[str, Any]]:
     """One lightweight LLM pass — quiz only, no practice material."""
     count = max(1, min(int(count), _TASK_CONTENT_QUIZ_TOPUP_BATCH))
@@ -2388,7 +3469,12 @@ def _task_content_generate_quiz_batch(
         user_lines += ["", f"STEP CONTEXT: {task_title}"]
     if task_detail and task_detail != task_title:
         user_lines.append(task_detail[:800])
+    if language_instruction:
+        user_lines += ["", language_instruction]
     user_lines += [
+        "",
+        "Each explanation must teach: why the correct answer is right (cite the "
+        "material), why distractors miss, and one takeaway.",
         "",
         'Return JSON: {"quiz":[...]} per the contract.',
     ]
@@ -2398,8 +3484,9 @@ def _task_content_generate_quiz_batch(
             system_prompt=_TASK_CONTENT_QUIZ_TOPUP_SYSTEM,
             user_prompt="\n".join(user_lines),
             model=model,
-            max_completion_tokens=700,
-            auto_detect_language=True,
+            max_completion_tokens=900,
+            auto_detect_language=False,
+            reply_language=_language_name_to_chat_code(coaching_language) if coaching_language else None,
         )
         if not response_text or not response_text.strip():
             return []
@@ -2417,6 +3504,8 @@ def _task_content_ensure_quiz_target(
     model: str,
     task_title: str,
     task_detail: str,
+    language_instruction: str = "",
+    coaching_language: str = "",
 ) -> List[Dict[str, Any]]:
     """Grow quiz to _TASK_CONTENT_QUIZ_TARGET via batched top-up calls."""
     quiz = _normalize_quiz(quiz, max_items=_TASK_CONTENT_QUIZ_TARGET)
@@ -2432,7 +3521,8 @@ def _task_content_ensure_quiz_target(
             _TASK_CONTENT_QUIZ_TARGET - len(quiz),
         )
         batch = _task_content_generate_quiz_batch(
-            content, quiz, need, model, task_title, task_detail
+            content, quiz, need, model, task_title, task_detail,
+            language_instruction, coaching_language,
         )
         if not batch:
             break
@@ -2452,15 +3542,42 @@ def _task_content_maybe_topup_cached_quiz(
     task_title: str,
     task_detail: str,
     step_fingerprint: str,
+    language_instruction: str = "",
 ) -> List[Dict[str, Any]]:
     """Backfill older caches (<5 questions) without spending monthly quota."""
     content = (cached.get("content") or "").strip()
     quiz = _normalize_quiz(cached.get("quiz"), max_items=_TASK_CONTENT_QUIZ_TARGET)
     if not content or not quiz or len(quiz) >= _TASK_CONTENT_QUIZ_TARGET:
         return quiz
-    model, _, _ = _task_content_model_bundle(tier)
+    category_key = cached.get("contentCategory") or "other"
+    model, _, _ = _task_content_model_bundle(tier, category_key)
+    lang_inst = language_instruction
+    if not lang_inst:
+        instr = (
+            cached.get("instructionLanguage")
+            or cached.get("stepLanguage")
+            or cached.get("replyLanguage")
+        )
+        practice = (
+            cached.get("practiceLanguage")
+            or cached.get("plannerLanguage")
+            or instr
+        )
+        if instr:
+            coach = (
+                cached.get("coachingLanguage")
+                or cached.get("replyLanguage")
+                or instr
+            )
+            lang_inst = _task_content_language_mix_instruction(
+                instr,
+                practice,
+                cached.get("contentCategory") or "other",
+                reply_language=coach,
+            )
+    coach_lang = cached.get("coachingLanguage") or cached.get("replyLanguage") or ""
     expanded = _task_content_ensure_quiz_target(
-        content, quiz, model, task_title, task_detail
+        content, quiz, model, task_title, task_detail, lang_inst, coach_lang,
     )
     if len(expanded) > len(quiz):
         _task_content_cache_set(uid, task_id, {
@@ -2486,8 +3603,9 @@ def _task_content_maybe_topup_cached_quiz(
 def generate_task_content(req: https_fn.Request) -> https_fn.Response:
     """Generate practice-step drill material + optional quiz.
 
-    Tier + monthly quota verified server-side; per-task cache is free.
-    Model: flagship (gpt-5.4) for all tiers; Free/Plus are capped per month."""
+    Thai task titles describe foreign-language drills; content uses practice
+    language (e.g. Chinese pinyin) with languageSelected for quiz/explanations.
+    Tier + monthly quota server-side; cache free."""
     if req.method == 'OPTIONS':
         return handle_preflight_request()
 
@@ -2506,6 +3624,7 @@ def generate_task_content(req: https_fn.Request) -> https_fn.Response:
         task_title = (payload.get("taskTitle") or "").strip()
         task_category = (payload.get("taskCategory") or "").strip()
         task_detail = (payload.get("taskDetail") or "").strip()
+        plan_id = (payload.get("planId") or "").strip()
         plan_name = (payload.get("planName") or "").strip()
         language_selected = (
             payload.get("languageSelected") or payload.get("language") or "english"
@@ -2531,6 +3650,85 @@ def generate_task_content(req: https_fn.Request) -> https_fn.Response:
         uid, tier = _resolve_task_content_uid_tier(req, payload)
         is_paid = tier in ("plus", "premium")
 
+        reply_language = _ui_language_name(language_selected)
+
+        plan_context = None
+        if plan_id:
+            plan_context = _load_practice_plan_context(
+                uid, plan_id, plan_day_number,
+            )
+            if plan_context is None:
+                # The client asked us to ground in a specific plan but we could
+                # not load it — the model will fall back to generic, off-intent
+                # material. Surface this loudly; it is the usual cause of
+                # "content doesn't match the planner".
+                logger.warning(
+                    "generate_task_content: plan_id=%s sent but plan context "
+                    "did NOT load (uid=%s, day=%s) — output will not be grounded "
+                    "in planner intent",
+                    plan_id, uid or "anon", plan_day_number,
+                )
+        plan_context_block = (
+            _format_practice_plan_context_block(plan_context)
+            if plan_context else ""
+        )
+        effective_plan_name = _resolve_task_content_plan_name(
+            plan_name, plan_context,
+        )
+        analysis_blob = _task_content_analysis_blob(
+            task_title,
+            task_category,
+            task_detail,
+            effective_plan_name,
+            plan_context,
+            plan_context_block,
+        )
+        instruction_language = _task_content_instruction_language(
+            task_title, task_detail, language_selected,
+        )
+        category_key = _task_content_category_key(
+            task_category, task_title, task_detail, effective_plan_name, plan_context,
+        )
+        planner_language, content_focus = _analyze_practice_intent(
+            analysis_blob, language_selected, plan_context, instruction_language,
+            effective_plan_name,
+        )
+        practice_language = _task_content_practice_language(
+            task_title,
+            task_detail,
+            plan_context,
+            effective_plan_name,
+            language_selected,
+            planner_language,
+            instruction_language,
+        )
+        coaching_language = _task_content_coaching_language(
+            instruction_language,
+            reply_language,
+            practice_language,
+            category_key,
+            task_title,
+            task_detail,
+        )
+        language_instruction = _task_content_language_mix_instruction(
+            instruction_language,
+            practice_language,
+            category_key,
+            reply_language=coaching_language,
+        )
+        planner_intent_note = _task_content_planner_intent_note(
+            instruction_language,
+            practice_language,
+            category_key,
+            task_title,
+            task_detail,
+            effective_plan_name,
+        )
+        category_guidance = _TASK_CONTENT_CATEGORY_GUIDANCE[category_key]
+        grounding_instruction = _task_content_grounding_instruction(
+            effective_plan_name, task_title, content_focus, task_detail,
+        )
+
         if not _coach_rate_allow(uid or "", is_paid):
             return create_response(
                 success=False, message='Rate limit',
@@ -2543,7 +3741,30 @@ def generate_task_content(req: https_fn.Request) -> https_fn.Response:
             cached = _task_content_cache_get(uid, task_id)
             if cached and cached.get("content"):
                 cached_fp = (cached.get("stepFingerprint") or "").strip()
-                if not step_fingerprint or not cached_fp or cached_fp == step_fingerprint:
+                cached_logic_v = int(cached.get("contentLogicVersion") or 0)
+                stale_logic = cached_logic_v < _TASK_CONTENT_LOGIC_VERSION
+                serve_cache = (
+                    not step_fingerprint or not cached_fp
+                    or cached_fp == step_fingerprint
+                )
+                if serve_cache and stale_logic:
+                    # Generation logic improved since this entry was written.
+                    # Regenerate it — but only if that won't cost the user a new
+                    # credit (task already charged this month) or there is quota
+                    # headroom. If they are capped, keep serving the old content
+                    # rather than blocking access.
+                    _ok, _c, _cap, already = _task_content_quota_peek(
+                        uid, tier, tz_offset_minutes, task_quota_key
+                    )
+                    if already or _ok:
+                        serve_cache = False
+                        logger.info(
+                            "generate_task_content: cache logic v%d<v%d — "
+                            "regenerating uid=%s task=%s (already_charged=%s)",
+                            cached_logic_v, _TASK_CONTENT_LOGIC_VERSION,
+                            uid, task_id, already,
+                        )
+                if serve_cache:
                     quiz = _task_content_maybe_topup_cached_quiz(
                         uid,
                         task_id,
@@ -2552,6 +3773,7 @@ def generate_task_content(req: https_fn.Request) -> https_fn.Response:
                         task_title,
                         task_detail,
                         step_fingerprint,
+                        language_instruction,
                     )
                     _allowed, count, cap, _charged = _task_content_quota_peek(
                         uid, tier, tz_offset_minutes, task_quota_key
@@ -2594,17 +3816,79 @@ def generate_task_content(req: https_fn.Request) -> https_fn.Response:
                 metadata={"capReached": True, "tier": tier, "cap": cap, "used": count},
             )
 
-        # 3) Generate. Lead the prompt with the STEP TEXT so the language
-        #    detector (and the model) key off the practice step itself — the
-        #    output language follows the prompt, not the app's UI language.
-        model, max_tokens, model_tier = _task_content_model_bundle(tier)
-        user_prompt_lines = [f"PRACTICE STEP: {task_title}"]
-        if task_detail:
-            user_prompt_lines.append(task_detail)
+        # 3) Generate — category-specific material + mixed language layout.
+        model, max_tokens, model_tier = _task_content_model_bundle(tier, category_key)
+        user_prompt_lines: List[str] = []
+        if effective_plan_name:
+            user_prompt_lines += [
+                "MAIN GOAL (planName — overall purpose of this plan):",
+                f"- planName: {effective_plan_name}",
+                "",
+            ]
+        user_prompt_lines += [
+            "THIS STEP — what to practice now (step description, not the main goal):",
+            f"- step: {task_title}",
+        ]
+        if task_detail and task_detail.strip() != (task_title or "").strip():
+            user_prompt_lines.append(f"- parent_task: {task_detail}")
+        user_prompt_lines += [
+            "",
+            f"SELECTED RESPONSE LANGUAGE (languageSelected): {reply_language}",
+            f"COACHING LANGUAGE (quiz, notes, explanations — one language only): "
+            f"{coaching_language}",
+            f"TASK TEXT LANGUAGE (instructions only): {instruction_language}",
+            f"PRACTICE/TARGET LANGUAGE (drill material): {practice_language}",
+            language_instruction,
+        ]
+        if planner_intent_note:
+            user_prompt_lines += ["", planner_intent_note]
+        user_prompt_lines += [
+            "",
+            grounding_instruction,
+        ]
+        if _task_content_step_is_thin(task_title, task_detail):
+            user_prompt_lines += [
+                "",
+                _task_content_thin_step_directive(
+                    effective_plan_name,
+                    task_title,
+                    has_plan_context=bool(plan_context),
+                    practice_language=practice_language,
+                ),
+            ]
+        user_prompt_lines += [
+            "",
+            "CATEGORY GUIDANCE:",
+            category_guidance,
+        ]
+        pronunciation_guidance = _task_content_pronunciation_guidance(
+            instruction_language, practice_language, reply_language,
+        )
+        if pronunciation_guidance:
+            user_prompt_lines += ["", pronunciation_guidance]
+        if (
+            category_key == "learning_language"
+            or not _practice_languages_same(instruction_language, practice_language)
+        ):
+            user_prompt_lines += [
+                "",
+                _task_content_drill_sheet_requirements(
+                    task_title,
+                    effective_plan_name,
+                    practice_language,
+                    coaching_language,
+                ),
+            ]
         if task_category:
-            user_prompt_lines.append(f"(category: {task_category})")
-        if plan_name:
-            user_prompt_lines.append(f"(plan: {plan_name})")
+            user_prompt_lines += ["", f"- taskCategory: {task_category}"]
+        if plan_context_block:
+            user_prompt_lines += ["", plan_context_block]
+        if content_focus:
+            user_prompt_lines += [
+                "",
+                "PLANNER INTENT FOCUS (from planName + step + plan arc):",
+                f"- {content_focus}",
+            ]
         if plan_day_number is not None:
             try:
                 user_prompt_lines.append(f"(plan day {int(plan_day_number)})")
@@ -2620,16 +3904,24 @@ def generate_task_content(req: https_fn.Request) -> https_fn.Response:
             )
         user_prompt_lines.append("")
         user_prompt_lines.append(
-            f"Produce ready-to-use PRACTICE MATERIAL for this step plus exactly "
+            f"Produce a ready-to-use DRILL SHEET for the step above (real "
+            f"{practice_language} items — not a {coaching_language} summary of "
+            f"the step), aligned with planName, plus exactly "
             f"{_TASK_CONTENT_QUIZ_FIRST_BATCH} quiz questions when a quiz helps "
-            "(more are added later), in the same language as the step, per the "
-            "JSON contract."
+            "(more are added later). Embed every fact the quiz will test inside "
+            "the material. Write rich 2–3 sentence explanations per the JSON "
+            "contract."
         )
         user_prompt = "\n".join(user_prompt_lines)
 
         logger.info(
-            "generate_task_content: uid=%s tier=%s model=%s task_id=%s peek_used=%s/%s",
-            uid, tier, model, task_id, count, cap if cap is not None else "∞",
+            "generate_task_content: uid=%s tier=%s model=%s category=%s "
+            "reply_lang=%s coach_lang=%s instr_lang=%s practice_lang=%s "
+            "plan_id=%s has_plan_ctx=%s task_id=%s peek_used=%s/%s",
+            uid, tier, model, category_key, reply_language, coaching_language,
+            instruction_language, practice_language, plan_id or "-",
+            bool(plan_context), task_id,
+            count, cap if cap is not None else "∞",
         )
 
         from chatgpt_wrapper import chat_with_gpt
@@ -2638,9 +3930,8 @@ def generate_task_content(req: https_fn.Request) -> https_fn.Response:
             user_prompt=user_prompt,
             model=model,
             max_completion_tokens=max_tokens,
-            # Follow the step/prompt language (detected from user_prompt), not
-            # the UI language — so material matches what's being practiced.
-            auto_detect_language=True,
+            auto_detect_language=False,
+            reply_language=_language_name_to_chat_code(coaching_language),
         )
 
         if not response_text or not response_text.strip():
@@ -2671,9 +3962,67 @@ def generate_task_content(req: https_fn.Request) -> https_fn.Response:
                 error='No content produced. Try again.', status_code=502,
             )
 
+        # Output-quality guard: when the target language is script-distinct
+        # (Chinese/Japanese/Korean) and differs from the step language, verify
+        # the drill is actually in that language. The common failure is copying
+        # the instruction-language example words. If so, regenerate ONCE with a
+        # forceful correction before charging the user.
+        if _task_content_needs_practice_script_check(
+            instruction_language, practice_language
+        ) and not _task_content_drill_uses_practice_language(
+            content, practice_language
+        ):
+            logger.warning(
+                "generate_task_content: drill missing %s script (copied %s?) — "
+                "regenerating once uid=%s task=%s",
+                practice_language, instruction_language, uid, task_id,
+            )
+            correction = _task_content_practice_script_correction(
+                practice_language, coaching_language
+            )
+            try:
+                from chatgpt_wrapper import chat_with_gpt
+                retry_text = chat_with_gpt(
+                    system_prompt=_TASK_CONTENT_SYSTEM_PROMPT,
+                    user_prompt=f"{user_prompt}\n\n{correction}",
+                    model=model,
+                    max_completion_tokens=max_tokens,
+                    auto_detect_language=False,
+                    reply_language=_language_name_to_chat_code(coaching_language),
+                )
+                retry_parsed = json.loads(_strip_json_fence(retry_text or ""))
+                retry_content = (
+                    (retry_parsed.get("content") or "").strip()
+                    if isinstance(retry_parsed, dict) else ""
+                )
+                if retry_content and _task_content_drill_uses_practice_language(
+                    retry_content, practice_language
+                ):
+                    content = retry_content
+                    quiz = _normalize_quiz(
+                        retry_parsed.get("quiz"),
+                        max_items=_TASK_CONTENT_QUIZ_FIRST_BATCH,
+                    )
+                    logger.info(
+                        "generate_task_content: correction succeeded uid=%s task=%s",
+                        uid, task_id,
+                    )
+                else:
+                    logger.warning(
+                        "generate_task_content: correction still missing %s "
+                        "script uid=%s task=%s",
+                        practice_language, uid, task_id,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "generate_task_content: practice-script correction failed "
+                    "uid=%s: %s", uid, e,
+                )
+
         if quiz:
             quiz = _task_content_ensure_quiz_target(
-                content, quiz, model, task_title, task_detail
+                content, quiz, model, task_title, task_detail,
+                language_instruction, coaching_language,
             )
             logger.info(
                 "generate_task_content: quiz batched uid=%s task=%s count=%d",
@@ -2689,6 +4038,14 @@ def generate_task_content(req: https_fn.Request) -> https_fn.Response:
             "stepFingerprint": step_fingerprint or None,
             "model_used": model,
             "model_tier": model_tier,
+            "contentCategory": category_key,
+            "replyLanguage": reply_language,
+            "instructionLanguage": instruction_language,
+            "practiceLanguage": practice_language,
+            "contentFocus": content_focus or None,
+            "plannerLanguage": planner_language or None,
+            "coachingLanguage": coaching_language,
+            "contentLogicVersion": _TASK_CONTENT_LOGIC_VERSION,
         }
         _task_content_cache_set(uid, task_id, normalized)
 
@@ -2856,7 +4213,10 @@ def _verify_google_subscription(purchase_token: str, sku: str) -> Dict[str, Any]
     }
 
 
-@https_fn.on_request(memory=512, max_instances=10, timeout_sec=60, cpu=1)
+@https_fn.on_request(
+    memory=512, max_instances=10, timeout_sec=60, cpu=1,
+    secrets=[_EVO_FIREBASE_SA_SECRET],
+)
 def verify_coach_subscription(req: https_fn.Request) -> https_fn.Response:
     """Verify an iOS/Android IAP receipt and grant premium in Firestore."""
     if req.method == 'OPTIONS':
@@ -2868,15 +4228,14 @@ def verify_coach_subscription(req: https_fn.Request) -> https_fn.Response:
         )
 
     try:
-        # Auth — required (we need a uid to write the subscription doc).
-        uid, _ = _verify_coach_tier(req)
+        payload = req.get_json(silent=True) or {}
+        uid, _ = _resolve_evo_authenticated_uid_tier(req, payload)
         if not uid:
             return create_response(
                 success=False, message='Auth required',
                 error='Sign in to confirm your purchase.', status_code=401,
             )
 
-        payload = req.get_json(silent=True) or {}
         receipt = (payload.get("receipt") or "").strip()
         platform = (payload.get("platform") or "").lower()
         sku = (payload.get("sku") or "").strip()
@@ -2929,13 +4288,11 @@ def verify_coach_subscription(req: https_fn.Request) -> https_fn.Response:
                 status_code=400,
             )
 
-        # Write Firestore subscription doc. From this moment the user is
-        # treated as `granted_tier` by useCoachSubscription on the client
-        # and by coach_review on the server.
+        # Write subscription in evoforluanching Firestore (not scheduler project).
         from firebase_admin import firestore as _fs
+        db = _evo_task_content_db()
         sub_ref = (
-            firestore.client()
-            .collection("users").document(uid)
+            db.collection("users").document(uid)
             .collection("coachSubscription").document("current")
         )
         sub_ref.set({
@@ -2944,7 +4301,7 @@ def verify_coach_subscription(req: https_fn.Request) -> https_fn.Response:
             "sku": sku,
             "originalTransactionId": v.get("original_transaction_id") or transaction_id,
             "expiresAt": _fs.Timestamp.from_seconds(expires_ms // 1000) if hasattr(_fs, "Timestamp") else datetime.utcfromtimestamp(expires_ms // 1000),
-            "updatedAt": _fs.SERVER_TIMESTAMP if hasattr(_fs, "SERVER_TIMESTAMP") else datetime.utcnow().isoformat(),
+            "updatedAt": _fs.SERVER_TIMESTAMP if hasattr(_fs, "SERVER_TIMESTAMP") else datetime.now(timezone.utc).isoformat(),
         }, merge=True)
 
         logger.info(
@@ -2988,7 +4345,7 @@ def _get_firestore_client():
 def _create_planner_job(request_data: Dict[str, Any]) -> Dict[str, Any]:
     """Create a new planner generation job in Firestore"""
     job_id = f"plan_{uuid.uuid4().hex[:12]}"
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     
     # Estimate generation time
     total_days = request_data.get('totalDays', 30)
@@ -3027,7 +4384,7 @@ def _create_planner_job(request_data: Dict[str, Any]) -> Dict[str, Any]:
 
 def _update_planner_job(job_id: str, updates: Dict[str, Any]):
     """Update a planner job in Firestore"""
-    updates["updated_at"] = datetime.utcnow().isoformat()
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
     
     try:
         db = _get_firestore_client()
@@ -5132,7 +6489,7 @@ def track_user_intent_signal(req: https_fn.Request) -> https_fn.Response:
             except Exception:
                 event_time = None
         if event_time is None:
-            event_time = datetime.utcnow()
+            event_time = datetime.now(timezone.utc)
         time_bucket = _build_time_bucket(event_time)
 
         db = _get_firestore_client()
