@@ -1258,11 +1258,15 @@ class PlannerUtils:
         identity / plasticity), optional stats, and todos to write a longer
         fortune-style "path reading" that still frames outcomes as emerging from
         habits and context—not supernatural certainty.
+
+        ``natural_power``: synthesizes **all** earned runes (meanings + identity
+        lines) into a short personalized "natural power in you" status — capacities
+        wired through practice and plasticity, not a random draw or dashboard tally.
         """
         try:
             normalized_language = self.validator.validate_language(language)
             normalized_output = (output_style or "brief").strip().lower()
-            if normalized_output not in ("brief", "share_card"):
+            if normalized_output not in ("brief", "share_card", "natural_power"):
                 normalized_output = "brief"
 
             earned = normalize_earned_runes_for_llm(
@@ -1334,6 +1338,71 @@ class PlannerUtils:
                     model=model,
                 )
                 logger.info("Share-card style todo/rune reading generated successfully")
+                return response
+
+            if normalized_output == "natural_power":
+                rune_lines = []
+                for r in earned[:24]:
+                    if not isinstance(r, dict):
+                        continue
+                    key = r.get("key") or r.get("rune_key")
+                    if not key:
+                        continue
+                    nm = r.get("name") or key
+                    meaning = r.get("meaning") or ""
+                    cat = r.get("category") or ""
+                    becoming = r.get("becoming") or ""
+                    rune_lines.append(
+                        f"- {nm} ({key}): {meaning}"
+                        + (f" [category: {cat}]" if cat else "")
+                        + (f" — earned identity: {becoming}" if becoming else "")
+                    )
+                rune_block = (
+                    "All earned Elder Futhark identities (real behavior — the user's "
+                    "natural-power vocabulary, not a new random draw):\n"
+                    + ("\n".join(rune_lines) if rune_lines else "(No runes unlocked yet.)")
+                )
+                stats_bits = []
+                if stats:
+                    for k in ("runes_unlocked", "runes_total"):
+                        if k in stats and stats[k] is not None:
+                            stats_bits.append(f"{k}: {stats[k]}")
+                stats_block = (
+                    "Progress:\n" + "\n".join(stats_bits)
+                    if stats_bits
+                    else ""
+                )
+                system_prompt = (
+                    "You are Evo, a warm behavioral coach. EVO uses Elder Futhark runes as "
+                    "**recognized identities** earned through real actions — symbols of practice, "
+                    "adaptation, and neuroplasticity — not magical fate or fortune-telling. "
+                    "Write a compact 'natural power in you' status: inner capacities the user has "
+                    "**already wired** through repetition, recovery, and return — like a living "
+                    "profile of their nervous system's use-dependent change. "
+                    "Weave themes from ALL listed runes into one coherent portrait; name at most "
+                    "two rune symbols inline if it helps clarity. "
+                    "Never claim supernatural knowledge, inevitability, or medical facts. "
+                    "No lucky colors. Write entirely in the user's requested language. "
+                    "Output ONLY the status text: 2–3 short sentences (~180–320 characters for "
+                    "Latin scripts; Thai may run slightly longer). Warm, specific, agency-forward. "
+                    "At most one emoji."
+                )
+                user_prompt = (
+                    f"{rune_block}\n"
+                    + (f"\n{stats_block}\n" if stats_block else "\n")
+                    + f"Write the natural-power status in {normalized_language}. "
+                    "If no runes are listed, encourage the first small rep that starts plasticity — "
+                    "one sentence only."
+                )
+                response = self._safe_chat_call(
+                    system_prompt,
+                    user_prompt,
+                    max_completion_tokens=400,
+                    temperature=0.85,
+                    language=normalized_language,
+                    model=model,
+                )
+                logger.info("Natural-power rune status generated successfully")
                 return response
 
             # --- brief (legacy) path ---

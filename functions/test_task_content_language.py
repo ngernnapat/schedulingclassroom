@@ -36,6 +36,33 @@ def test_japanese_and_korean_detected():
     assert m._task_content_practice_language_from_hints("topik ฮันกึล") == "Korean"
 
 
+def test_many_target_languages_detected():
+    cases = {
+        "เรียนภาษาฝรั่งเศส delf": "French",
+        "ภาษาสเปนเพื่อการท่องเที่ยว": "Spanish",
+        "learn italian for travel": "Italian",
+        "ภาษาโปรตุเกสเบื้องต้น": "Portuguese",
+        "เรียนภาษาเวียดนามเบื้องต้น": "Vietnamese",
+        "ภาษาอินโดนีเซียสำหรับธุรกิจ": "Indonesian",
+        "เรียนภาษารัสเซีย": "Russian",
+        "ภาษาอาหรับเบื้องต้น": "Arabic",
+        "ฝึกภาษาฮินดี": "Hindi",
+    }
+    for blob, want in cases.items():
+        assert m._task_content_practice_language_from_hints(blob.lower()) == want, blob
+
+
+def test_guard_works_across_scripts():
+    # Cyrillic / Arabic / Devanagari targets are now script-checkable.
+    assert not m._task_content_drill_uses_practice_language("privet — สวัสดี", "Russian")
+    assert m._task_content_drill_uses_practice_language("привет (ปรีเวียต) — สวัสดี", "Russian")
+    assert m._task_content_drill_uses_practice_language("مرحبا — hello", "Arabic")
+    assert m._task_content_drill_uses_practice_language("नमस्ते — hello", "Hindi")
+    # Latin-script targets remain unverifiable (assume fine, no false regen).
+    assert m._task_content_needs_practice_script_check("Thai", "Italian") is False
+    assert m._task_content_needs_practice_script_check("Thai", "Vietnamese") is False
+
+
 def test_practice_language_resolves_chinese_for_food_step():
     plan = "30-Day การเรียนรู้ภาษาจีนเพื่อการท่องเที่ยว"
     step = "เรียนคำศัพท์ส่วนผสม 8 คำ เช่น เนื้อ ไก่ หมู ไข่ ผัก แล้วอ่านออกเสียง"
@@ -71,6 +98,33 @@ def test_coaching_english_for_english_step():
         "English", "English", "Chinese", "learning_language", "practice tones", ""
     )
     assert coach == "English"
+
+
+def test_coaching_immersive_english_quiz_for_english_plan_thai_ui():
+    # The screenshot bug: English-learning plan, English step, Thai app UI.
+    # The quiz must be in English (immersion), NOT translated to Thai.
+    coach = m._task_content_coaching_language(
+        "English", "Thai", "English", "learning_language",
+        "Complete a short baseline assessment: 1 reading passage question set", "",
+    )
+    assert coach == "English"
+
+
+def test_coaching_thai_for_chinese_drill_stays_thai():
+    # Mirror case must still hold: Thai step drilling Chinese → Thai quiz.
+    coach = m._task_content_coaching_language(
+        "Thai", "Thai", "Chinese", "learning_language", "ฝึกออกเสียงพินอิน 5 คำ", ""
+    )
+    assert coach == "Thai"
+
+
+def test_coaching_nonlanguage_english_step_thai_ui_stays_thai():
+    # A fitness plan with an English step + Thai UI should still coach in Thai —
+    # the user is not learning English, so no immersion.
+    coach = m._task_content_coaching_language(
+        "English", "Thai", "English", "exercise", "Do 3 sets of squats", ""
+    )
+    assert coach == "Thai"
 
 
 # --- thin-step detection ----------------------------------------------------

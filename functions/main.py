@@ -1016,8 +1016,9 @@ _PRACTICE_CACHE_TTL_SEC = 24 * 60 * 60
 _PRACTICE_HISTORY_LIMIT = 10
 # Bump when the card prompt/logic changes enough to invalidate cached cards
 # (alongside the 24h TTL). v2: per-category scenario guidance, thin-step
-# grounding, and practice-language output guard.
-_PRACTICE_FORMAT_VERSION = 2
+# grounding, and practice-language output guard. v3: immersive coaching
+# language for target-language steps.
+_PRACTICE_FORMAT_VERSION = 3
 
 # Semantic role of each scenario choice. Logged with the user's pick so the
 # coach loop can mine *what kind* of move a user makes under pressure — not
@@ -1577,27 +1578,37 @@ def _task_content_coaching_language(
     task_title: str = "",
     task_detail: str = "",
 ) -> str:
-    """One coaching language for quiz, notes, and explanations — no EN/TH mix."""
+    """One coaching language for quiz, notes, and explanations — no EN/TH mix.
+
+    For a language-learning plan the quiz IS the practice, so it follows the
+    learner's level rather than the app UI:
+      - step written IN the target language (e.g. an English reading passage in
+        an English plan) → quiz/notes in the TARGET language. Answering English
+        questions about an English passage is the actual skill; translating the
+        quiz to the UI language (Thai) defeats the planner intent.
+      - step written in the learner's own language (e.g. Thai describing a
+        Chinese drill) → quiz in that language so a beginner can follow it.
+    For non-language plans the quiz follows the app UI language, but a step the
+    user authored in a non-English language is never coached in English.
+    """
     instr = (instruction_language or "").strip() or "English"
     respond = (reply_language or instr).strip()
     practice = (practice_language or "").strip()
     step_blob = f"{task_title} {task_detail}"
-    is_foreign_drill = (
-        category_key == "learning_language"
-        or (
-            category_key in ("learning", "other")
-            and practice
-            and not _practice_languages_same(instr, practice)
-        )
-    )
-    # Thai planner steps → coach in Thai even when the app sent languageSelected=english.
+
+    if category_key == "learning_language":
+        # Immersive: the step is written in the target language → coach in it.
+        if practice and _practice_languages_same(instr, practice):
+            return practice
+        # Beginner: step is in the learner's working language → coach in it.
+        if instr == "Thai" or _text_has_thai_script(step_blob):
+            return "Thai"
+        return respond
+
+    # Non-language plans: Thai (or any non-English) step → never leak English
+    # just because the app UI defaulted to English.
     if instr == "Thai" or _text_has_thai_script(step_blob):
         return "Thai"
-    if is_foreign_drill and instr == "Thai":
-        return "Thai"
-    # A non-English instruction language wins over an English app-UI default:
-    # the user authored the step in `instr`, so coach in `instr`, never leak
-    # English into a non-English step.
     if (
         instr
         and not _practice_languages_same(instr, "English")
@@ -2374,6 +2385,8 @@ _TASK_CONTENT_QUIZ_TOPUP_MAX_ATTEMPTS = 3
 # free when the task was already charged this month — and otherwise served
 # as-is so a user at their cap never loses access to existing material.
 #   v2: translate-don't-copy drill rule + thin-step + language fixes.
+#   v3: immersive coaching language (target-language quiz for target-language
+#       steps, e.g. English quiz for an English-learning plan).
 _TASK_CONTENT_LOGIC_VERSION = 2
 
 _TASK_CONTENT_PLAN_CATEGORIES = frozenset({
@@ -2404,7 +2417,10 @@ _LANGUAGE_LEARNING_HINTS = (
     "kanji", "hiragana", "katakana", "pinyin", "romaji", "jlpt", "toefl",
     "ielts", "hsk", "topik", "japanese", "chinese", "korean", "thai",
     "english", "spanish", "french", "german", "mandarin", "cantonese",
-    "arabic", "hindi", "中文", "日本語", "한국어",
+    "arabic", "hindi", "italian", "portuguese", "vietnamese", "indonesian",
+    "russian", "toeic", "delf", "dele", "goethe",
+    "中文", "日本語", "한국어", "español", "français", "deutsch", "italiano",
+    "português", "русский", "العربية", "हिन्दी",
     "ภาษา", "คำศัพท์", "ไวยากรณ์", "แปล", "อ่าน", "พินอิน", "โทนเสียง",
     "แมนดาริน", "ฮั่นจื้อ",
 )
@@ -2426,10 +2442,29 @@ _PRACTICE_TARGET_LANGUAGE_HINTS: Dict[str, Tuple[str, ...]] = {
         "เกาหลี", "ภาษาเกาหลี", "ฮันกึล",
     ),
     "Thai": ("thai", "ภาษาไทย", "ไทย"),
-    "English": ("english", "ภาษาอังกฤษ", "อังกฤษ", "toefl", "ielts"),
-    "French": ("french", "ภาษาฝรั่งเศส", "ฝรั่งเศส"),
-    "German": ("german", "ภาษาเยอรมัน", "เยอรมัน"),
-    "Spanish": ("spanish", "ภาษาสเปน", "สเปน"),
+    "English": ("english", "ภาษาอังกฤษ", "อังกฤษ", "toefl", "ielts", "toeic"),
+    "French": ("french", "français", "francais", "delf", "ภาษาฝรั่งเศส", "ฝรั่งเศส"),
+    "German": ("german", "deutsch", "goethe", "ภาษาเยอรมัน", "เยอรมัน"),
+    "Spanish": ("spanish", "español", "espanol", "dele", "ภาษาสเปน", "สเปน"),
+    "Italian": ("italian", "italiano", "ภาษาอิตาลี", "อิตาลี"),
+    "Portuguese": (
+        "portuguese", "português", "portugues", "ภาษาโปรตุเกส", "โปรตุเกส",
+    ),
+    "Vietnamese": (
+        "vietnamese", "tiếng việt", "tieng viet", "ภาษาเวียดนาม", "เวียดนาม",
+    ),
+    "Indonesian": (
+        "indonesian", "bahasa indonesia", "ภาษาอินโดนีเซีย", "อินโดนีเซีย",
+    ),
+    "Russian": (
+        "russian", "русский", "русски", "ภาษารัสเซีย", "รัสเซีย",
+    ),
+    "Arabic": (
+        "arabic", "العربية", "ภาษาอาหรับ", "อาหรับ",
+    ),
+    "Hindi": (
+        "hindi", "हिन्दी", "हिंदी", "ภาษาฮินดี", "ฮินดี",
+    ),
 }
 
 # When instruction language ≠ practice language, how to spell pronunciation
@@ -2890,6 +2925,10 @@ _PRACTICE_SCRIPT_RANGES: Dict[str, Tuple[Tuple[int, int], ...]] = {
     "Chinese": ((0x4E00, 0x9FFF), (0x3400, 0x4DBF)),               # CJK ideographs
     "Japanese": ((0x3040, 0x30FF), (0x4E00, 0x9FFF)),              # kana + kanji
     "Korean": ((0xAC00, 0xD7A3), (0x1100, 0x11FF)),               # hangul
+    "Russian": ((0x0400, 0x04FF),),                                # Cyrillic
+    "Arabic": ((0x0600, 0x06FF), (0x0750, 0x077F)),               # Arabic
+    "Hindi": ((0x0900, 0x097F),),                                  # Devanagari
+    "Thai": ((0x0E00, 0x0E7F),),                                   # Thai (as target)
 }
 # Toned pinyin vowels \u2014 count as Chinese content even without \u6c49\u5b57.
 _PINYIN_TONE_CHARS = frozenset("\u0101\u00e1\u01ce\u00e0\u0113\u00e9\u011b\u00e8\u012b\u00ed\u01d0\u00ec\u014d\u00f3\u01d2\u00f2\u016b\u00fa\u01d4\u00f9\u01d6\u01d8\u01da\u01dc")
@@ -2952,6 +2991,14 @@ def _task_content_practice_script_correction(
         extra = " Every drill line MUST contain Japanese script (\u304b\u306a/\u6f22\u5b57)."
     elif practice == "Korean":
         extra = " Every drill line MUST contain Hangul (\ud55c\uae00)."
+    elif practice == "Russian":
+        extra = " Every drill line MUST contain Cyrillic script (\u0430\u0431\u0432\u2026)."
+    elif practice == "Arabic":
+        extra = " Every drill line MUST contain Arabic script (\u0627\u0628\u062a\u2026)."
+    elif practice == "Hindi":
+        extra = " Every drill line MUST contain Devanagari script (\u0905\u0906\u0907\u2026)."
+    elif practice == "Thai":
+        extra = " Every drill line MUST contain Thai script (\u0e01\u0e02\u0e04\u2026)."
     return (
         f"CORRECTION \u2014 your previous attempt drilled {coach} words instead of "
         f"{practice}. That is WRONG and unusable. The user is learning "
