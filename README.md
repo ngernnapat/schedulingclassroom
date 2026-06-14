@@ -54,14 +54,19 @@ Notable groups:
 
 ## Environment
 
-Secrets are loaded via `python-dotenv` at cold start. `functions/.env` is
-loaded for local emulator runs; in production set them as Firebase secrets:
+**Production (deployed Cloud Functions):** set secrets via Firebase — never put
+`OPENAI_API_KEY` in `functions/.env` (Firebase injects that file as plain env
+vars and will conflict with `SecretParam("OPENAI_API_KEY")`):
 
 ```
 firebase functions:secrets:set OPENAI_API_KEY
 ```
 
-`functions/.env` is gitignored and **must not** be committed.
+**Local emulator / scripts:** put `OPENAI_API_KEY` in `functions/.env.local`
+(that file is not deployed). You can also use the repo-root `.env` for local runs.
+
+`functions/.env` must stay free of `OPENAI_API_KEY`. `.env` / `.env.local` are
+gitignored and **must not** be committed.
 
 ## Deploy
 

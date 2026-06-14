@@ -15,11 +15,15 @@ from openai import OpenAI, APITimeoutError, APIConnectionError, RateLimitError, 
 from openai.types.chat import ChatCompletion
 from dotenv import load_dotenv
 from langdetect import detect, LangDetectException
+from pathlib import Path
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+_functions_dir = Path(__file__).resolve().parent
+load_dotenv(_functions_dir / ".env.local")
+load_dotenv(_functions_dir.parent / ".env")
 load_dotenv()
 
 
@@ -57,6 +61,10 @@ class ChatConfig:
     retry_delay: float = 1.0
     connection_timeout: int = 10  # New: connection timeout
     read_timeout: int = 60  # New: read timeout
+    # When set (e.g. {"type": "json_object"}) the model is constrained to emit
+    # valid JSON. Used by endpoints that json.loads() the reply so the model
+    # can't wrap the object in prose or markdown fences.
+    response_format: Optional[Dict[str, Any]] = None
 
 class LanguageDetector:
     """Language detection utility with caching"""
@@ -93,13 +101,19 @@ class LanguageDetector:
         return LanguageDetector.LANGUAGE_MAP.get(language_code.lower(), language_code)
 
 class CircuitBreaker:
-    """Circuit breaker to prevent cascading failures"""
-    
-    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 60.0):
+    """Circuit breaker to prevent cascading failures.
+
+    Tuned for Cloud Run / Cloud Functions: a warm instance reuses one breaker,
+    so the threshold must count *distinct exhausted requests*, not per-retry
+    attempts inside a single call chain.
+    """
+
+    def __init__(self, failure_threshold: int = 12, recovery_timeout: float = 30.0):
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
         self.failure_count = 0
         self.last_failure_time = 0
+        self.last_error = ""
         self.state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
         self.lock = Lock()
     
@@ -122,19 +136,26 @@ class CircuitBreaker:
             self.failure_count = 0
             self.state = "CLOSED"
     
-    def record_failure(self):
-        """Record a failed request"""
+    def record_failure(self, error: Optional[str] = None):
+        """Record a failed request (one count per exhausted call, not per retry)."""
         with self.lock:
             self.failure_count += 1
             self.last_failure_time = time.time()
+            if error:
+                self.last_error = str(error)[:300]
             if self.failure_count >= self.failure_threshold:
                 self.state = "OPEN"
-                logger.warning(f"Circuit breaker opened after {self.failure_count} failures")
+                logger.warning(
+                    "Circuit breaker opened after %d failures (last: %s)",
+                    self.failure_count,
+                    self.last_error or "unknown",
+                )
     
     def reset(self):
         """Manually reset the circuit breaker"""
         with self.lock:
             self.failure_count = 0
+            self.last_error = ""
             self.state = "CLOSED"
             logger.info("Circuit breaker manually reset")
 
@@ -286,7 +307,10 @@ class ChatGPTWrapper:
         try:
             # Check circuit breaker first
             if not self.circuit_breaker.can_proceed():
-                logger.warning("Circuit breaker is OPEN, request blocked")
+                logger.warning(
+                    "Circuit breaker is OPEN, request blocked (last: %s)",
+                    self.circuit_breaker.last_error or "unknown",
+                )
                 return "Service is temporarily unavailable due to recent failures. Please try again later."
             
             # Use provided config or fall back to default
@@ -329,6 +353,10 @@ class ChatGPTWrapper:
                 api_params["top_p"] = current_config.top_p
             elif current_config.temperature != 1.0:
                 logger.info(f"Model {current_config.model} only supports temperature=1.0, ignoring temperature={current_config.temperature}")
+
+            # Constrain output to JSON when requested (callers that parse the reply).
+            if current_config.response_format:
+                api_params["response_format"] = current_config.response_format
             
             logger.info(f"API params: model={current_config.model}, max_completion_tokens={current_config.max_completion_tokens}")
             
@@ -386,34 +414,66 @@ class ChatGPTWrapper:
             return content.strip()
             
         except RateLimitError as e:
-            # Handle rate limit errors with special retry logic
-            self.circuit_breaker.record_failure()
-            
-            # Extract retry-after if available
+            # Rate limits are transient — do not count intermediate retries toward
+            # the circuit breaker; only the final exhausted attempt counts.
             retry_after = self._extract_retry_after(e)
-            
-            # Check if we should retry
+
             if attempt < current_config.max_retries:
-                # Use retry-after if available, otherwise use longer exponential backoff for rate limits
                 if retry_after:
                     backoff_time = retry_after + (time.time() % 1)  # Add jitter
                 else:
-                    # Longer backoff for rate limits: start with 5 seconds, then exponential
                     backoff_time = 5.0 * (2 ** (attempt - 1)) + (time.time() % 1)
-                
-                logger.warning(f"Rate limit exceeded on attempt {attempt}, retrying in {backoff_time:.1f}s...")
+
+                logger.warning(
+                    "Rate limit exceeded on attempt %d, retrying in %.1fs...",
+                    attempt, backoff_time,
+                )
                 time.sleep(backoff_time)
                 return self._make_api_call(messages, config, attempt + 1)
-            else:
-                logger.error(f"Rate limit exceeded after {current_config.max_retries} attempts")
-                raise RateLimitExceededError(
-                    "Rate limit exceeded. Please try again later.",
-                    retry_after=retry_after
-                )
+
+            logger.error(
+                "Rate limit exceeded after %d attempts",
+                current_config.max_retries,
+            )
+            self.circuit_breaker.record_failure(str(e))
+            raise RateLimitExceededError(
+                "Rate limit exceeded. Please try again later.",
+                retry_after=retry_after,
+            )
             
         except Exception as e:
             error_msg = str(e)
+
+            # Auth / config errors are permanent — never retry them.
+            low_err = error_msg.lower()
+            if (
+                "401" in error_msg
+                or "invalid_api_key" in low_err
+                or "incorrect api key" in low_err
+                or "authentication" in low_err
+            ):
+                logger.error("OpenAI auth/config error (no retry): %s", error_msg[:300])
+                self.circuit_breaker.record_failure(error_msg)
+                return "Service configuration error. Please contact support."
             
+            # Some models reject response_format / json_object mode. Retry once
+            # immediately without it rather than burning the backoff budget — the
+            # caller still parses the reply defensively.
+            if "response_format" in error_msg.lower() and current_config.response_format:
+                logger.warning("Model rejected response_format; retrying without it")
+                no_fmt = ChatConfig(
+                    model=current_config.model,
+                    temperature=current_config.temperature,
+                    top_p=current_config.top_p,
+                    max_completion_tokens=current_config.max_completion_tokens,
+                    timeout=current_config.timeout,
+                    max_retries=current_config.max_retries,
+                    retry_delay=current_config.retry_delay,
+                    response_format=None,
+                )
+                if attempt == 1:
+                    return self._make_api_call(messages, no_fmt, attempt + 1)
+
             # Check for temperature not supported error - don't retry with exponential backoff,
             # instead retry immediately without temperature parameter
             if "temperature" in error_msg.lower() and "unsupported" in error_msg.lower():
@@ -431,22 +491,21 @@ class ChatGPTWrapper:
                 # Retry once with the corrected config
                 if attempt == 1:  # Only retry once for this specific error
                     return self._make_api_call(messages, temp_config, attempt + 1)
-                else:
-                    self.circuit_breaker.record_failure()
-                    return self._handle_api_error(e, attempt)
-            
-            # Record failure in circuit breaker
-            self.circuit_breaker.record_failure()
-            
-            # Check if we should retry
+
+            # Count one breaker failure only after all retries for this call are
+            # exhausted — not on each intermediate attempt (which used to trip
+            # the breaker after a single bad request with max_retries=5).
             if attempt < current_config.max_retries:
-                # Calculate exponential backoff with jitter
                 backoff_time = current_config.retry_delay * (2 ** (attempt - 1)) + (time.time() % 1)
-                logger.warning(f"API call failed on attempt {attempt}: {error_msg}, retrying in {backoff_time:.1f}s")
+                logger.warning(
+                    "API call failed on attempt %d: %s, retrying in %.1fs",
+                    attempt, error_msg, backoff_time,
+                )
                 time.sleep(backoff_time)
                 return self._make_api_call(messages, config, attempt + 1)
-            else:
-                return self._handle_api_error(e, attempt)
+
+            self.circuit_breaker.record_failure(error_msg)
+            return self._handle_api_error(e, attempt)
     
     def chat_with_gpt(
         self,
@@ -459,6 +518,7 @@ class ChatGPTWrapper:
         auto_detect_language: bool = True,
         reply_language: Optional[str] = None,
         language: Optional[str] = None,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Send a chat completion request to OpenAI API with enhanced error handling.
@@ -508,7 +568,8 @@ class ChatGPTWrapper:
                 max_completion_tokens=max_completion_tokens or self.config.max_completion_tokens,
                 timeout=self.config.timeout,
                 max_retries=self.config.max_retries,
-                retry_delay=self.config.retry_delay
+                retry_delay=self.config.retry_delay,
+                response_format=response_format,
             )
             
             # Make API call
@@ -550,10 +611,11 @@ def chat_with_gpt(
     auto_detect_language: bool = True,
     reply_language: Optional[str] = None,
     language: Optional[str] = None,
+    response_format: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Backward compatibility function for existing code.
-    
+
     This function maintains the same interface as the original chat_with_gpt
     but uses the enhanced ChatGPTWrapper internally.
     """
@@ -567,5 +629,6 @@ def chat_with_gpt(
         max_completion_tokens=max_completion_tokens,
         auto_detect_language=auto_detect_language,
         reply_language=reply_language,
-        language=language
+        language=language,
+        response_format=response_format,
     )

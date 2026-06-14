@@ -23,14 +23,21 @@ from firebase_functions import https_fn
 from firebase_functions.options import set_global_options
 from firebase_functions.params import SecretParam
 
-# Injected at deploy when bound on generate_task_content (see decorator below).
+# Injected at deploy when bound on functions that need them (see decorators).
 _EVO_FIREBASE_SA_SECRET = SecretParam("EVO_FIREBASE_SERVICE_ACCOUNT_JSON")
+_OPENAI_API_KEY_SECRET = SecretParam("OPENAI_API_KEY")
+_LLM_SECRETS = [_EVO_FIREBASE_SA_SECRET, _OPENAI_API_KEY_SECRET]
 from firebase_admin import initialize_app, storage, firestore
 from fastapi import HTTPException
 from pydantic import BaseModel, Field, ValidationError
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
-# Load environment variables
+from pathlib import Path
+
+# Local overrides only — never deployed as plain env vars by Firebase CLI.
+_functions_dir = Path(__file__).resolve().parent
+load_dotenv(_functions_dir / ".env.local")
+load_dotenv(_functions_dir.parent / ".env")
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -620,7 +627,7 @@ def format_schedule_data(schedule_df, homeroom_df) -> Tuple[List[Dict[str, Any]]
 #     return create_response(data=info_data, message='API information retrieved successfully')
 
 ########### Generate Planner Content API Endpoints #############
-@https_fn.on_request(memory=2048, max_instances=5, timeout_sec=540, cpu=2)  # 9 minutes timeout
+@https_fn.on_request(memory=2048, max_instances=5, timeout_sec=540, cpu=2, secrets=_LLM_SECRETS)  # 9 minutes timeout
 def generate_planner_content(req: https_fn.Request) -> https_fn.Response:
     """Generate planner content (sync). Supports chunked generation for totalDays > 7."""
     if req.method == 'OPTIONS':
@@ -693,7 +700,7 @@ def generate_planner_content(req: https_fn.Request) -> https_fn.Response:
         )
 
 
-@https_fn.on_request(memory=2048, max_instances=5, timeout_sec=540, cpu=2)
+@https_fn.on_request(memory=2048, max_instances=5, timeout_sec=540, cpu=2, secrets=_LLM_SECRETS)
 def refine_planner_content(req: https_fn.Request) -> https_fn.Response:
     """Refine an existing AI-generated plan draft based on user feedback."""
     if req.method == 'OPTIONS':
@@ -881,7 +888,7 @@ def _verify_coach_tier(req: https_fn.Request) -> Tuple[Optional[str], str]:
 
 @https_fn.on_request(
     memory=1024, max_instances=20, timeout_sec=120, cpu=1,
-    secrets=[_EVO_FIREBASE_SA_SECRET],
+    secrets=_LLM_SECRETS,
 )
 def coach_review(req: https_fn.Request) -> https_fn.Response:
     """Generate an AI Coach review. Tier is verified server-side from the
@@ -1084,8 +1091,11 @@ _PRACTICE_SYSTEM_PROMPT_BASE = (
     "return-rep scenario; do not shame.\n"
     "8. Avoid scenario themes listed in `recent_scenarios`.\n"
     "9. Follow the LANGUAGE instruction in the user message exactly — the card "
-    "language comes from taskTitle/taskDetail; weave in the practice/target "
-    "language for speech being rehearsed. Never default to English.\n"
+    "language comes from taskTitle/taskDetail. ONLY when the plan is about "
+    "learning a foreign language do you weave that target language into speech "
+    "being rehearsed; for any other subject (math, science, fitness, art, "
+    "finance, …) write the whole card in the one coaching language. Never "
+    "default to English.\n"
 )
 
 def _practice_choice_key(index: int) -> str:
@@ -1698,15 +1708,10 @@ def _analyze_practice_intent(
             max_completion_tokens=120,
             auto_detect_language=False,
             reply_language="English",
+            response_format={"type": "json_object"},
         )
         if raw and raw.strip():
-            parsed_raw = raw.strip()
-            if parsed_raw.startswith("```"):
-                parsed_raw = parsed_raw.strip("`")
-                if parsed_raw.lower().startswith("json"):
-                    parsed_raw = parsed_raw[4:]
-                parsed_raw = parsed_raw.strip()
-            parsed = json.loads(parsed_raw)
+            parsed = _extract_json_object(raw)
             if isinstance(parsed, dict):
                 lang = (
                     parsed.get("plannerLanguage")
@@ -1733,7 +1738,7 @@ def _analyze_practice_intent(
 
 @https_fn.on_request(
     memory=512, max_instances=20, timeout_sec=60, cpu=1,
-    secrets=[_EVO_FIREBASE_SA_SECRET],
+    secrets=_LLM_SECRETS,
 )
 def generate_practice(req: https_fn.Request) -> https_fn.Response:
     """Generate one scenario practice card for a task on dateScreenFull.
@@ -1878,6 +1883,7 @@ def generate_practice(req: https_fn.Request) -> https_fn.Response:
             language_selected,
             planner_language,
             instruction_language,
+            category_key=category_key,
         )
         coaching_language = _task_content_coaching_language(
             instruction_language,
@@ -1922,12 +1928,20 @@ def generate_practice(req: https_fn.Request) -> https_fn.Response:
         ]
         if task_detail and task_detail.strip() != (task_title or "").strip():
             user_prompt_lines.append(f"- parent_task: {task_detail}")
+        is_language_plan = category_key == "learning_language"
         user_prompt_lines += [
             "",
             f"SELECTED RESPONSE LANGUAGE (languageSelected): {reply_language}",
             f"TASK TEXT LANGUAGE (taskTitle/taskDetail): {instruction_language}",
-            f"PRACTICE/TARGET LANGUAGE (what the user drills): "
-            f"{practice_language}",
+        ]
+        if is_language_plan:
+            # Only a foreign-language plan has a separate target language to
+            # rehearse; other subjects are coached entirely in the reply language.
+            user_prompt_lines.append(
+                f"PRACTICE/TARGET LANGUAGE (what the user drills): "
+                f"{practice_language}"
+            )
+        user_prompt_lines += [
             language_instruction,
             "",
             grounding_instruction,
@@ -2003,6 +2017,7 @@ def generate_practice(req: https_fn.Request) -> https_fn.Response:
             # wrapper append "Please reply in X" and force a single language.
             auto_detect_language=False,
             reply_language=None,
+            response_format={"type": "json_object"},
         )
 
         if not response_text or not response_text.strip():
@@ -2013,17 +2028,22 @@ def generate_practice(req: https_fn.Request) -> https_fn.Response:
                 status_code=502,
             )
 
-        # 4) Parse + validate. Strip fences just in case the model added them
-        #    despite the contract.
-        raw = response_text.strip()
-        if raw.startswith("```"):
-            raw = raw.strip("`")
-            if raw.lower().startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
-        try:
-            card = json.loads(raw)
-        except Exception:
+        # 4) Parse + validate — tolerant of fences / stray prose around the JSON.
+        card = _extract_json_object(response_text)
+        if not isinstance(card, dict):
+            # The wrapper returns a plain-English sentence (not JSON) on timeout /
+            # rate-limit / breaker / refusal. Surface that as a retryable "busy"
+            # error rather than a confusing "malformed card" one.
+            if _looks_like_model_unavailable(response_text):
+                logger.warning(
+                    "generate_practice: model unavailable for uid=%s: %s",
+                    uid, response_text.strip()[:160],
+                )
+                return create_response(
+                    success=False, message='Service busy',
+                    error='The AI is busy right now. Please try again in a moment.',
+                    status_code=503,
+                )
             logger.warning("generate_practice: JSON parse failed for uid=%s", uid)
             return create_response(
                 success=False,
@@ -2031,11 +2051,6 @@ def generate_practice(req: https_fn.Request) -> https_fn.Response:
                 error='The card came back malformed. Try again.',
                 status_code=502,
             )
-
-        if not isinstance(card, dict):
-            return create_response(success=False, message='Bad model output',
-                                   error='Card payload must be an object.',
-                                   status_code=502)
         situation = (card.get("situation") or "").strip()
         choices = card.get("choices") or []
         if (not situation or not isinstance(choices, list)
@@ -2081,9 +2096,9 @@ def generate_practice(req: https_fn.Request) -> https_fn.Response:
                     max_completion_tokens=max_tokens,
                     auto_detect_language=False,
                     reply_language=None,
+                    response_format={"type": "json_object"},
                 )
-                retry_raw = _strip_json_fence(retry_text or "")
-                retry_card = json.loads(retry_raw)
+                retry_card = _extract_json_object(retry_text or "")
                 if isinstance(retry_card, dict):
                     r_sit = (retry_card.get("situation") or "").strip()
                     r_choices = retry_card.get("choices") or []
@@ -2386,11 +2401,16 @@ _TASK_CONTENT_QUIZ_TOPUP_MAX_ATTEMPTS = 3
 # as-is so a user at their cap never loses access to existing material.
 #   v2: translate-don't-copy drill rule + thin-step + language fixes.
 #   v3: immersive coaching language (target-language quiz for target-language
-#       steps, e.g. English quiz for an English-learning plan).
-_TASK_CONTENT_LOGIC_VERSION = 2
+#       steps, e.g. English quiz for an English-learning plan) +
+#       genre generalization: the foreign-language drill machinery now fires
+#       ONLY for learning_language plans, so math/science/economics/arts/
+#       psychology/finance/etc. produce real subject material instead of being
+#       skewed toward language practice.
+_TASK_CONTENT_LOGIC_VERSION = 3
 
 _TASK_CONTENT_PLAN_CATEGORIES = frozenset({
-    "learning", "exercise", "travel", "finance", "health",
+    "learning", "math", "science", "economics", "arts", "psychology",
+    "exercise", "travel", "finance", "health",
     "personal_development", "other",
 })
 
@@ -2407,8 +2427,39 @@ _TASK_CONTENT_CATEGORY_ALIASES = {
     "personaldevelopment": "personal_development",
     "money": "finance",
     "financial": "finance",
+    "investing": "finance",
     "trip": "travel",
     "tourism": "travel",
+    # Academic / subject genres — each maps to genre-specific guidance so the
+    # output is real subject material (worked problems, mechanisms, exercises),
+    # not generic study advice and not language drills.
+    "maths": "math",
+    "mathematics": "math",
+    "calculus": "math",
+    "algebra": "math",
+    "geometry": "math",
+    "statistics": "math",
+    "stats": "math",
+    "physics": "science",
+    "chemistry": "science",
+    "biology": "science",
+    "astronomy": "science",
+    "engineering": "science",
+    "economy": "economics",
+    "econ": "economics",
+    "macroeconomics": "economics",
+    "microeconomics": "economics",
+    "business": "economics",
+    "art": "arts",
+    "drawing": "arts",
+    "painting": "arts",
+    "music": "arts",
+    "design": "arts",
+    "writing": "arts",
+    "photography": "arts",
+    "psych": "psychology",
+    "phycology": "psychology",  # common misspelling
+    "philosophy": "psychology",
 }
 
 _LANGUAGE_LEARNING_HINTS = (
@@ -2537,7 +2588,8 @@ _TASK_CONTENT_CATEGORY_GUIDANCE: Dict[str, str] = {
         "usage details present in the material."
     ),
     "learning": (
-        "CATEGORY: learning (non-language) — concepts, formulas, or skills.\n"
+        "CATEGORY: learning (any academic subject that isn't a foreign "
+        "language) — concepts, formulas, or skills.\n"
         "Output the actual STUDY MATERIAL for this step, grounded in planName "
         "and the step topic — not generic study advice.\n"
         "WRONG: 'review the concept and take notes' (advice, no content)\n"
@@ -2548,6 +2600,74 @@ _TASK_CONTENT_CATEGORY_GUIDANCE: Dict[str, str] = {
         "recall prompt or practice problem to do now. Use the step's specific "
         "topic; never substitute a generic textbook example. Quiz tests the "
         "definitions, steps, or distinctions embedded in the material."
+    ),
+    "math": (
+        "CATEGORY: math.\n"
+        "Output real worked math for THIS step's topic from planName — not "
+        "'practice some problems'.\n"
+        "WRONG: 'work on quadratic equations today' (advice)\n"
+        "RIGHT: state the rule, then SOLVE: 'Quadratic formula x=(-b±√(b²-4ac"
+        "))/2a. Solve 2x²-4x-6=0: a=2,b=-4,c=-6 → disc=16+48=64 → x=(4±8)/4 → "
+        "x=3 or x=-1.'\n"
+        "Structure `content` (90–220 words): the rule/definition → 1–2 fully "
+        "worked examples showing EVERY step → one common error → 1–2 practice "
+        "problems for the user to solve now (give the answers at the end so it "
+        "is self-checkable). Use the step's exact topic and difficulty. Quiz "
+        "tests the method, a step, or the result of a worked problem."
+    ),
+    "science": (
+        "CATEGORY: science (physics, chemistry, biology, etc.).\n"
+        "Output the actual concept + mechanism for THIS step's topic — not "
+        "'read about photosynthesis'.\n"
+        "WRONG: 'review Newton's laws' (advice)\n"
+        "RIGHT: state and explain, e.g. 'Newton's 2nd law: F=ma. A 2 kg cart "
+        "pushed with 10 N accelerates a=F/m=5 m/s². Heavier mass → smaller "
+        "acceleration for the same force.'\n"
+        "Structure `content` (90–220 words): the principle/term → the mechanism "
+        "or cause-and-effect in plain words → one concrete example or quick "
+        "calculation with real units → one common misconception → one 'predict "
+        "this' or recall prompt to do now. Quiz tests the mechanism, units, or "
+        "cause-effect embedded in the material."
+    ),
+    "economics": (
+        "CATEGORY: economics / business.\n"
+        "Output the actual model or concept for THIS step with numbers — not "
+        "'study supply and demand'.\n"
+        "WRONG: 'learn about elasticity' (advice)\n"
+        "RIGHT: define + compute, e.g. 'Price elasticity of demand = %Δqty / "
+        "%Δprice. Price 100→120 (+20%), demand 50→40 (−20%) → elasticity = "
+        "−1.0 (unit elastic): revenue unchanged.'\n"
+        "Structure `content` (90–220 words): the term/model → plain intuition "
+        "for why it works → one worked example with real figures → one common "
+        "misreading → one 'what happens if…' prompt to reason through now. Quiz "
+        "tests the model, the calculation, or the intuition in the material."
+    ),
+    "arts": (
+        "CATEGORY: arts (drawing, painting, music, writing, design, etc.).\n"
+        "Output a concrete technique + a do-it-now exercise for THIS step — not "
+        "'practice drawing'.\n"
+        "WRONG: 'work on your shading' (vague)\n"
+        "RIGHT: name the technique and the drill, e.g. 'Value scale: draw 5 "
+        "boxes, fill them 10%→90% black with even hatching. Squint to check the "
+        "jumps are equal. Cue: press lighter for mid-tones, build up in passes.'\n"
+        "Structure `content` (80–200 words): the technique/principle in plain "
+        "terms → one or two specific exercises to do now (with steps, time, or "
+        "counts) → one cue or common mistake → what 'good' looks like so the "
+        "user can self-assess. Quiz may test the technique, terms, or cues."
+    ),
+    "psychology": (
+        "CATEGORY: psychology (studying the subject).\n"
+        "Output the actual concept + how it shows up in real life for THIS "
+        "step — not 'read the chapter'.\n"
+        "WRONG: 'review classical conditioning' (advice)\n"
+        "RIGHT: define + example, e.g. 'Classical conditioning: a neutral "
+        "stimulus paired with one that triggers a response eventually triggers "
+        "it alone. Pavlov: bell (neutral) + food (UCS) → bell alone makes the "
+        "dog salivate (CR).'\n"
+        "Structure `content` (90–220 words): the concept/term → a plain "
+        "definition → one everyday example → one related term it's often "
+        "confused with (and the difference) → one application or recall prompt. "
+        "Quiz tests the definitions, the example, or the distinctions."
     ),
     "exercise": (
         "CATEGORY: fitness / exercise.\n"
@@ -2615,22 +2735,32 @@ _TASK_CONTENT_CATEGORY_GUIDANCE: Dict[str, str] = {
 }
 
 _TASK_CONTENT_SYSTEM_PROMPT = (
-    "You generate PRACTICE MATERIAL for a single step of a user's plan. The "
-    "user will WORK THROUGH whatever you produce — output the actual material "
-    "to practice with, shaped by the CATEGORY GUIDANCE in the user message.\n\n"
+    "You generate PRACTICE / STUDY MATERIAL for a single step of a user's plan. "
+    "The plan can be about ANY subject — math, science, economics, finance, "
+    "art, music, psychology, history, coding, cooking, travel, fitness, a "
+    "language, anything. The user will WORK THROUGH whatever you produce, so "
+    "output the actual material to practice or study with, in the form the "
+    "CATEGORY GUIDANCE in the user message asks for. Language learning is just "
+    "ONE possible subject — do NOT assume it unless the guidance says so.\n\n"
+    "What 'material' means depends on the subject: worked math problems with "
+    "solutions; a science concept with its mechanism and an example; an "
+    "economics model with numbers; a finance action with real figures; an art "
+    "technique with a concrete exercise; a workout with sets and cues; a "
+    "language drill with target-language items. In EVERY case the rule is the "
+    "same: output the substance the user studies/does — NEVER a paragraph that "
+    "only restates the step or gives generic 'remember to study' advice.\n\n"
     "QUIZ SUPPORT: when you include a quiz, `content` must carry every fact "
     "the questions test — woven into the practice material itself. A careful "
     "reader should find every correct answer in `content`.\n\n"
     "Hierarchy: planName = the user's MAIN GOAL for the whole plan. The step "
-    "text = what to practice on THIS step only. Ground drill material in the "
+    "text = what to practice on THIS step only. Ground the material in the "
     "step while advancing the planName goal.\n\n"
-    "`content` must be a DRILL SHEET listing real practice-language items "
-    "(pinyin syllables/words line by line). NEVER output only a coaching-language "
-    "summary of what to do — that paraphrases the step and is WRONG.\n\n"
-    "Follow the LANGUAGE instruction in the user message — for language "
-    "learning, the step describes the task; drill items use the practice/target "
-    "language (e.g. Chinese pinyin). Coaching language is ONE language for "
-    "quiz, meanings, and notes — never mix English with Thai.\n\n"
+    "Follow the LANGUAGE instruction in the user message. Write `content`, the "
+    "quiz, meanings, and notes in ONE coaching language — never mix two "
+    "languages (e.g. English with Thai). ONLY when the plan is about learning a "
+    "foreign language do the drill items themselves switch to that target "
+    "language; for every other subject all output stays in the coaching "
+    "language.\n\n"
     "Voice: direct and usable. No preamble, no meta commentary, no emoji.\n\n"
     "Hard rules:\n"
     "1. Return ONLY valid JSON. No markdown fences, no preamble.\n"
@@ -3073,20 +3203,34 @@ def _task_content_practice_language(
     language_selected: str,
     planner_language: str = "",
     instruction_language: str = "",
+    category_key: str = "",
 ) -> str:
-    """Target language being practiced (e.g. Chinese), NOT the task title language."""
+    """Target language being practiced (e.g. Chinese), NOT the task title language.
+
+    Only language-learning plans have a distinct "practice/target language".
+    For every other genre (math, science, finance, fitness, art, …) the user is
+    NOT drilling a foreign language, so the practice language is simply the
+    language the step is written in. Returning the instruction language here is
+    what neutralises all the downstream foreign-drill machinery (pronunciation
+    guides, translate-don't-copy rules, mixed-language layout) for non-language
+    genres — otherwise a plan that merely mentions a place or word in another
+    language would be mistaken for a language course.
+    """
+    instr_resolved = (
+        (instruction_language or "").strip()
+        or _task_content_instruction_language(
+            task_title, task_detail, language_selected,
+        )
+    )
+    if category_key and category_key != "learning_language":
+        return instr_resolved
     blob = _task_content_practice_language_blob(
         task_title, task_detail, plan_context, plan_name,
     )
     hint_lang = _task_content_practice_language_from_hints(blob)
     if hint_lang:
         return hint_lang
-    instr = (
-        (instruction_language or "").strip()
-        or _task_content_instruction_language(
-            task_title, task_detail, language_selected,
-        )
-    )
+    instr = instr_resolved
     reply_language = _ui_language_name(language_selected)
     sanitized = _sanitize_planner_target_language(
         planner_language, blob, instr, reply_language,
@@ -3208,6 +3352,67 @@ def _strip_json_fence(raw: str) -> str:
             text = text[4:]
         text = text.strip()
     return text
+
+
+def _extract_json_object(raw: str) -> Optional[Any]:
+    """Parse a JSON value from a model reply, tolerating prose/fences/trailing text.
+
+    The model occasionally wraps the JSON in a markdown fence, adds a sentence
+    before or after it, or appends commentary. A plain json.loads then fails and
+    the user sees "content came back malformed". We first try a clean parse, then
+    fall back to slicing the outermost {...} / [...] span and parsing that.
+    Returns the parsed value, or None when nothing parseable is present.
+    """
+    text = _strip_json_fence(raw)
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    candidates = [i for i in (text.find("{"), text.find("[")) if i != -1]
+    if not candidates:
+        return None
+    start = min(candidates)
+    close_ch = "}" if text[start] == "{" else "]"
+    end = text.rfind(close_ch)
+    if end <= start:
+        return None
+    try:
+        return json.loads(text[start:end + 1])
+    except Exception:
+        return None
+
+
+# Human-readable fallbacks chatgpt_wrapper returns INSTEAD of model content when
+# the call times out, is rate-limited, trips the circuit breaker, is refused, or
+# comes back empty/truncated. They are not JSON, so a JSON endpoint would parse
+# them as "malformed output" and mask the real cause. Detect them so we can
+# return an accurate, retryable error and never cache/charge for them.
+_MODEL_UNAVAILABLE_SENTINELS = (
+    "request timed out",
+    "connection issue",
+    "experiencing high demand",
+    "service temporarily unavailable",
+    "service is temporarily unavailable",
+    "service configuration error",
+    "response was cut off due to token limit",
+    "the model returned an empty response",
+    "i encountered an unexpected error",
+    "network connection issue",
+    "unable to process request:",
+    "please try rephrasing your request",
+)
+
+
+def _looks_like_model_unavailable(text: str) -> bool:
+    low = (text or "").strip().lower()
+    # Real content is long JSON; the sentinels are short single sentences. The
+    # length guard keeps a genuine long answer that happens to mention one of
+    # these phrases from being misread as an outage.
+    if not low or len(low) > 400:
+        return False
+    return any(s in low for s in _MODEL_UNAVAILABLE_SENTINELS)
 
 
 def _task_content_model_bundle(
@@ -3534,10 +3739,11 @@ def _task_content_generate_quiz_batch(
             max_completion_tokens=900,
             auto_detect_language=False,
             reply_language=_language_name_to_chat_code(coaching_language) if coaching_language else None,
+            response_format={"type": "json_object"},
         )
         if not response_text or not response_text.strip():
             return []
-        parsed = json.loads(_strip_json_fence(response_text))
+        parsed = _extract_json_object(response_text)
         raw_quiz = parsed.get("quiz") if isinstance(parsed, dict) else None
         return _normalize_quiz(raw_quiz, max_items=count)
     except Exception as e:
@@ -3645,7 +3851,7 @@ def _task_content_maybe_topup_cached_quiz(
     max_instances=20,
     timeout_sec=120,
     cpu=1,
-    secrets=[_EVO_FIREBASE_SA_SECRET],
+    secrets=_LLM_SECRETS,
 )
 def generate_task_content(req: https_fn.Request) -> https_fn.Response:
     """Generate practice-step drill material + optional quiz.
@@ -3748,6 +3954,7 @@ def generate_task_content(req: https_fn.Request) -> https_fn.Response:
             language_selected,
             planner_language,
             instruction_language,
+            category_key=category_key,
         )
         coaching_language = _task_content_coaching_language(
             instruction_language,
@@ -3878,15 +4085,22 @@ def generate_task_content(req: https_fn.Request) -> https_fn.Response:
         ]
         if task_detail and task_detail.strip() != (task_title or "").strip():
             user_prompt_lines.append(f"- parent_task: {task_detail}")
+        is_language_plan = category_key == "learning_language"
         user_prompt_lines += [
             "",
             f"SELECTED RESPONSE LANGUAGE (languageSelected): {reply_language}",
-            f"COACHING LANGUAGE (quiz, notes, explanations — one language only): "
-            f"{coaching_language}",
-            f"TASK TEXT LANGUAGE (instructions only): {instruction_language}",
-            f"PRACTICE/TARGET LANGUAGE (drill material): {practice_language}",
-            language_instruction,
+            f"WRITE EVERYTHING IN (one language only — content, quiz, notes, "
+            f"explanations): {coaching_language}",
         ]
+        if is_language_plan:
+            # Only a foreign-language plan has a distinct target language for
+            # the drill items; for every other subject the material is written
+            # entirely in the coaching language above.
+            user_prompt_lines += [
+                f"TASK TEXT LANGUAGE (instructions only): {instruction_language}",
+                f"PRACTICE/TARGET LANGUAGE (drill items only): {practice_language}",
+            ]
+        user_prompt_lines.append(language_instruction)
         if planner_intent_note:
             user_prompt_lines += ["", planner_intent_note]
         user_prompt_lines += [
@@ -3950,14 +4164,25 @@ def generate_task_content(req: https_fn.Request) -> https_fn.Response:
                 "(recovery: missed yesterday — gentle return rep; no streak shame.)"
             )
         user_prompt_lines.append("")
+        if is_language_plan:
+            produce_line = (
+                f"Produce a ready-to-use DRILL SHEET for the step above (real "
+                f"{practice_language} items — not a {coaching_language} summary "
+                f"of the step), aligned with planName, plus exactly "
+            )
+        else:
+            produce_line = (
+                f"Produce ready-to-use STUDY/PRACTICE MATERIAL for the step "
+                f"above (the real substance to work through per the CATEGORY "
+                f"GUIDANCE — not a summary of the step), written in "
+                f"{coaching_language} and aligned with planName, plus exactly "
+            )
         user_prompt_lines.append(
-            f"Produce a ready-to-use DRILL SHEET for the step above (real "
-            f"{practice_language} items — not a {coaching_language} summary of "
-            f"the step), aligned with planName, plus exactly "
-            f"{_TASK_CONTENT_QUIZ_FIRST_BATCH} quiz questions when a quiz helps "
-            "(more are added later). Embed every fact the quiz will test inside "
-            "the material. Write rich 2–3 sentence explanations per the JSON "
-            "contract."
+            produce_line
+            + f"{_TASK_CONTENT_QUIZ_FIRST_BATCH} quiz questions when a quiz "
+            "helps (more are added later). Embed every fact the quiz will test "
+            "inside the material. Write rich 2–3 sentence explanations per the "
+            "JSON contract."
         )
         user_prompt = "\n".join(user_prompt_lines)
 
@@ -3979,6 +4204,7 @@ def generate_task_content(req: https_fn.Request) -> https_fn.Response:
             max_completion_tokens=max_tokens,
             auto_detect_language=False,
             reply_language=_language_name_to_chat_code(coaching_language),
+            response_format={"type": "json_object"},
         )
 
         if not response_text or not response_text.strip():
@@ -3988,11 +4214,50 @@ def generate_task_content(req: https_fn.Request) -> https_fn.Response:
                 status_code=502,
             )
 
-        raw = _strip_json_fence(response_text)
-        try:
-            parsed = json.loads(raw)
-        except Exception:
-            logger.warning("generate_task_content: JSON parse failed uid=%s", uid)
+        parsed = _extract_json_object(response_text)
+        if not isinstance(parsed, dict):
+            # The wrapper returns a plain-English sentence (not JSON) when the
+            # call times out / is rate-limited / trips the breaker / is refused.
+            # Surface that as a retryable "busy" error instead of a confusing
+            # "malformed" one — and do NOT spend a credit or retry on it.
+            if _looks_like_model_unavailable(response_text):
+                logger.warning(
+                    "generate_task_content: model unavailable for uid=%s: %s",
+                    uid, response_text.strip()[:160],
+                )
+                return create_response(
+                    success=False, message='Service busy',
+                    error='The AI is busy right now. Please try again in a moment.',
+                    status_code=503,
+                )
+            # One forceful retry: re-ask for strict JSON only. Common when the
+            # model prepends a sentence or truncates the object.
+            logger.warning(
+                "generate_task_content: JSON parse failed uid=%s — retrying once",
+                uid,
+            )
+            try:
+                from chatgpt_wrapper import chat_with_gpt as _chat_json
+                retry_text = _chat_json(
+                    system_prompt=_TASK_CONTENT_SYSTEM_PROMPT,
+                    user_prompt=(
+                        f"{user_prompt}\n\nIMPORTANT: Return ONLY the JSON object "
+                        "described in the contract — no prose, no markdown fences, "
+                        "nothing before or after it."
+                    ),
+                    model=model,
+                    max_completion_tokens=max_tokens,
+                    auto_detect_language=False,
+                    reply_language=_language_name_to_chat_code(coaching_language),
+                    response_format={"type": "json_object"},
+                )
+                parsed = _extract_json_object(retry_text)
+            except Exception as _retry_err:
+                logger.warning(
+                    "generate_task_content: JSON retry errored uid=%s: %s",
+                    uid, _retry_err,
+                )
+        if not isinstance(parsed, dict):
             return create_response(
                 success=False, message='Bad model output',
                 error='The content came back malformed. Try again.', status_code=502,
@@ -4036,8 +4301,9 @@ def generate_task_content(req: https_fn.Request) -> https_fn.Response:
                     max_completion_tokens=max_tokens,
                     auto_detect_language=False,
                     reply_language=_language_name_to_chat_code(coaching_language),
+                    response_format={"type": "json_object"},
                 )
-                retry_parsed = json.loads(_strip_json_fence(retry_text or ""))
+                retry_parsed = _extract_json_object(retry_text or "")
                 retry_content = (
                     (retry_parsed.get("content") or "").strip()
                     if isinstance(retry_parsed, dict) else ""
