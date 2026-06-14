@@ -40,6 +40,48 @@ def _format_month_context(month_context: Optional[Dict[str, Any]] = None) -> str
     return "Month context (use to improve relevance and continuity):\n" + "\n\n".join(parts)
 
 
+def _format_today_tasks_for_notification(
+    today_todo_list_data: Optional[List[Dict[str, Any]]],
+    language: str = "thai",
+    max_tasks: int = 8,
+) -> str:
+    """Build an explicit bullet list of today's tasks for morning push notifications."""
+    tasks = today_todo_list_data or []
+    active = [
+        task for task in tasks
+        if isinstance(task, dict) and not task.get("completed")
+    ]
+    if not active:
+        return ""
+
+    def _sort_key(task: Dict[str, Any]) -> tuple:
+        start = str(task.get("start") or "").strip()
+        if not start:
+            return (1, 9999)
+        parts = start.split(":")
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1][:2].isdigit():
+            return (0, int(parts[0]) * 60 + int(parts[1][:2]))
+        return (0, start)
+
+    active.sort(key=_sort_key)
+
+    lang = (language or "thai").strip().lower()
+    is_thai = lang in ("thai", "th", "ไทย")
+    header = f"📋 วันนี้ ({len(active)}):" if is_thai else f"📋 Today ({len(active)}):"
+
+    lines = []
+    for task in active[:max_tasks]:
+        title = str(task.get("title") or "Task").strip()[:40]
+        start = str(task.get("start") or "").strip()
+        lines.append(f"• {start} {title}" if start else f"• {title}")
+
+    remaining = len(active) - max_tasks
+    if remaining > 0:
+        lines.append(f"• +{remaining} อีก" if is_thai else f"• +{remaining} more")
+
+    return header + "\n" + "\n".join(lines)
+
+
 def _format_identity_context(
     identity_context: Optional[Dict[str, Any]] = None,
     last_week_completion_rate: Optional[float] = None,
@@ -684,6 +726,15 @@ class PlannerUtils:
                 language=language,
             )
 
+            task_block = _format_today_tasks_for_notification(
+                today_todo_list_data, language
+            )
+            if task_block:
+                if response and response.strip():
+                    response = f"{response.strip()}\n\n{task_block}"
+                else:
+                    response = task_block
+
             logger.info(
                 "Morning message generated (mode=%s, tasks=%s)",
                 normalized_mode,
@@ -693,7 +744,10 @@ class PlannerUtils:
 
         except Exception as e:
             logger.error(f"Failed to generate morning message: {str(e)}")
-            return None
+            task_block = _format_today_tasks_for_notification(
+                today_todo_list_data, language
+            )
+            return task_block or None
 
 
     def summarize_end_of_the_week_message(

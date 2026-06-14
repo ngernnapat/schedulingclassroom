@@ -2462,17 +2462,23 @@ _TASK_CONTENT_CATEGORY_ALIASES = {
     "philosophy": "psychology",
 }
 
+# Tokens that mark a plan as FOREIGN-LANGUAGE learning. Keep these
+# diagnostic — only words that genuinely signal "learning a language" belong
+# here. Generic study verbs/tools (read / อ่าน, flashcard, sentence, phrase)
+# were REMOVED: they appear in every subject (e.g. "read an overview of
+# Aristotle" is philosophy, not language study) and were forcing unrelated
+# plans into pinyin/pronunciation drill mode.
 _LANGUAGE_LEARNING_HINTS = (
-    "language", "vocab", "vocabulary", "grammar", "phrase", "sentences",
-    "sentence", "pronunciation", "fluent", "flashcard", "translation",
+    "language", "vocab", "vocabulary", "grammar", "pronunciation",
+    "fluent", "translation", "conjugation",
     "kanji", "hiragana", "katakana", "pinyin", "romaji", "jlpt", "toefl",
-    "ielts", "hsk", "topik", "japanese", "chinese", "korean", "thai",
-    "english", "spanish", "french", "german", "mandarin", "cantonese",
+    "ielts", "hsk", "topik", "japanese", "chinese", "korean",
+    "spanish", "french", "german", "mandarin", "cantonese",
     "arabic", "hindi", "italian", "portuguese", "vietnamese", "indonesian",
     "russian", "toeic", "delf", "dele", "goethe",
     "中文", "日本語", "한국어", "español", "français", "deutsch", "italiano",
     "português", "русский", "العربية", "हिन्दी",
-    "ภาษา", "คำศัพท์", "ไวยากรณ์", "แปล", "อ่าน", "พินอิน", "โทนเสียง",
+    "ภาษา", "คำศัพท์", "ไวยากรณ์", "แปล", "พินอิน", "โทนเสียง",
     "แมนดาริน", "ฮั่นจื้อ",
 )
 
