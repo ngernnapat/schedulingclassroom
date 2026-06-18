@@ -40,44 +40,58 @@ def _format_month_context(month_context: Optional[Dict[str, Any]] = None) -> str
     return "Month context (use to improve relevance and continuity):\n" + "\n\n".join(parts)
 
 
+def _task_start_sort_key(task: Dict[str, Any]) -> tuple:
+    start = str(task.get("start") or "").strip()
+    if not start:
+        return (1, 9999)
+    parts = start.split(":")
+    if len(parts) >= 2 and parts[0].isdigit() and parts[1][:2].isdigit():
+        return (0, int(parts[0]) * 60 + int(parts[1][:2]))
+    return (0, start)
+
+
+def _sorted_today_tasks(
+    today_todo_list_data: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    tasks = [
+        task for task in (today_todo_list_data or [])
+        if isinstance(task, dict)
+    ]
+    return sorted(tasks, key=_task_start_sort_key)
+
+
 def _format_today_tasks_for_notification(
     today_todo_list_data: Optional[List[Dict[str, Any]]],
     language: str = "thai",
-    max_tasks: int = 8,
 ) -> str:
-    """Build an explicit bullet list of today's tasks for morning push notifications."""
-    tasks = today_todo_list_data or []
-    active = [
-        task for task in tasks
-        if isinstance(task, dict) and not task.get("completed")
-    ]
-    if not active:
+    """Build a full, explicit bullet list of today's tasks for morning push notifications."""
+    tasks = _sorted_today_tasks(today_todo_list_data)
+    if not tasks:
         return ""
-
-    def _sort_key(task: Dict[str, Any]) -> tuple:
-        start = str(task.get("start") or "").strip()
-        if not start:
-            return (1, 9999)
-        parts = start.split(":")
-        if len(parts) >= 2 and parts[0].isdigit() and parts[1][:2].isdigit():
-            return (0, int(parts[0]) * 60 + int(parts[1][:2]))
-        return (0, start)
-
-    active.sort(key=_sort_key)
 
     lang = (language or "thai").strip().lower()
     is_thai = lang in ("thai", "th", "ไทย")
-    header = f"📋 วันนี้ ({len(active)}):" if is_thai else f"📋 Today ({len(active)}):"
+    header = (
+        f"📋 รายการวันนี้ ({len(tasks)}):"
+        if is_thai
+        else f"📋 Today's list ({len(tasks)}):"
+    )
 
     lines = []
-    for task in active[:max_tasks]:
-        title = str(task.get("title") or "Task").strip()[:40]
+    for task in tasks:
+        title = str(task.get("title") or "Task").strip()[:50]
         start = str(task.get("start") or "").strip()
-        lines.append(f"• {start} {title}" if start else f"• {title}")
-
-    remaining = len(active) - max_tasks
-    if remaining > 0:
-        lines.append(f"• +{remaining} อีก" if is_thai else f"• +{remaining} more")
+        done = bool(task.get("completed"))
+        if done:
+            if start:
+                line = f"• ✓ {start} {title}"
+            else:
+                line = f"• ✓ {title}"
+        elif start:
+            line = f"• {start} {title}"
+        else:
+            line = f"• {title}"
+        lines.append(line)
 
     return header + "\n" + "\n".join(lines)
 
@@ -106,9 +120,9 @@ def _format_identity_context(
     current = ctx.get("currentStreak")
     longest = ctx.get("longestStreak")
     if isinstance(current, (int, float)) and current > 0:
-        lines.append(f"Current daily streak: {int(current)} days")
+        lines.append(f"Recent return streak (background only, do not push): {int(current)} days")
     if isinstance(longest, (int, float)) and longest > 0:
-        lines.append(f"Longest streak ever: {int(longest)} days")
+        lines.append(f"Longest return streak (background only): {int(longest)} days")
 
     last_done = ctx.get("lastCompletionDate")
     if isinstance(last_done, str) and last_done.strip():
@@ -135,18 +149,18 @@ def _format_identity_context(
 
     if isinstance(last_week_completion_rate, (int, float)):
         rate_pct = round(float(last_week_completion_rate) * 100)
-        lines.append(f"Last week's completion rate: {rate_pct}%")
+        lines.append(
+            f"Last week's task-touch rate: {rate_pct}% (context only — never guilt-trip)"
+        )
 
     if not lines:
         return ""
 
     header = (
-        "User behavior signals (ground your coaching in this — reference "
-        "specific streaks/dates when they're relevant, and lean into the "
-        "identity framing of the most recent badge phrase rather than "
-        "generic motivational language. If completion rate is low, be "
-        "supportive and propose lighter next steps; if high, reinforce the "
-        "identity that's emerging):"
+        "User behavior signals (ground coaching in goals, return rhythm, and how "
+        "they likely feel — not streak pressure. Reference the most recent badge "
+        "identity phrase when relevant. If load was low, suggest lighter sustainable "
+        "next steps; if strong, reinforce alignment with what matters to them):"
     )
     return header + "\n" + "\n".join(f"- {ln}" for ln in lines)
 
@@ -159,6 +173,7 @@ When analyzing the user's todo list (from context above), always address these a
 2. **Protect deep work time**: Identify focus-needed tasks (e.g. report, coding, study) and suggest when to block uninterrupted time; warn if they're squeezed between meetings.
 3. **Maintain goal momentum**: Spot recurring or goal-related items (e.g. gym, learning, project milestones). Encourage consistency and suggest how to keep them visible and achievable.
 4. **Be practical**: Give 2–4 concrete, actionable suggestions only. No generic advice—reference specific titles, dates, or patterns from their list. Use their language.
+5. **Protect recovery**: When suggesting moves, avoid dumping items into late night (after 21:00). Prefer afternoon gaps or making flexible notes unscheduled. Coach reflections and meta-reminders are not calendar blocks.
 """
 
 
@@ -173,7 +188,7 @@ class PlannerType(Enum):
 @dataclass
 class PlannerConfig:
     """Configuration for planner operations"""
-    max_completion_tokens: int = 200
+    max_completion_tokens: int = 512
     temperature: float = 1.0
     top_p: float = 0.9
     enable_emojis: bool = True
@@ -315,27 +330,63 @@ class PromptBuilder:
         return system_prompt, user_prompt
     
     @staticmethod
-    def build_todo_info_prompt(user_query: str, todo_data: Dict[str, Any]) -> tuple[str, str]:
+    def build_todo_info_prompt(
+        user_query: str,
+        todo_data: Dict[str, Any],
+        personalization_block: Optional[str] = None,
+        general_coach: bool = False,
+    ) -> tuple[str, str]:
         """Build prompt for providing information about todo_data"""
-        system_prompt = (
-            "You are Evo, a helpful AI assistant that provides practical information about todo lists. "
-            "Be honest, concise, and actionable. If something doesn't make sense, say so clearly and helpfully."
-        )
-        
-        # Format todo data for clarity
-        todo_info = "\n".join([f"• {key}: {value}" for key, value in todo_data.items()])
-        
-        user_prompt = (
-            f"User query: {user_query}\n\n"
-            f"Todo data:\n{todo_info}\n\n"
-            "Provide a CONCISE response (2-4 sentences maximum) focusing only on what matters:\n\n"
-            "- If user asks about a specific point, give focused details\n"
-            "- If user's query doesn't align with the todo data, point it out honestly\n"
-            "- When relevant, add 1 practical suggestion for improvement\n"
-            "- Only suggest links/resources if user explicitly asks\n\n"
-            "Be honest: cheer up only when deserved, but be straightforward when something doesn't make sense. "
-            "Use minimal emojis. Keep it short and practical."
-        )
+        if general_coach:
+            system_prompt = (
+                "You are EVO AI — a warm, friendly companion inside a planning app. "
+                "Talk like a supportive friend who knows the user's calendar across last month, "
+                "this month, and next month (refined summaries), plus today's tasks, plans, and habits. "
+                "Users keep tasks as reminders (they rarely tap complete) — treat past dates/times as handled. "
+                "Never mention completion %, checkmarks, or guilt about unfinished tasks. "
+                "Optimize for consistency on their real goals and how they feel about their path — "
+                "not streak anxiety. Returning after a miss and lighter days are valid progress. "
+                "When Planner content or PLAN ARC is provided, say what the plan/day is actually about "
+                "(topic, day focus, concrete steps) — not just the calendar task title. "
+                "Use their planner data to give helpful, honest answers — never invent schedules or progress "
+                "you were not given. Stay encouraging without toxic positivity; lighter days and rest are okay."
+            )
+            user_prompt = (
+                f"User query: {user_query}\n\n"
+                "Friendly check-in chat (not a formal report).\n"
+                "Reply in 2-4 short, warm sentences:\n"
+                "- If Planner content is provided, mention what the relevant plan day is about before suggesting action\n"
+                "- Acknowledge how they're doing when calendar context is available — goals and feeling, not streaks\n"
+                "- If calendar data shows many tasks this month, reflect that honestly — never say the month is empty\n"
+                "- Answer their question in plain, friendly language\n"
+                "- Suggest one small realistic next step when helpful\n"
+                "Use 0-1 emoji max. Sound human and kind, not corporate or preachy."
+            )
+        else:
+            system_prompt = (
+                "You are EVO AI — a warm coach for a specific calendar task. "
+                "When PLAN ARC / planner content is provided, ground every suggestion in that plan's "
+                "goal, day focus, and steps — do not invent unrelated advice. "
+                "Be honest, concise, and actionable. Never guilt-trip about streaks or completion %. "
+                "When personalization context is provided, tailor advice to the user's schedule and goals — "
+                "never invent facts beyond that context."
+            )
+            todo_info = "\n".join([f"• {key}: {value}" for key, value in todo_data.items()])
+            user_prompt = (
+                f"User query: {user_query}\n\n"
+                f"Todo data:\n{todo_info}\n\n"
+                "Provide a CONCISE response (2-4 sentences maximum) focusing only on what matters:\n\n"
+                "- If planner/plan content is provided, tie advice to that plan day and main goal\n"
+                "- If user asks about a specific point, give focused details\n"
+                "- If user's query doesn't align with the todo data, point it out honestly\n"
+                "- When relevant, add 1 practical suggestion for improvement\n"
+                "- Only suggest links/resources if user explicitly asks\n\n"
+                "Be honest: cheer up only when deserved, but be straightforward when something doesn't make sense. "
+                "Use minimal emojis. Keep it short and practical."
+            )
+
+        if personalization_block and personalization_block.strip():
+            user_prompt = f"{personalization_block.strip()}\n\n{user_prompt}"
         
         return system_prompt, user_prompt
 
@@ -524,8 +575,10 @@ class PlannerUtils:
             if identity_block:
                 user_prompt = f"{identity_block}\n\n{user_prompt}"
 
-            # Make API call
-            response = self._safe_chat_call(system_prompt, user_prompt)
+            # Allow full supportive replies (Thai needs more tokens than Latin).
+            response = self._safe_chat_call(
+                system_prompt, user_prompt, max_completion_tokens=512
+            )
 
             logger.info("User input response generated successfully")
             return response
@@ -564,7 +617,14 @@ class PlannerUtils:
             logger.error(f"Failed to generate mood boost: {str(e)}")
             return "You're absolutely amazing! Keep shining bright! ✨🌟💫"
     
-    def get_todo_information_generator_response(self, user_query: str, todo_data: Dict[str, Any], language: str = "thai") -> str:
+    def get_todo_information_generator_response(
+        self,
+        user_query: str,
+        todo_data: Dict[str, Any],
+        language: str = "thai",
+        personalization_block: Optional[str] = None,
+        general_coach: bool = False,
+    ) -> str:
         """
         Provide concise, honest, and practical information about todo_data.
         
@@ -578,6 +638,7 @@ class PlannerUtils:
             user_query: User's question about the todo list
             todo_data: Todo list data
             language: Language for the response
+            personalization_block: Optional bounded identity/schedule/RAG context
             
         Returns:
             Concise, honest information about the todo list
@@ -587,17 +648,22 @@ class PlannerUtils:
             if not user_query or not isinstance(user_query, str):
                 user_query = "Tell me about this todo list"
             
-            self.validator.validate_planner_data(todo_data)
+            if not general_coach:
+                self.validator.validate_planner_data(todo_data)
             normalized_language = self.validator.validate_language(language)
             
             # Build prompt
             system_prompt, user_prompt = self.prompt_builder.build_todo_info_prompt(
-                user_query, todo_data
+                user_query,
+                todo_data,
+                personalization_block=personalization_block,
+                general_coach=general_coach,
             )
             
-            # Make API call with moderate max_completion_tokens for concise responses
+            # Coach chat needs enough tokens for 2–4 complete Thai sentences.
+            token_budget = 768 if general_coach else 400
             response = self._safe_chat_call(
-                system_prompt, user_prompt, language=normalized_language, max_completion_tokens=200
+                system_prompt, user_prompt, language=normalized_language, max_completion_tokens=token_budget
             )
             
             logger.info("Todo information generated successfully")
@@ -632,8 +698,8 @@ class PlannerUtils:
                 "Make them smile this morning with gentle humor plus real encouragement.",
             ),
             "identity_cheer": (
-                voice + " Celebrate who they're becoming — streaks, runes, badges as proof of growth.",
-                "Cheer them on using identity/streak/rune context if provided; focus on becoming, not doing.",
+                voice + " Celebrate who they're becoming — identity, goals, and honest feeling, not streak scores.",
+                "Cheer them on using identity/badge context if provided; focus on becoming and consistency on what matters.",
             ),
             "gentle_rest": (
                 voice + " Cozy permission to breathe when the day is light — still hopeful, never lazy-shaming.",
@@ -656,6 +722,8 @@ class PlannerUtils:
         behavior_stats: Optional[Dict[str, Any]] = None,
         identity_context: Optional[Dict[str, Any]] = None,
         morning_mode: Optional[str] = "todo_coach",
+        week_tasks: Optional[List[Dict[str, Any]]] = None,
+        today_date: Optional[str] = None,
     ) -> Optional[str]:
         """
         Generate a compact morning push message. ``morning_mode`` rotates personality:
@@ -676,18 +744,49 @@ class PlannerUtils:
             tasks_info = ""
             if total_tasks > 0:
                 tasks_info = "\n".join([
-                    f"• {task.get('title', 'Task')[:30]} - {task.get('start', '')}"
-                    for task in today_todo_list_data[:4]
+                    (
+                        f"• ✓ {task.get('start', '')} {str(task.get('title', 'Task'))[:40]}".strip()
+                        if task.get("completed")
+                        else f"• {task.get('start', '')} {str(task.get('title', 'Task'))[:40]}".strip()
+                    )
+                    for task in _sorted_today_tasks(today_todo_list_data)
                 ])
-                remaining = total_tasks - 4 if total_tasks > 4 else 0
-                if remaining:
-                    tasks_info += f"\n• +{remaining} more"
 
             user_prompt = user_task
             if total_tasks > 0:
                 user_prompt += f"\n\nToday's tasks ({total_tasks}):\n{tasks_info}"
             else:
                 user_prompt += "\n\nToday's tasks: none or very light."
+
+            week_list = [
+                t for t in (week_tasks or []) if isinstance(t, dict)
+            ][:40]
+            if week_list:
+                week_by_date: Dict[str, List[Dict[str, Any]]] = {}
+                for task in _sorted_today_tasks(week_list):
+                    day_key = str(task.get("date") or "").strip() or "?"
+                    week_by_date.setdefault(day_key, []).append(task)
+
+                week_lines: List[str] = []
+                for day_key in sorted(week_by_date.keys()):
+                    day_tasks = week_by_date[day_key]
+                    day_header = (
+                        f"{day_key} ({len(day_tasks)})"
+                        + (" — today" if today_date and day_key == today_date else "")
+                    )
+                    week_lines.append(day_header)
+                    for task in day_tasks[:6]:
+                        title = str(task.get("title") or "Task").strip()[:40]
+                        start = str(task.get("start") or "").strip()
+                        mark = "✓ " if task.get("completed") else ""
+                        week_lines.append(f"  • {mark}{start} {title}".strip())
+                    if len(day_tasks) > 6:
+                        week_lines.append(f"  • … +{len(day_tasks) - 6} more")
+
+                user_prompt += (
+                    f"\n\nCalendar week ({len(week_list)} tasks):\n"
+                    + "\n".join(week_lines)
+                )
 
             if user_context:
                 context_block = "\n".join(f"• {c}" for c in user_context[:8])
@@ -731,7 +830,7 @@ class PlannerUtils:
             )
             if task_block:
                 if response and response.strip():
-                    response = f"{response.strip()}\n\n{task_block}"
+                    response = f"{task_block}\n\n{response.strip()}"
                 else:
                     response = task_block
 
@@ -749,6 +848,141 @@ class PlannerUtils:
             )
             return task_block or None
 
+    def reminder_message(
+        self,
+        target_task: Dict[str, Any],
+        week_tasks: Optional[List[Dict[str, Any]]] = None,
+        month_tasks: Optional[List[Dict[str, Any]]] = None,
+        language: str = "thai",
+        minutes_until: int = 0,
+        time_until_text: Optional[str] = None,
+        identity_context: Optional[Dict[str, Any]] = None,
+        earned_runes: Optional[List[Dict[str, Any]]] = None,
+        behavior_stats: Optional[Dict[str, Any]] = None,
+        today_date: Optional[str] = None,
+        user_context: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        """
+        Generate a compact, personalized push notification body for an upcoming todo.
+        Grounds the nudge in the target task plus light week/month calendar context.
+        """
+        try:
+            normalized_language = self.validator.validate_language(language)
+            task = target_task if isinstance(target_task, dict) else {}
+            title = str(task.get("title") or "Task").strip()[:60]
+            start = str(task.get("start") or "").strip()
+            task_date = str(task.get("date") or "").strip()
+            timing = (time_until_text or "").strip() or (
+                f"{minutes_until} min" if minutes_until else "soon"
+            )
+
+            week_list = [
+                t for t in (week_tasks or []) if isinstance(t, dict)
+            ][:40]
+            month_list = [
+                t for t in (month_tasks or []) if isinstance(t, dict)
+            ][:30]
+
+            week_by_date: Dict[str, List[Dict[str, Any]]] = {}
+            for t in _sorted_today_tasks(week_list):
+                day_key = str(t.get("date") or "").strip() or "?"
+                week_by_date.setdefault(day_key, []).append(t)
+
+            week_lines: List[str] = []
+            for day_key in sorted(week_by_date.keys()):
+                day_tasks = week_by_date[day_key]
+                is_today = bool(today_date and day_key == today_date)
+                day_label = f"{day_key} ({len(day_tasks)})"
+                if is_today:
+                    day_label += " — today"
+                week_lines.append(day_label)
+                for t in day_tasks[:5]:
+                    t_title = str(t.get("title") or "Task").strip()[:40]
+                    t_start = str(t.get("start") or "").strip()
+                    mark = "✓ " if t.get("completed") else ""
+                    week_lines.append(f"  • {mark}{t_start} {t_title}".strip())
+                if len(day_tasks) > 5:
+                    week_lines.append(f"  • … +{len(day_tasks) - 5} more")
+
+            week_block = (
+                "\n".join(week_lines) if week_lines else "(light week)"
+            )
+
+            month_titles = [
+                str(t.get("title") or "").strip()[:35]
+                for t in month_list
+                if str(t.get("title") or "").strip()
+            ]
+            month_hint = (
+                f"{len(month_list)} tasks this month"
+                + (
+                    f" — e.g. {', '.join(month_titles[:4])}"
+                    if month_titles
+                    else ""
+                )
+            )
+
+            system_prompt = (
+                "You are Evo, a warm behavioral coach sending a mobile push reminder. "
+                "Write ONLY the notification body (no title). "
+                "Must mention how soon the event starts using the provided timing text. "
+                "Reference the target task by name. "
+                "Use the calendar week context to personalize — note if today is busy "
+                "or if the week ahead is lighter/heavier. "
+                "You may nod to identity/streak if helpful — agency-forward, never guilt. "
+                "Maximum 160 characters. At most one emoji."
+            )
+
+            target_line = (
+                f"Target: {start} {title} ({task_date})".strip()
+                if start
+                else f"Target: {title} ({task_date})".strip()
+            )
+            user_prompt = (
+                f"{target_line}\n"
+                f"Starts in: {timing}\n\n"
+                f"Calendar week ({len(week_list)} tasks):\n{week_block}\n\n"
+                f"Month context: {month_hint}\n\n"
+                f"Write the push body in {normalized_language}."
+            )
+
+            if user_context:
+                context_block = "\n".join(f"• {c}" for c in user_context[:6])
+                user_prompt = (
+                    f"Relevant user context:\n{context_block}\n\n{user_prompt}"
+                )
+
+            earned = normalize_earned_runes_for_llm(earned_runes)
+            grounding_lines = []
+            if isinstance(behavior_stats, dict) and behavior_stats:
+                streak = behavior_stats.get("current_streak")
+                if streak:
+                    grounding_lines.append(f"Current streak: {streak}")
+            if earned:
+                grounding_lines.append(
+                    "Earned rune identities: "
+                    + "; ".join(f"{e['name']}" for e in earned[:4])
+                )
+            if isinstance(identity_context, dict) and identity_context:
+                id_block = _format_identity_context(identity_context)
+                if id_block.strip():
+                    grounding_lines.append("Identity:\n" + id_block[:400])
+            if grounding_lines:
+                user_prompt = "\n".join(grounding_lines) + "\n\n" + user_prompt
+
+            response = self._safe_chat_call(
+                system_prompt,
+                user_prompt,
+                max_completion_tokens=120,
+                temperature=0.9,
+                language=normalized_language,
+            )
+            if response and response.strip():
+                return response.strip()
+            return None
+        except Exception as e:
+            logger.error(f"Failed to generate reminder message: {str(e)}")
+            return None
 
     def summarize_end_of_the_week_message(
         self,
@@ -1594,6 +1828,8 @@ def message_in_the_morning(
     behavior_stats: Optional[Dict[str, Any]] = None,
     identity_context: Optional[Dict[str, Any]] = None,
     morning_mode: Optional[str] = "todo_coach",
+    week_tasks: Optional[List[Dict[str, Any]]] = None,
+    today_date: Optional[str] = None,
 ) -> Optional[str]:
     """Backward compatibility function for message in the morning"""
     planner = get_default_planner()
@@ -1606,6 +1842,38 @@ def message_in_the_morning(
         behavior_stats=behavior_stats,
         identity_context=identity_context,
         morning_mode=morning_mode,
+        week_tasks=week_tasks,
+        today_date=today_date,
+    )
+
+
+def todo_reminder_message(
+    target_task: Dict[str, Any],
+    week_tasks: Optional[List[Dict[str, Any]]] = None,
+    month_tasks: Optional[List[Dict[str, Any]]] = None,
+    language: str = "thai",
+    minutes_until: int = 0,
+    time_until_text: Optional[str] = None,
+    identity_context: Optional[Dict[str, Any]] = None,
+    earned_runes: Optional[List[Dict[str, Any]]] = None,
+    behavior_stats: Optional[Dict[str, Any]] = None,
+    today_date: Optional[str] = None,
+    user_context: Optional[List[str]] = None,
+) -> Optional[str]:
+    """Backward compatibility function for personalized todo reminder push bodies."""
+    planner = get_default_planner()
+    return planner.reminder_message(
+        target_task,
+        week_tasks=week_tasks,
+        month_tasks=month_tasks,
+        language=language,
+        minutes_until=minutes_until,
+        time_until_text=time_until_text,
+        identity_context=identity_context,
+        earned_runes=earned_runes,
+        behavior_stats=behavior_stats,
+        today_date=today_date,
+        user_context=user_context,
     )
 
 def summarize_end_of_the_week_at_friday(
@@ -1665,10 +1933,22 @@ def analyze_todo_list(
     )
 
 
-def get_todo_information(user_query: str, todo_data: Dict[str, Any], language: str = "thai") -> str:
+def get_todo_information(
+    user_query: str,
+    todo_data: Dict[str, Any],
+    language: str = "thai",
+    personalization_block: Optional[str] = None,
+    general_coach: bool = False,
+) -> str:
     """Backward compatibility function for getting todo information generator response"""
     planner = get_default_planner()
-    return planner.get_todo_information_generator_response(user_query, todo_data, language)
+    return planner.get_todo_information_generator_response(
+        user_query,
+        todo_data,
+        language,
+        personalization_block=personalization_block,
+        general_coach=general_coach,
+    )
 
 def summarize_this_year_todos_message(
     this_year_todos_data: str,

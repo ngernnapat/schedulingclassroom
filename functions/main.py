@@ -4,6 +4,7 @@
 import json
 import logging
 import os
+import re
 import sys
 import time
 import traceback
@@ -300,6 +301,57 @@ def _month_context_from_request(data: Dict[str, Any]) -> Optional[Dict[str, Any]
         if val is not None and (isinstance(val, str) and val.strip() or isinstance(val, list)):
             month_context[key] = val
     return month_context if month_context else None
+
+
+def _calendar_context_from_request(data: Dict[str, Any]) -> str:
+    """Plain-text calendar summary from client (works even if personalization module is older)."""
+    text = data.get("calendar_context_text")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    summary = data.get("month_life_summary")
+    if summary:
+        try:
+            from personalization_context import format_month_life_from_client
+            block = format_month_life_from_client(summary)
+            if block:
+                return block
+        except Exception as exc:
+            logger.debug("month_life_summary formatting skipped: %s", exc)
+    return ""
+
+
+def _infer_plan_day_number(row: Dict[str, Any]) -> Optional[int]:
+    """Parse Day N from todo fields when planDayNumber / progressDay are missing."""
+    for key in ("planDayNumber", "progressDay", "plan_day_number"):
+        val = row.get(key)
+        if val is None:
+            continue
+        try:
+            n = int(val)
+            if n > 0:
+                return n
+        except (TypeError, ValueError):
+            continue
+    title = str(row.get("title") or "")
+    match = re.search(r"Day\s*(\d+)", title, re.I) or re.search(r"วัน\s*(\d+)", title)
+    if match:
+        try:
+            n = int(match.group(1))
+            if n > 0:
+                return n
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _planner_context_from_request(data: Dict[str, Any]) -> str:
+    """Planner content summary from client (plan_context_text / now_context)."""
+    parts: List[str] = []
+    for key in ("plan_context_text", "now_context_text"):
+        text = data.get(key)
+        if isinstance(text, str) and text.strip():
+            parts.append(text.strip())
+    return "\n\n".join(parts)
 
 
 def _month_context_for_user(
@@ -5248,7 +5300,7 @@ def summarize_planner(req: https_fn.Request) -> https_fn.Response:
         )
 
 # AI Assistant to provide information about todo_data
-@https_fn.on_request(memory=1024, max_instances=3, cpu=1)
+@https_fn.on_request(memory=1024, max_instances=3, cpu=1, secrets=_LLM_SECRETS)
 def progress(req: https_fn.Request) -> https_fn.Response:
     """Track user progress using ChatGPT"""
     if req.method == 'OPTIONS':
@@ -5272,17 +5324,11 @@ def progress(req: https_fn.Request) -> https_fn.Response:
                 status_code=400
             )
         
-        # Validate required fields
-        if 'todo_data' not in data:
-            return create_response(
-                success=False,
-                message='Missing required field',
-                error='todo_data is required',
-                status_code=400
-            )
-
         todo_data = data.get('todo_data')
-        if not isinstance(todo_data, dict):
+        general_coach = not isinstance(todo_data, dict) or not todo_data
+        if general_coach:
+            todo_data = {}
+        elif not isinstance(todo_data, dict):
             return create_response(
                 success=False,
                 message='Invalid todo_data',
@@ -5292,13 +5338,19 @@ def progress(req: https_fn.Request) -> https_fn.Response:
 
         # Build a stronger, contextual query for more accurate responses.
         raw_user_query = data.get('user_update')
-        user_query = raw_user_query.strip() if isinstance(raw_user_query, str) and raw_user_query.strip() else "Help me understand this todo and what to do next."
+        user_message_field = data.get('user_message')
+        if isinstance(user_message_field, str) and user_message_field.strip():
+            user_query = user_message_field.strip()
+        elif isinstance(raw_user_query, str) and raw_user_query.strip():
+            user_query = raw_user_query.strip().split("\n\n")[0].strip()
+        else:
+            user_query = "Help me understand this todo and what to do next."
 
         # Optional short chat history from client to preserve intent.
         chat_history = data.get('chat_history', [])
         history_lines: List[str] = []
         if isinstance(chat_history, list):
-            for message in chat_history[-8:]:
+            for message in chat_history[-20:]:
                 if not isinstance(message, dict):
                     continue
                 role = message.get('role')
@@ -5316,6 +5368,73 @@ def progress(req: https_fn.Request) -> https_fn.Response:
         else:
             enriched_query = user_query
 
+        calendar_block = _calendar_context_from_request(data)
+        if calendar_block:
+            enriched_query = (
+                f"{enriched_query}\n\n{calendar_block}\n"
+                "Important: If calendar data above shows tasks this month, do NOT say the month is empty."
+            )
+
+        planner_block = _planner_context_from_request(data)
+        if planner_block:
+            enriched_query = (
+                f"{enriched_query}\n\n{planner_block}\n"
+                "Important: When planner content is present, explain what the relevant plan/day "
+                "is about using Planner summary and day steps — not only the calendar reminder title. "
+                "Ground suggestions in that plan content."
+            )
+
+        if general_coach and isinstance(data.get('today_todos'), list):
+            focus_row = data.get("focus_todo")
+            plan_rows = []
+            if isinstance(focus_row, dict) and str(
+                focus_row.get("planId") or focus_row.get("plan_id") or ""
+            ).strip():
+                plan_rows.append(focus_row)
+            for row in data.get('today_todos') or []:
+                if isinstance(row, dict) and row not in plan_rows:
+                    plan_rows.append(row)
+
+            for row in plan_rows:
+                if not isinstance(row, dict):
+                    continue
+                plan_id = str(row.get("planId") or row.get("plan_id") or "").strip()
+                if not plan_id:
+                    continue
+                plan_day = _infer_plan_day_number(row)
+                user_id = data.get("user_id")
+                plan_ctx = _load_practice_plan_context(user_id, plan_id, plan_day)
+                if plan_ctx:
+                    plan_ctx_block = _format_practice_plan_context_block(plan_ctx)
+                    enriched_query = (
+                        f"{enriched_query}\n\n{plan_ctx_block}\n"
+                        "This is today's focus plan from the calendar — cite what this plan day "
+                        "covers (topic + steps) when answering."
+                    )
+                break
+
+        if not general_coach and isinstance(todo_data, dict):
+            plan_id = str(
+                todo_data.get("planId")
+                or todo_data.get("plan_id")
+                or ""
+            ).strip()
+            if plan_id:
+                plan_day = (
+                    todo_data.get("planDayNumber")
+                    or todo_data.get("progressDay")
+                    or todo_data.get("plan_day_number")
+                )
+                user_id = data.get("user_id")
+                plan_ctx = _load_practice_plan_context(user_id, plan_id, plan_day)
+                if plan_ctx:
+                    plan_ctx_block = _format_practice_plan_context_block(plan_ctx)
+                    enriched_query = (
+                        f"{enriched_query}\n\n{plan_ctx_block}\n"
+                        "Use this PLAN ARC for the linked calendar task — suggest steps that match "
+                        "the plan day focus and main goal."
+                    )
+
         # Normalize language field to avoid accidental unsupported values.
         language = data.get('language', 'thai')
         if not isinstance(language, str) or not language.strip():
@@ -5323,9 +5442,25 @@ def progress(req: https_fn.Request) -> https_fn.Response:
         else:
             language = language.strip().lower()
 
+        personalization_block = ""
+        try:
+            from personalization_context import build_personalization_for_request
+            personalization_block = build_personalization_for_request(data, user_query)
+        except Exception as personalization_error:
+            logger.warning(
+                "Personalization context skipped in progress: %s",
+                personalization_error,
+            )
+
         # Get information about todo_data using AI assistant
         pu = get_planner_utils()
-        information = pu.get_todo_information(enriched_query, todo_data, language)
+        information = pu.get_todo_information(
+            enriched_query,
+            todo_data,
+            language,
+            personalization_block=personalization_block or None,
+            general_coach=general_coach,
+        )
         return create_response(
             data={'feedback': information},
             message='Todo information provided successfully'
@@ -5465,6 +5600,8 @@ def encourage_in_the_morning(req: https_fn.Request) -> https_fn.Response:
             behavior_stats=data.get('behavior_stats'),
             identity_context=data.get('identity_context'),
             morning_mode=morning_mode,
+            week_tasks=data.get('week_tasks') if isinstance(data.get('week_tasks'), list) else [],
+            today_date=data.get('today_date'),
         )
         return create_response(
             data={'response': response},
@@ -5479,6 +5616,88 @@ def encourage_in_the_morning(req: https_fn.Request) -> https_fn.Response:
             error=f'Failed to generate response: {str(e)}',
             status_code=500
         )
+
+
+@https_fn.on_request(memory=1024, max_instances=5, timeout_sec=120, cpu=1)
+def todo_reminder_message(req: https_fn.Request) -> https_fn.Response:
+    """Personalized push body for an upcoming todo reminder (target + week/month context)."""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+
+    if req.method != 'POST':
+        return create_response(
+            success=False,
+            message='Method not allowed',
+            error='Only POST method is allowed',
+            status_code=405
+        )
+
+    try:
+        data = req.get_json()
+        if not data:
+            return create_response(
+                success=False,
+                message='No data provided',
+                error='Request body is required',
+                status_code=400
+            )
+
+        target_task = data.get('target_task')
+        if not isinstance(target_task, dict):
+            return create_response(
+                success=False,
+                message='Missing required field',
+                error='target_task is required',
+                status_code=400
+            )
+
+        minutes_until = data.get('minutes_until', 0)
+        try:
+            minutes_until = int(minutes_until)
+        except (TypeError, ValueError):
+            minutes_until = 0
+
+        user_context = None
+        user_id = data.get('user_id')
+        if user_id and isinstance(user_id, str) and user_id.strip():
+            user_id = user_id.strip()
+            try:
+                from user_memory import retrieve_user_context
+                user_context = retrieve_user_context(
+                    user_id,
+                    "upcoming todo reminder calendar week schedule",
+                    top_k=4,
+                )
+            except Exception as e:
+                logger.warning("RAG retrieval failed in todo_reminder_message: %s", e)
+
+        pu = get_planner_utils()
+        response = pu.todo_reminder_message(
+            target_task=target_task,
+            week_tasks=data.get('week_tasks') if isinstance(data.get('week_tasks'), list) else [],
+            month_tasks=data.get('month_tasks') if isinstance(data.get('month_tasks'), list) else [],
+            language=data.get('languageSelected', 'thai'),
+            minutes_until=minutes_until,
+            time_until_text=data.get('time_until_text'),
+            identity_context=data.get('identity_context'),
+            earned_runes=data.get('earned_runes'),
+            behavior_stats=data.get('behavior_stats'),
+            today_date=data.get('today_date'),
+            user_context=user_context,
+        )
+        return create_response(
+            data={'response': response},
+            message='Reminder message generated successfully'
+        )
+    except Exception as e:
+        logger.error(f"Error in todo_reminder_message: {str(e)}")
+        return create_response(
+            success=False,
+            message='Reminder message generation failed',
+            error=f'Failed to generate reminder message: {str(e)}',
+            status_code=500
+        )
+
 
 # Summarize the end of the week using ChatGPT and suggest rest (when user_id present, RAG is consulted before generating)
 @https_fn.on_request(memory=1024, max_instances=3, timeout_sec=540, cpu=1)
@@ -6038,7 +6257,7 @@ def todo_fate_prediction(req: https_fn.Request) -> https_fn.Response:
             status_code=500
         )
 
-@https_fn.on_request(memory=1024, max_instances=3, timeout_sec=540, cpu=1)
+@https_fn.on_request(memory=1024, max_instances=3, timeout_sec=540, cpu=1, secrets=_LLM_SECRETS)
 def generate_todo_data_from_user_input(req: https_fn.Request) -> https_fn.Response:
     """Convert natural language user input into structured todo data using AI.
     
@@ -6093,6 +6312,8 @@ def generate_todo_data_from_user_input(req: https_fn.Request) -> https_fn.Respon
         timezone = data.get('timezone', 'Asia/Bangkok')
         
         existing_todos = data.get('existing_todos', [])
+        pending_actions = data.get('pending_actions', [])
+        is_refine = bool(data.get('is_refine'))
         chat_history = data.get('chat_history', [])
         intent_profile = _get_intent_profile_for_user(user_id)
         enriched_user_input = user_input
@@ -6124,6 +6345,35 @@ def generate_todo_data_from_user_input(req: https_fn.Request) -> https_fn.Respon
                 "Use this conversation history to infer user intent, constraints, and whether they want rest vs challenge."
             )
 
+        merged_existing = list(existing_todos) if isinstance(existing_todos, list) else []
+        if isinstance(pending_actions, list) and pending_actions:
+            for draft in pending_actions:
+                if not isinstance(draft, dict):
+                    continue
+                op = str(draft.get("action") or "create").lower()
+                todo = draft.get("todo") if isinstance(draft.get("todo"), dict) else draft
+                if op == "delete":
+                    continue
+                if isinstance(todo, dict):
+                    merged_existing.append(
+                        {
+                            **todo,
+                            "todoID": draft.get("target_todo_id") or todo.get("todoID") or "",
+                            "todoDocID": draft.get("target_todo_doc_id") or todo.get("todoDocID") or "",
+                            "_unsaved_draft": True,
+                        }
+                    )
+            if is_refine:
+                enriched_user_input = (
+                    f"{enriched_user_input}\n\n"
+                    f"[REFINEMENT_MODE]\n"
+                    "The user is refining UNSAVED draft calendar actions (not saved yet). "
+                    "Apply their latest message to those drafts plus existing todos. "
+                    "Return the complete final action list.\n\n"
+                    f"[UNSAVED_DRAFT_ACTIONS]\n"
+                    f"{json.dumps(pending_actions, ensure_ascii=False, default=str)}"
+                )
+
         # Use todo_generator module for action extraction
         tg = get_todo_generator()
         action_result = tg.extract_todo_actions_from_text(
@@ -6131,7 +6381,7 @@ def generate_todo_data_from_user_input(req: https_fn.Request) -> https_fn.Respon
             language=language,
             current_date=current_date,
             timezone=timezone,
-            existing_todos=existing_todos if isinstance(existing_todos, list) else []
+            existing_todos=merged_existing
         )
         actions = action_result.get('actions', [])
         todos = action_result.get('todos', [])
@@ -6152,21 +6402,9 @@ def generate_todo_data_from_user_input(req: https_fn.Request) -> https_fn.Respon
             return None
 
         def _build_energy_analytics(existing, extracted_actions, lang):
-            def _compact_energy_summary(text, language_code):
+            def _compact_energy_summary(text, _language_code):
                 cleaned = " ".join(str(text or "").replace("\n", " ").split())
-                if not cleaned:
-                    return ""
-                first_sentence = cleaned
-                sentence_separators = [". ", "! ", "? ", "。", "！", "？"]
-                for separator in sentence_separators:
-                    if separator in cleaned:
-                        first_sentence = cleaned.split(separator)[0].strip()
-                        break
-                concise = first_sentence if len(first_sentence) >= 40 else cleaned
-                max_chars = 120 if str(language_code).lower() == "thai" else 140
-                if len(concise) > max_chars:
-                    concise = f"{concise[:max_chars - 1].rstrip()}…"
-                return concise
+                return cleaned.strip()
 
             safe_existing = existing if isinstance(existing, list) else []
             safe_actions = extracted_actions if isinstance(extracted_actions, list) else []
@@ -6263,7 +6501,7 @@ def generate_todo_data_from_user_input(req: https_fn.Request) -> https_fn.Respon
                 }
             }
 
-        analytics = _build_energy_analytics(existing_todos, actions, language)
+        analytics = _build_energy_analytics(merged_existing, actions, language)
         
         return create_response(
             data={
@@ -6279,11 +6517,17 @@ def generate_todo_data_from_user_input(req: https_fn.Request) -> https_fn.Respon
         
     except ValueError as e:
         logger.warning(f"Validation error in generate_todo_data_from_user_input: {str(e)}")
+        status_code = 503 if "OPENAI_API_KEY" in str(e) else 400
+        message = (
+            "AI service is temporarily unavailable"
+            if status_code == 503
+            else "Invalid input"
+        )
         return create_response(
             success=False,
-            message='Invalid input',
+            message=message,
             error=str(e),
-            status_code=400
+            status_code=status_code
         )
     except json.JSONDecodeError as e:
         logger.error(f"JSON parsing error in generate_todo_data_from_user_input: {str(e)}")
@@ -6302,7 +6546,7 @@ def generate_todo_data_from_user_input(req: https_fn.Request) -> https_fn.Respon
             status_code=500
         )
 
-@https_fn.on_request(memory=1024, max_instances=3, timeout_sec=540, cpu=1)
+@https_fn.on_request(memory=1024, max_instances=3, timeout_sec=540, cpu=1, secrets=_LLM_SECRETS)
 def create_rag_todo_users(req: https_fn.Request) -> https_fn.Response:
     """RAG-augmented todo extraction: convert natural language to structured todos,
     optionally using context (e.g. existing user todos) to avoid duplicates and align output.

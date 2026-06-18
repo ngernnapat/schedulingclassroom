@@ -216,17 +216,37 @@ def progress():
     """Track user progress"""
     try:
         data = request.get_json()
-        if not data or 'todo_data' not in data:
-            return create_response(success=False, message='todo_data is required', status_code=400)
-        
+        if not data:
+            return create_response(success=False, message='No data provided', status_code=400)
+
+        todo_data = data.get('todo_data')
+        general_coach = data.get('general_coach') is True or not isinstance(todo_data, dict) or not todo_data
+        if general_coach:
+            todo_data = {}
+        elif not isinstance(todo_data, dict):
+            return create_response(success=False, message='Invalid todo_data', status_code=400)
+
         user_query = data.get('user_update', 'Tell me about this todo list')
         language = data.get('language', 'thai')
-        
+
+        personalization_block = ""
+        try:
+            from personalization_context import build_personalization_for_request
+            personalization_block = build_personalization_for_request(data, user_query)
+        except Exception as personalization_error:
+            logger.warning("Personalization skipped in progress: %s", personalization_error)
+
         pu = get_planner_utils()
-        information = pu.get_todo_information(user_query, data['todo_data'], language)
-        
+        information = pu.get_todo_information(
+            user_query,
+            todo_data,
+            language,
+            personalization_block=personalization_block or None,
+            general_coach=general_coach,
+        )
+
         return create_response(data={'feedback': information}, message='Todo information provided')
-        
+
     except Exception as e:
         logger.error(f"Error: {e}\n{traceback.format_exc()}")
         return create_response(success=False, message='Failed', error=str(e), status_code=500)
@@ -267,10 +287,51 @@ def encourage_in_the_morning():
             earned_runes=data.get('earned_runes'),
             behavior_stats=data.get('behavior_stats'),
             identity_context=data.get('identity_context'),
+            morning_mode=data.get('morning_mode'),
+            week_tasks=data.get('week_tasks') if isinstance(data.get('week_tasks'), list) else [],
+            today_date=data.get('today_date'),
         )
         
         return create_response(data={'response': response}, message='Response generated')
         
+    except Exception as e:
+        logger.error(f"Error: {e}\n{traceback.format_exc()}")
+        return create_response(success=False, message='Failed', error=str(e), status_code=500)
+
+
+@app.route('/todo_reminder_message', methods=['POST'])
+def todo_reminder_message():
+    """Personalized push body for an upcoming todo reminder."""
+    try:
+        data = request.get_json()
+        if not data or not isinstance(data.get('target_task'), dict):
+            return create_response(
+                success=False,
+                message='target_task is required',
+                status_code=400
+            )
+
+        minutes_until = data.get('minutes_until', 0)
+        try:
+            minutes_until = int(minutes_until)
+        except (TypeError, ValueError):
+            minutes_until = 0
+
+        pu = get_planner_utils()
+        response = pu.todo_reminder_message(
+            target_task=data['target_task'],
+            week_tasks=data.get('week_tasks') if isinstance(data.get('week_tasks'), list) else [],
+            month_tasks=data.get('month_tasks') if isinstance(data.get('month_tasks'), list) else [],
+            language=data.get('languageSelected', 'thai'),
+            minutes_until=minutes_until,
+            time_until_text=data.get('time_until_text'),
+            identity_context=data.get('identity_context'),
+            earned_runes=data.get('earned_runes'),
+            behavior_stats=data.get('behavior_stats'),
+            today_date=data.get('today_date'),
+            user_context=data.get('user_context'),
+        )
+        return create_response(data={'response': response}, message='Response generated')
     except Exception as e:
         logger.error(f"Error: {e}\n{traceback.format_exc()}")
         return create_response(success=False, message='Failed', error=str(e), status_code=500)
@@ -403,6 +464,7 @@ def get_schedule_info():
             'POST /progress': 'Track user progress',
             'POST /coach': 'Get coaching response',
             'POST /encourage_in_the_morning': 'Morning encouragement',
+            'POST /todo_reminder_message': 'Personalized todo reminder push body',
             'POST /summarize_end_of_the_week': 'End of week summary',
             'POST /summarize_next_week': 'Next week summary',
             'POST /summary_this_year_todos': 'Year todos summary',

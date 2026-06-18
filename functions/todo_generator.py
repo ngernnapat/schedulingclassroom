@@ -4,8 +4,9 @@
 import json
 import logging
 import os
-from datetime import datetime
-from typing import Dict, Any, Optional, List
+import re
+from datetime import datetime, timedelta
+from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import dataclass
 
 # Configure logging
@@ -92,7 +93,7 @@ TODO_ITEM_SCHEMA = {
         },
         "date": {
             "type": "string",
-            "description": "Date in YYYY-MM-DD format, or empty string if not specified"
+            "description": "Date in YYYY-MM-DD format. REQUIRED when user mentions a day (today, tomorrow, weekday, or specific date). Resolve weekday names to the next occurrence on or after the current date."
         },
         "start": {
             "type": "string",
@@ -344,6 +345,495 @@ Multiple separate tasks:
 
 Always respond in valid JSON format with a 'todos' array containing all extracted items."""
 
+_WEEKDAY_HINTS: Tuple[Tuple[int, Tuple[str, ...]], ...] = (
+    (0, ("วันจันทร์", "จันทร์", r"\bmonday\b", r"\bmon\b")),
+    (1, ("วันอังคาร", "อังคาร", r"\btuesday\b", r"\btue\b")),
+    (2, ("วันพุธ", r"\bพุธ\b", r"\bwednesday\b", r"\bwed\b")),
+    (3, ("วันพฤหัส", "พฤหัสบดี", "พฤหัส", r"\bthursday\b", r"\bthu\b")),
+    (4, ("วันศุกร์", "ศุกร์", r"\bfriday\b", r"\bfri\b")),
+    (5, ("วันเสาร์", "เสาร์", r"\bsaturday\b", r"\bsat\b")),
+    (6, ("อาทิตย์", r"\bsunday\b", r"\bsun\b")),
+)
+
+
+def _strip_enriched_user_input(user_input: str) -> str:
+    """Remove server-side enrichment blocks before date heuristics."""
+    text = str(user_input or "")
+    for marker in (
+        "\n\n[USER_INTENT_PROFILE]",
+        "\n\n[RECENT_CHAT_HISTORY]",
+        "\n\n[UNSAVED_DRAFT_ACTIONS",
+        "\n\n[REFINEMENT_MODE]",
+    ):
+        if marker in text:
+            text = text.split(marker, 1)[0]
+    return text.strip()
+
+
+def _parse_reference_date(current_date: str, timezone: str):
+    try:
+        dt = datetime.fromisoformat(str(current_date).replace("Z", "+00:00"))
+    except ValueError:
+        dt = datetime.now()
+
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo(timezone or "Asia/Bangkok")
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(tz)
+        else:
+            dt = dt.replace(tzinfo=tz)
+    except Exception:
+        pass
+    return dt.date()
+
+
+def _is_valid_date_string(date_value: str) -> bool:
+    if not date_value or not isinstance(date_value, str):
+        return False
+    try:
+        datetime.strptime(date_value[:10], "%Y-%m-%d")
+        return True
+    except ValueError:
+        return False
+
+
+def _extract_weekday_from_text(text: str) -> Optional[int]:
+    haystack = str(text or "")
+    lower = haystack.lower()
+    for weekday, patterns in _WEEKDAY_HINTS:
+        for pattern in patterns:
+            target = haystack if pattern.isascii() is False else lower
+            if re.search(pattern, target, re.IGNORECASE):
+                return weekday
+    return None
+
+
+def _next_weekday_on_or_after(from_date, weekday: int):
+    days_ahead = weekday - from_date.weekday()
+    if days_ahead < 0:
+        days_ahead += 7
+    return from_date + timedelta(days=days_ahead)
+
+
+def resolve_date_from_text(
+    text: str,
+    current_date: str,
+    timezone: str = "Asia/Bangkok",
+) -> Optional[str]:
+    """Resolve relative day references (today, tomorrow, weekday) to YYYY-MM-DD."""
+    raw = _strip_enriched_user_input(text)
+    if not raw:
+        return None
+
+    ref = _parse_reference_date(current_date, timezone)
+
+    if re.search(r"วันนี้|\btoday\b", raw, re.IGNORECASE):
+        return ref.isoformat()
+    if re.search(r"มะรืน|วันมะรืน|วันรืน|\bday after tomorrow\b", raw, re.IGNORECASE):
+        return (ref + timedelta(days=2)).isoformat()
+    if re.search(r"พรุ่งนี้|\btomorrow\b", raw, re.IGNORECASE):
+        return (ref + timedelta(days=1)).isoformat()
+
+    weekday = _extract_weekday_from_text(raw)
+    if weekday is not None:
+        return _next_weekday_on_or_after(ref, weekday).isoformat()
+    return None
+
+
+def resolve_source_target_dates_from_move_request(
+    text: str,
+    current_date: str,
+    timezone: str = "Asia/Bangkok",
+) -> Tuple[Optional[str], Optional[str]]:
+    """Best-effort parse source/target calendar dates from bulk-move phrasing."""
+    raw = _strip_enriched_user_input(text)
+    if not raw:
+        return None, None
+
+    ref = _parse_reference_date(current_date, timezone)
+
+    def _offset_date(days: int) -> str:
+        return (ref + timedelta(days=days)).isoformat()
+
+    source = None
+    target = None
+
+    if re.search(r"(?:จาก)?\s*พรุ่งนี้|\bfrom tomorrow\b", raw, re.IGNORECASE):
+        source = _offset_date(1)
+    elif re.search(r"วันนี้|\btoday\b", raw, re.IGNORECASE):
+        source = _offset_date(0)
+
+    if re.search(r"ไป(?:ที่)?\s*มะรืน|ไป(?:ที่)?\s*วันมะรืน|\bto day after tomorrow\b", raw, re.IGNORECASE):
+        target = _offset_date(2)
+    elif re.search(r"ไป(?:ที่)?\s*พรุ่งนี้|\bto tomorrow\b", raw, re.IGNORECASE):
+        target = _offset_date(1)
+
+    if source and not target:
+        target = resolve_date_from_text(raw, current_date, timezone)
+    if target and not source:
+        # e.g. "move tomorrow's work" — source is tomorrow when paired with target later
+        if re.search(r"พรุ่งนี้|\btomorrow\b", raw, re.IGNORECASE):
+            source = _offset_date(1)
+
+    return source, target
+
+
+BULK_ALL_PATTERN = re.compile(
+    r"(?:ให้หมด|ทั้งหมด|ทุก(?:อย่าง|รายการ)|all\b|everything|every\s+(?:item|task))",
+    re.IGNORECASE,
+)
+MOVE_REQUEST_PATTERN = re.compile(
+    r"(?:ย้าย|เลื่อน|move|reschedule|shift|postpone)",
+    re.IGNORECASE,
+)
+WORK_SCOPE_PATTERN = re.compile(
+    r"(?:งาน\b|work(?:\s+items?)?|tasks?\b|alPlanner|Day\s*\d+)",
+    re.IGNORECASE,
+)
+LEISURE_TITLE_PATTERN = re.compile(
+    r"(?:ว่ายน้ำ|swim|พักยาว|ชิล|relax|rest block|brain reset)",
+    re.IGNORECASE,
+)
+
+
+def _todo_date_key(todo: Dict[str, Any]) -> str:
+    return str((todo or {}).get("date") or "")[:10]
+
+
+def _should_include_todo_for_bulk_move(todo: Dict[str, Any], work_only: bool) -> bool:
+    title = str((todo or {}).get("title") or "")
+    if not work_only:
+        return True
+    if LEISURE_TITLE_PATTERN.search(title):
+        return False
+    if WORK_SCOPE_PATTERN.search(title):
+        return True
+    todo_type = str((todo or {}).get("typeOfTodo") or "").lower()
+    if todo_type in ("general", "work", "learning", "exercise", "planner"):
+        return True
+    return not LEISURE_TITLE_PATTERN.search(title)
+
+
+def expand_bulk_day_move_actions(
+    actions: List[Dict[str, Any]],
+    user_input: str,
+    existing_todos: Optional[List[Dict[str, Any]]],
+    current_date: str,
+    timezone: str = "Asia/Bangkok",
+) -> List[Dict[str, Any]]:
+    """
+  When the user asks to move *all* items from one day to another, expand to one
+  update action per matching calendar row instead of a single vague update.
+    """
+    raw = _strip_enriched_user_input(user_input)
+    if not raw or not MOVE_REQUEST_PATTERN.search(raw) or not BULK_ALL_PATTERN.search(raw):
+        return actions
+
+    source_date, target_date = resolve_source_target_dates_from_move_request(
+        raw, current_date, timezone
+    )
+    if not source_date or not target_date or source_date == target_date:
+        return actions
+
+    work_only = bool(WORK_SCOPE_PATTERN.search(raw))
+    pool = [t for t in (existing_todos or []) if isinstance(t, dict)]
+    candidates = [
+        t
+        for t in pool
+        if _todo_date_key(t) == source_date and _should_include_todo_for_bulk_move(t, work_only)
+    ]
+    if len(candidates) < 2:
+        return actions
+
+    expanded: List[Dict[str, Any]] = []
+    for todo in candidates:
+        updated = dict(todo)
+        updated["date"] = target_date
+        expanded.append(
+            {
+                "action": "update",
+                "target_todo_id": str(todo.get("todoID") or ""),
+                "target_todo_doc_id": str(todo.get("todoDocID") or ""),
+                "target_title": str(todo.get("title") or ""),
+                "reason": f"Bulk move {source_date} → {target_date}",
+                "todo": updated,
+            }
+        )
+
+    create_actions = [
+        a for a in (actions or []) if str((a or {}).get("action", "")).lower() == "create"
+    ]
+    logger.info(
+        "Expanded bulk day move: %s items from %s to %s (work_only=%s)",
+        len(expanded),
+        source_date,
+        target_date,
+        work_only,
+    )
+    return expanded + create_actions
+
+
+DELETE_REQUEST_PATTERN = re.compile(
+    r"(?:ลบ|ยกเลิก|delete|remove|cancel|ตัดออก|เอาออก|clear(?:\s+out)?)",
+    re.IGNORECASE,
+)
+
+
+def resolve_delete_source_date(
+    text: str,
+    current_date: str,
+    timezone: str = "Asia/Bangkok",
+) -> Optional[str]:
+    """Resolve which calendar day the user wants to clear/delete from."""
+    raw = _strip_enriched_user_input(text)
+    if not raw:
+        return None
+
+    ref = _parse_reference_date(current_date, timezone)
+    if re.search(r"(?:จาก)?\s*พรุ่งนี้|\bfrom tomorrow\b", raw, re.IGNORECASE):
+        return (ref + timedelta(days=1)).isoformat()
+    if re.search(r"มะรืน|วันมะรืน|\bday after tomorrow\b", raw, re.IGNORECASE):
+        return (ref + timedelta(days=2)).isoformat()
+    if re.search(r"วันนี้|\btoday\b", raw, re.IGNORECASE):
+        return ref.isoformat()
+
+    weekday = _extract_weekday_from_text(raw)
+    if weekday is not None:
+        return _next_weekday_on_or_after(ref, weekday).isoformat()
+    return None
+
+
+def expand_bulk_day_delete_actions(
+    actions: List[Dict[str, Any]],
+    user_input: str,
+    existing_todos: Optional[List[Dict[str, Any]]],
+    current_date: str,
+    timezone: str = "Asia/Bangkok",
+) -> List[Dict[str, Any]]:
+    """When user asks to delete all items on a day, emit one delete per match."""
+    raw = _strip_enriched_user_input(user_input)
+    if not raw or not DELETE_REQUEST_PATTERN.search(raw) or not BULK_ALL_PATTERN.search(raw):
+        return actions
+
+    source_date = resolve_delete_source_date(raw, current_date, timezone)
+    if not source_date:
+        return actions
+
+    work_only = bool(WORK_SCOPE_PATTERN.search(raw))
+    pool = [t for t in (existing_todos or []) if isinstance(t, dict)]
+    candidates = [
+        t
+        for t in pool
+        if _todo_date_key(t) == source_date and _should_include_todo_for_bulk_move(t, work_only)
+    ]
+    if not candidates:
+        return actions
+
+    existing_deletes = [
+        a for a in (actions or []) if str((a or {}).get("action", "")).lower() == "delete"
+    ]
+    if len(existing_deletes) >= len(candidates):
+        return actions
+
+    expanded: List[Dict[str, Any]] = []
+    for todo in candidates:
+        expanded.append(
+            {
+                "action": "delete",
+                "target_todo_id": str(todo.get("todoID") or ""),
+                "target_todo_doc_id": str(todo.get("todoDocID") or ""),
+                "target_title": str(todo.get("title") or ""),
+                "reason": f"Bulk delete on {source_date}",
+                "todo": dict(todo),
+            }
+        )
+
+    logger.info(
+        "Expanded bulk day delete: %s items on %s (work_only=%s)",
+        len(expanded),
+        source_date,
+        work_only,
+    )
+    return expanded
+
+
+def normalize_todo_dates_in_actions(
+    actions: List[Dict[str, Any]],
+    user_input: str,
+    current_date: str,
+    timezone: str = "Asia/Bangkok",
+) -> List[Dict[str, Any]]:
+    """Fill missing todo.date values using weekday/relative-day hints in user text."""
+    if not isinstance(actions, list):
+        return actions
+
+    fallback_date = resolve_date_from_text(user_input, current_date, timezone)
+
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        todo = action.get("todo")
+        if not isinstance(todo, dict):
+            continue
+        date_val = str(todo.get("date", "")).strip()
+        if _is_valid_date_string(date_val):
+            continue
+        if fallback_date:
+            todo["date"] = fallback_date
+    return actions
+
+
+OPTIMIZE_REQUEST_PATTERN = re.compile(
+    r"(?:ปรับตาราง|optimize|rebalance|จัด(?:ตาราง)?ใหม่|เบาลง|กระจาย|spread|balance|lighter|สมดุล|ทำได้จริง|แน่น|packed|too busy|ลด(?:ภาระ|งาน))",
+    re.IGNORECASE,
+)
+
+COACH_NOTE_PATTERNS = (
+    re.compile(r"ต่อไปถ้าจะทำ", re.IGNORECASE),
+    re.compile(r"ขอให้เล็ก", re.IGNORECASE),
+    re.compile(r"เล็กมาก", re.IGNORECASE),
+    re.compile(r"ทำเล็ก\s*ๆ", re.IGNORECASE),
+    re.compile(r"next time if you (?:want to )?do more", re.IGNORECASE),
+    re.compile(r"keep it (?:very )?small", re.IGNORECASE),
+    re.compile(r"small step", re.IGNORECASE),
+    re.compile(r"(?:coach|reflection|journal|บันทึก|สะท้อน)", re.IGNORECASE),
+)
+
+AFTERNOON_SLOT_CANDIDATES = ("14:00", "15:00", "16:00", "17:00", "13:30", "13:00")
+LATE_NIGHT_START_HOUR = 21
+EARLY_MORNING_END_HOUR = 7
+
+
+def _parse_hhmm(value: str) -> Optional[Tuple[int, int]]:
+    match = re.match(r"^(\d{1,2}):(\d{2})$", str(value or "").strip())
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return None
+    return hour, minute
+
+
+def _minutes_from_midnight(value: str) -> Optional[int]:
+    parsed = _parse_hhmm(value)
+    if not parsed:
+        return None
+    hour, minute = parsed
+    return hour * 60 + minute
+
+
+def _is_late_night_time(start: str) -> bool:
+    parsed = _parse_hhmm(start)
+    return parsed is not None and parsed[0] >= LATE_NIGHT_START_HOUR
+
+
+def _is_early_morning_time(start: str) -> bool:
+    parsed = _parse_hhmm(start)
+    return parsed is not None and parsed[0] < EARLY_MORNING_END_HOUR
+
+
+def _is_schedule_optimize_request(user_input: str) -> bool:
+    return bool(OPTIMIZE_REQUEST_PATTERN.search(_strip_enriched_user_input(user_input)))
+
+
+def _is_coach_style_note(todo: Dict[str, Any]) -> bool:
+    combined = f"{todo.get('title', '')} {todo.get('detail', '')}".strip()
+    if not combined:
+        return False
+    return any(pattern.search(combined) for pattern in COACH_NOTE_PATTERNS)
+
+
+def _clear_todo_time(todo: Dict[str, Any]) -> None:
+    todo["start"] = ""
+    todo["noSettingTime"] = True
+
+
+def _occupied_minutes_for_date(
+    existing_todos: List[Dict[str, Any]],
+    date_str: str,
+) -> List[int]:
+    occupied: List[int] = []
+    target_date = date_str[:10]
+    for todo in existing_todos:
+        if not isinstance(todo, dict):
+            continue
+        if str(todo.get("date", ""))[:10] != target_date:
+            continue
+        minutes = _minutes_from_midnight(str(todo.get("start", "")).strip())
+        if minutes is not None:
+            occupied.append(minutes)
+    return occupied
+
+
+def _find_afternoon_slot(
+    date_str: str,
+    existing_todos: List[Dict[str, Any]],
+) -> Optional[str]:
+    occupied = _occupied_minutes_for_date(existing_todos, date_str)
+    for slot in AFTERNOON_SLOT_CANDIDATES:
+        slot_minutes = _minutes_from_midnight(slot)
+        if slot_minutes is None:
+            continue
+        if any(abs(slot_minutes - busy) < 60 for busy in occupied):
+            continue
+        return slot
+    return None
+
+
+def sanitize_schedule_optimization_actions(
+    actions: List[Dict[str, Any]],
+    user_input: str,
+    existing_todos: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Guardrails for schedule rebalance/optimize requests:
+    - Coach-style notes become flexible (no fixed time).
+    - Late-night / very-early slots are moved to afternoon gaps or cleared.
+    """
+    if not isinstance(actions, list) or not actions:
+        return actions
+    if not _is_schedule_optimize_request(user_input):
+        return actions
+
+    existing = existing_todos if isinstance(existing_todos, list) else []
+
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        if str(action.get("action", "")).lower() not in ("create", "update"):
+            continue
+        todo = action.get("todo")
+        if not isinstance(todo, dict):
+            continue
+
+        if _is_coach_style_note(todo):
+            _clear_todo_time(todo)
+            continue
+
+        start = str(todo.get("start", "")).strip()
+        if not start:
+            continue
+        if not (_is_late_night_time(start) or _is_early_morning_time(start)):
+            continue
+
+        date_str = str(todo.get("date", "")).strip()
+        afternoon_slot = (
+            _find_afternoon_slot(date_str, existing)
+            if _is_valid_date_string(date_str)
+            else None
+        )
+        if afternoon_slot:
+            todo["start"] = afternoon_slot
+            todo["noSettingTime"] = False
+        else:
+            _clear_todo_time(todo)
+
+    return actions
+
+
 def build_action_extraction_system_prompt(
     current_date: str,
     timezone: str,
@@ -375,6 +865,25 @@ Rules:
    - For create/update: todo is the new desired state.
    - For delete: copy the matched todo content if available, otherwise use a minimal reasonable todo object.
 7) Return all operations in execution order.
+8) BULK MOVE: when user says all/ทั้งหมด/ให้หมด/everything on a source day, emit one update per matching existing todo on that day (not a single combined action).
+9) BULK DELETE: when user says delete/remove all/ลบ...ทั้งหมด/ให้หมด on a day, emit one delete action per matching existing todo on that day.
+10) REFINEMENT: when UNSAVED_DRAFT_ACTIONS are present, merge the user's latest instruction with those drafts and return the full final action set.
+
+DATE AND TIME (CRITICAL):
+- Parse date references into todo.date as YYYY-MM-DD. Never leave date empty when the user mentions a day.
+- Relative days: today/วันนี้ -> current date; tomorrow/พรุ่งนี้ -> next day; day after tomorrow/มะรืน/วันมะรืน -> +2 days.
+- Weekdays (Monday/วันจันทร์, Wednesday/วันพุธ, etc.): resolve to the next occurrence on or after the current date (include today if it matches).
+- Specific dates: convert to YYYY-MM-DD in the user's timezone.
+- Parse time references (09:00, 2pm, บ่าย 2) into todo.start as HH:mm (24-hour).
+- If no specific time is mentioned, set noSettingTime=true and leave start as empty string.
+- Only create todos for today or future dates, never past dates.
+
+SCHEDULE OPTIMIZATION (when user asks to rebalance, optimize, lighten, or make the schedule realistic):
+- Prefer afternoon gaps (13:00–18:00) when moving items to ease a packed morning.
+- Never schedule after 20:30 unless the user explicitly asks for a late-night slot.
+- Protect sleep/recovery: do NOT move items to 21:00+ when rebalancing a busy day.
+- Coach-style notes, reflections, or meta-guidance (e.g. "keep additions small", "ต่อไปถ้าจะทำอะไรเพิ่ม ขอให้เล็กมากๆ") are NOT calendar blocks — set noSettingTime=true and leave start empty.
+- When easing overload, move real tasks/events — not diary/coach reminders.
 
 Output JSON ONLY with an 'actions' array."""
 
@@ -508,7 +1017,31 @@ class TodoExtractor:
 
         raw_response = response.choices[0].message.content
         result = json.loads(raw_response)
-        actions = result.get("actions", [])
+        actions = normalize_todo_dates_in_actions(
+            result.get("actions", []),
+            user_input=user_input,
+            current_date=current_date,
+            timezone=timezone,
+        )
+        actions = sanitize_schedule_optimization_actions(
+            actions,
+            user_input=user_input,
+            existing_todos=existing_todos,
+        )
+        actions = expand_bulk_day_move_actions(
+            actions,
+            user_input=user_input,
+            existing_todos=existing_todos,
+            current_date=current_date,
+            timezone=timezone,
+        )
+        actions = expand_bulk_day_delete_actions(
+            actions,
+            user_input=user_input,
+            existing_todos=existing_todos,
+            current_date=current_date,
+            timezone=timezone,
+        )
 
         # Backward compatible create-list for existing callers.
         create_like_todos = []
