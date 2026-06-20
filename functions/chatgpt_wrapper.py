@@ -4,6 +4,8 @@ import os
 import time
 import logging
 import json
+import io
+import base64
 from typing import Optional, Dict, Any, List
 from functools import lru_cache
 from dataclasses import dataclass
@@ -16,6 +18,8 @@ from openai.types.chat import ChatCompletion
 from dotenv import load_dotenv
 from langdetect import detect, LangDetectException
 from pathlib import Path
+
+from openai_api_key import resolve_openai_api_key
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -200,9 +204,11 @@ class ChatGPTWrapper:
     
     def __init__(self, api_key: Optional[str] = None, config: Optional[ChatConfig] = None):
         """Initialize the ChatGPT wrapper"""
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self.api_key = api_key or resolve_openai_api_key()
         if not self.api_key:
-            raise EnvironmentError("OPENAI_API_KEY environment variable is not set.")
+            raise EnvironmentError(
+                "OPENAI_API_KEY is not set (env/Secret Manager or Firestore ai_api_key/open-api-key)."
+            )
         
         self.config = config or ChatConfig()
         # Create client with more granular timeout control
@@ -585,6 +591,238 @@ class ChatGPTWrapper:
             duration = time.time() - start_time
             logger.error(f"Chat completion failed after {duration:.2f}s: {str(e)}")
             raise RuntimeError(f"Failed to communicate with OpenAI API: {str(e)}") from e
+
+    def generate_image(
+        self,
+        prompt: str,
+        *,
+        model: str = ModelType.GPT_5_4.value,
+        size: str = "1024x1792",
+        quality: str = "medium",
+    ) -> Dict[str, str]:
+        """Generate an image via gpt-5.4 + image_generation tool (Responses API).
+
+        Returns a dict with ``b64_json`` and ``size``. The caller should persist
+        the bytes (e.g. Firebase Storage) and return a download URL to clients.
+        """
+        if not prompt or not str(prompt).strip():
+            raise ValueError("prompt cannot be empty")
+        clean_prompt = str(prompt).strip()[:4000]
+        if not self.circuit_breaker.can_proceed():
+            raise RuntimeError("Image generation temporarily unavailable (circuit open)")
+        if not self.rate_limiter.can_proceed():
+            raise RuntimeError("Rate limit reached — try again shortly")
+
+        gpt_quality = quality if quality in ("low", "medium", "high") else (
+            "high" if quality == "hd" else "medium"
+        )
+
+        try:
+            self.rate_limiter.record_call()
+            response = self.client.responses.create(
+                model=model,
+                input=(
+                    "Generate a warm, lifestyle-coach inspirational image. "
+                    "No text, captions, logos, or watermarks in the image.\n\n"
+                    f"{clean_prompt}"
+                ),
+                tools=[{
+                    "type": "image_generation",
+                    "action": "generate",
+                    "size": size,
+                    "quality": gpt_quality,
+                }],
+                tool_choice={"type": "image_generation"},
+            )
+
+            image_b64 = None
+            for output in response.output or []:
+                out_type = getattr(output, "type", None)
+                if out_type == "image_generation_call":
+                    image_b64 = getattr(output, "result", None)
+                    if image_b64:
+                        break
+
+            if not image_b64:
+                raise RuntimeError("No image returned from image generation")
+
+            self.circuit_breaker.record_success()
+            return {"b64_json": image_b64, "size": size}
+        except Exception as e:
+            self.circuit_breaker.record_failure(str(e))
+            logger.error(f"Image generation failed: {e}")
+            raise
+
+    _OPENAI_INPUT_AUDIO_FORMATS = frozenset({"wav", "mp3"})
+
+    def voice_chat_completion(
+        self,
+        *,
+        audio_bytes: bytes,
+        audio_format: str = "m4a",
+        system_prompt: str,
+        context_text: str = "",
+        user_text: Optional[str] = None,
+        chat_history: Optional[List[Dict[str, str]]] = None,
+        voice: str = "alloy",
+        output_format: str = "wav",
+        model: str = "gpt-audio-1.5",
+    ) -> Dict[str, Any]:
+        """Two-way voice chat: audio in, text + spoken audio out (gpt-audio)."""
+        transcript = str(user_text or "").strip()
+        if not audio_bytes and not transcript:
+            raise ValueError("audio_bytes or user_text is required")
+        if not system_prompt or not system_prompt.strip():
+            raise ValueError("system_prompt is required")
+        if not self.circuit_breaker.can_proceed():
+            raise RuntimeError("Voice chat temporarily unavailable (circuit open)")
+        if not self.rate_limiter.can_proceed():
+            raise RuntimeError("Rate limit reached — try again shortly")
+
+        fmt = str(audio_format or "m4a").strip().lower().lstrip(".")
+        if fmt in {"mp4", "aac", "m4a", "mpeg", "mpga", "webm", "ogg", "flac", "caf"}:
+            fmt = "m4a" if fmt in {"mp4", "aac", "m4a", "caf"} else fmt
+
+        use_audio_input = fmt in self._OPENAI_INPUT_AUDIO_FORMATS
+        if not use_audio_input and not transcript:
+            raise ValueError(
+                "user_text is required when input audio is not wav/mp3 (e.g. m4a from mobile)"
+            )
+
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": system_prompt.strip()}
+        ]
+        for msg in (chat_history or [])[-12:]:
+            role = msg.get("role")
+            text = msg.get("text")
+            if role in {"user", "assistant"} and isinstance(text, str) and text.strip():
+                messages.append({"role": role, "content": text.strip()})
+
+        if use_audio_input:
+            user_content: List[Dict[str, Any]] = []
+            if context_text and str(context_text).strip():
+                user_content.append({"type": "text", "text": str(context_text).strip()})
+            user_content.append(
+                {
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": base64.b64encode(audio_bytes).decode("utf-8"),
+                        "format": fmt,
+                    },
+                }
+            )
+            messages.append({"role": "user", "content": user_content})
+        else:
+            parts = []
+            if context_text and str(context_text).strip():
+                parts.append(str(context_text).strip())
+            parts.append(f'User spoke (transcript): "{transcript}"')
+            parts.append("Respond naturally by voice to what the user said.")
+            messages.append({"role": "user", "content": "\n\n".join(parts)})
+
+        try:
+            self.rate_limiter.record_call()
+            completion = self.client.chat.completions.create(
+                model=model,
+                modalities=["text", "audio"],
+                audio={"voice": voice, "format": output_format},
+                messages=messages,
+            )
+            choice = completion.choices[0].message
+            text = str(getattr(choice, "content", None) or "").strip()
+            audio_obj = getattr(choice, "audio", None)
+            audio_b64 = str(getattr(audio_obj, "data", None) or "").strip()
+            if not text and not audio_b64:
+                raise RuntimeError("No voice response returned")
+            self.circuit_breaker.record_success()
+            return {
+                "text": text,
+                "audio_base64": audio_b64,
+                "audio_format": output_format,
+            }
+        except Exception as e:
+            self.circuit_breaker.record_failure(str(e))
+            logger.error(f"Voice chat failed: {e}")
+            raise
+
+    def synthesize_speech(
+        self,
+        text: str,
+        *,
+        voice: str = "alloy",
+        model: str = "tts-1",
+        response_format: str = "mp3",
+    ) -> Dict[str, Any]:
+        """Short spoken line for voice UX confirmations (OpenAI TTS, alloy voice)."""
+        spoken = str(text or "").strip()
+        if not spoken:
+            raise ValueError("text is required")
+        if len(spoken) > 600:
+            spoken = spoken[:597].rstrip() + "..."
+        if not self.circuit_breaker.can_proceed():
+            raise RuntimeError("Voice synthesis temporarily unavailable (circuit open)")
+        if not self.rate_limiter.can_proceed():
+            raise RuntimeError("Rate limit reached — try again shortly")
+
+        try:
+            self.rate_limiter.record_call()
+            response = self.client.audio.speech.create(
+                model=model,
+                voice=voice,
+                input=spoken,
+                response_format=response_format,
+            )
+            audio_bytes = getattr(response, "content", None)
+            if audio_bytes is None and hasattr(response, "read"):
+                audio_bytes = response.read()
+            if not audio_bytes:
+                raise RuntimeError("No synthesized audio returned")
+            self.circuit_breaker.record_success()
+            return {
+                "audio_base64": base64.b64encode(audio_bytes).decode("utf-8"),
+                "audio_format": response_format,
+            }
+        except Exception as e:
+            self.circuit_breaker.record_failure(str(e))
+            logger.error(f"Voice synthesis failed: {e}")
+            raise
+
+    def transcribe_audio(
+        self,
+        audio_file,
+        *,
+        model: str = "gpt-4o-transcribe",
+        language: Optional[str] = None,
+    ) -> str:
+        """Transcribe speech audio to text using OpenAI speech-to-text."""
+        if audio_file is None:
+            raise ValueError("audio_file is required")
+        if not self.circuit_breaker.can_proceed():
+            raise RuntimeError("Speech transcription temporarily unavailable (circuit open)")
+        if not self.rate_limiter.can_proceed():
+            raise RuntimeError("Rate limit reached — try again shortly")
+
+        try:
+            self.rate_limiter.record_call()
+            kwargs: Dict[str, Any] = {
+                "model": model,
+                "file": audio_file,
+                "response_format": "text",
+            }
+            if language:
+                kwargs["language"] = language
+
+            result = self.client.audio.transcriptions.create(**kwargs)
+            text = result if isinstance(result, str) else getattr(result, "text", str(result))
+            text = str(text or "").strip()
+            if not text:
+                raise RuntimeError("No transcription returned")
+            self.circuit_breaker.record_success()
+            return text
+        except Exception as e:
+            self.circuit_breaker.record_failure(str(e))
+            logger.error(f"Speech transcription failed: {e}")
+            raise
 
 # Global instance for backward compatibility
 _default_wrapper = None

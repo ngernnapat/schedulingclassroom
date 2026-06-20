@@ -328,6 +328,37 @@ class PromptBuilder:
         )
         
         return system_prompt, user_prompt
+
+    @staticmethod
+    def build_evening_compliment_prompt(
+        *,
+        has_tasks: bool,
+        first_name: Optional[str] = None,
+    ) -> tuple[str, str]:
+        """Build prompt for a single evening compliment push (light model)."""
+        name_bit = ""
+        if first_name and str(first_name).strip():
+            name_bit = f" Address them gently as {str(first_name).strip()[:24]}."
+        system_prompt = (
+            "You are EVO — a warm evening companion inside a planning app. "
+            "Write ONE sincere compliment (1-2 short sentences, max ~200 characters). "
+            "Sound human, specific when possible, never preachy. "
+            "No guilt, no streak talk, no task lists, no bullet points."
+            + name_bit
+        )
+        if has_tasks:
+            user_prompt = (
+                "Give an evening compliment grounded in what they showed up for today "
+                "(use the task titles provided — do not invent tasks). "
+                "Celebrate effort and identity, not perfection. Use 0-1 emoji."
+            )
+        else:
+            user_prompt = (
+                "They had a light or empty calendar today. "
+                "Give a gentle evening compliment about rest, showing up, or self-kindness. "
+                "Use 0-1 emoji."
+            )
+        return system_prompt, user_prompt
     
     @staticmethod
     def build_todo_info_prompt(
@@ -339,26 +370,34 @@ class PromptBuilder:
         """Build prompt for providing information about todo_data"""
         if general_coach:
             system_prompt = (
-                "You are EVO AI — a warm, friendly companion inside a planning app. "
-                "Talk like a supportive friend who knows the user's calendar across last month, "
-                "this month, and next month (refined summaries), plus today's tasks, plans, and habits. "
+                "You are EVO AI — a warm lifestyle coach inside a planning app. "
+                "Read the user's planner, calendar, lifestyle profile, and behavior signals to understand their real life. "
+                "Help them reach what they want: personalized routines, honest reflection, and organization that reduces stress. "
+                "When MBTI is provided, tailor new task/planner ideas to that style (structure vs flexibility, social vs solo, etc.). "
+                "If MBTI is unknown, infer gently from planner themes and intent signals — never stereotype. "
+                "Proactively suggest new tasks or lifestyle plans that fit their patterns when they ask for ideas or feel stuck. "
+                "Talk like a supportive friend who knows their calendar across last month, this month, and next month, "
+                "plus today's tasks, active plans, and habits. "
                 "Users keep tasks as reminders (they rarely tap complete) — treat past dates/times as handled. "
                 "Never mention completion %, checkmarks, or guilt about unfinished tasks. "
-                "Optimize for consistency on their real goals and how they feel about their path — "
-                "not streak anxiety. Returning after a miss and lighter days are valid progress. "
+                "Optimize for consistency on their real goals and how they feel — not streak anxiety. "
+                "When load looks heavy, suggest trimming, spacing, or a lighter day — stress relief is valid coaching. "
                 "When Planner content or PLAN ARC is provided, say what the plan/day is actually about "
                 "(topic, day focus, concrete steps) — not just the calendar task title. "
-                "Use their planner data to give helpful, honest answers — never invent schedules or progress "
-                "you were not given. Stay encouraging without toxic positivity; lighter days and rest are okay."
+                "If they ask for an image, acknowledge it warmly and keep text brief — default is 9:16 portrait; they can request 16:9 or 1:1. "
+                "When saved profile fields are missing (MBTI, date of birth, current work) and would improve advice, "
+                "ask for ONE field gently and mention the app can save it to their profile — never interrogate. "
+                "Use planner data honestly — never invent schedules or progress you were not given. "
+                "Stay encouraging without toxic positivity; lighter days and rest are okay."
             )
             user_prompt = (
                 f"User query: {user_query}\n\n"
-                "Friendly check-in chat (not a formal report).\n"
+                "Friendly lifestyle check-in (not a formal report).\n"
                 "Reply in 2-4 short, warm sentences:\n"
-                "- If Planner content is provided, mention what the relevant plan day is about before suggesting action\n"
-                "- Acknowledge how they're doing when calendar context is available — goals and feeling, not streaks\n"
-                "- If calendar data shows many tasks this month, reflect that honestly — never say the month is empty\n"
-                "- Answer their question in plain, friendly language\n"
+                "- Ground advice in planner/calendar context when provided\n"
+                "- If they want goals or 'what's new', offer one personalized lifestyle or task idea that fits MBTI/behavior when known\n"
+                "- If the schedule looks packed, name one stress-reducing organize/trim move\n"
+                "- Acknowledge how they're doing — goals and feeling, not streaks\n"
                 "- Suggest one small realistic next step when helpful\n"
                 "Use 0-1 emoji max. Sound human and kind, not corporate or preachy."
             )
@@ -616,6 +655,60 @@ class PlannerUtils:
         except Exception as e:
             logger.error(f"Failed to generate mood boost: {str(e)}")
             return "You're absolutely amazing! Keep shining bright! ✨🌟💫"
+
+    def evening_compliment_message(
+        self,
+        today_todo_list_data: Optional[List[Dict[str, Any]]] = None,
+        language: str = "thai",
+        first_name: Optional[str] = None,
+        identity_context: Optional[Dict[str, Any]] = None,
+        today_date: Optional[str] = None,
+    ) -> str:
+        """Generate a single evening compliment sentence (light model)."""
+        try:
+            tasks = [t for t in (today_todo_list_data or []) if isinstance(t, dict)]
+            normalized_language = self.validator.validate_language(language)
+            system_prompt, user_prompt = self.prompt_builder.build_evening_compliment_prompt(
+                has_tasks=len(tasks) > 0,
+                first_name=first_name,
+            )
+
+            if tasks:
+                tasks_info = "\n".join([
+                    (
+                        f"• ✓ {str(task.get('title', 'Task'))[:48]}".strip()
+                        if task.get("completed") or task.get("isCompleted")
+                        else f"• {str(task.get('title', 'Task'))[:48]}".strip()
+                    )
+                    for task in _sorted_today_tasks(tasks)[:8]
+                ])
+                user_prompt += f"\n\nToday's tasks ({len(tasks)}):\n{tasks_info}"
+
+            if today_date:
+                user_prompt += f"\n\nDate: {today_date}"
+
+            if isinstance(identity_context, dict) and identity_context:
+                id_block = _format_identity_context(identity_context)
+                if id_block.strip():
+                    user_prompt = f"Identity context:\n{id_block[:400]}\n\n{user_prompt}"
+
+            response = self._safe_chat_call(
+                system_prompt,
+                user_prompt,
+                language=normalized_language,
+                model="gpt-5.4-mini",
+                max_completion_tokens=120,
+                temperature=0.95,
+            )
+            text = (response or "").strip()
+            if text:
+                return text[:280]
+            raise ValueError("empty evening compliment response")
+        except Exception as e:
+            logger.error("Failed to generate evening compliment: %s", e)
+            if language == "thai":
+                return "วันนี้คุณทำดีแล้ว — พักผ่อนให้หัวใจเบาลงนะ 💛"
+            return "You showed up today — that's worth being proud of. Rest well. 💛"
     
     def get_todo_information_generator_response(
         self,
@@ -1818,6 +1911,24 @@ def mood_boost(summary: str) -> str:
     """Backward compatibility function for mood boosting"""
     planner = get_default_planner()
     return planner.mood_boost(summary)
+
+
+def evening_compliment_message(
+    today_todo_list_data: Optional[List[Dict[str, Any]]] = None,
+    language: str = "thai",
+    first_name: Optional[str] = None,
+    identity_context: Optional[Dict[str, Any]] = None,
+    today_date: Optional[str] = None,
+) -> str:
+    """Backward compatibility wrapper for evening compliment pushes."""
+    planner = get_default_planner()
+    return planner.evening_compliment_message(
+        today_todo_list_data=today_todo_list_data,
+        language=language,
+        first_name=first_name,
+        identity_context=identity_context,
+        today_date=today_date,
+    )
 
 def message_in_the_morning(
     today_todo_list_data: List[Dict[str, Any]],

@@ -2458,7 +2458,8 @@ _TASK_CONTENT_QUIZ_TOPUP_MAX_ATTEMPTS = 3
 #       ONLY for learning_language plans, so math/science/economics/arts/
 #       psychology/finance/etc. produce real subject material instead of being
 #       skewed toward language practice.
-_TASK_CONTENT_LOGIC_VERSION = 3
+_TASK_CONTENT_LOGIC_VERSION = 4
+_TASK_CONTENT_SPEECH_MAX_CHARS = 500
 
 _TASK_CONTENT_PLAN_CATEGORIES = frozenset({
     "learning", "math", "science", "economics", "arts", "psychology",
@@ -2830,14 +2831,26 @@ _TASK_CONTENT_SYSTEM_PROMPT = (
     "(EXACTLY 4 strings), 'answerIndex' (0–3), 'explanation' (2–3 sentences "
     "that TEACH: why correct using a detail from `content`; why others miss; "
     "one takeaway). Quiz text follows the LANGUAGE instruction.\n"
-    "4. Questions answerable from `content` alone. Exactly one correct choice.\n\n"
+    "4. Questions answerable from `content` alone. Exactly one correct choice.\n"
+    "5. `speech` (required): a listen-along script the app reads aloud via "
+    "text-to-speech. Tie it to THIS step's topic — not generic filler. "
+    "`script` is ONLY the spoken words (max 500 characters). `instruction` is "
+    "one sentence in the coaching language telling the user what to do while "
+    "listening. `title` is a short 2–4 word play-button label in the coaching "
+    "language. For foreign-language plans, `script` is in the practice/target "
+    "language; for every other subject it is in the coaching language.\n\n"
     "Output JSON shape (quiz may be empty):\n"
     "{\n"
     '  "content": "<practice material>",\n'
     '  "quiz": [\n'
     '    {"question":"...","choices":["...","...","...","..."],'
     '"answerIndex":0,"explanation":"..."}\n'
-    "  ]\n"
+    "  ],\n"
+    '  "speech": {\n'
+    '    "title": "<short label>",\n'
+    '    "instruction": "<what to do while listening>",\n'
+    '    "script": "<spoken text for TTS>"\n'
+    "  }\n"
     "}\n"
 )
 
@@ -3725,6 +3738,119 @@ def _normalize_quiz(
     return out
 
 
+def _normalize_speech(raw_speech: Any) -> Optional[Dict[str, str]]:
+    """Validate listen-along TTS payload from task-content generation."""
+    if not isinstance(raw_speech, dict):
+        return None
+    title = str(raw_speech.get("title") or "").strip()[:80]
+    instruction = str(raw_speech.get("instruction") or "").strip()[:240]
+    script = str(raw_speech.get("script") or "").strip()
+    if not script:
+        return None
+    if len(script) > _TASK_CONTENT_SPEECH_MAX_CHARS:
+        script = script[: _TASK_CONTENT_SPEECH_MAX_CHARS - 3].rstrip() + "..."
+    if not title:
+        title = "Listen along"
+    if not instruction:
+        instruction = "Listen once, then follow the step in the material above."
+    return {
+        "title": title,
+        "instruction": instruction,
+        "script": script,
+    }
+
+
+def _task_content_speech_guidance(
+    category_key: str,
+    coaching_language: str,
+    practice_language: str,
+    is_language_plan: bool,
+    task_title: str = "",
+    task_detail: str = "",
+) -> str:
+    """User-prompt block: category-aware listen-along script for TTS."""
+    script_lang = practice_language if is_language_plan else coaching_language
+    blob = f"{task_title} {task_detail}".lower()
+    story_hint = ""
+    if any(
+        tok in blob
+        for tok in (
+            "story", "fairy", "tale", "fable", "narrative", "audiobook",
+            "listen", "listening", "read aloud", "bedtime",
+            "นิทาน", "ฟัง", "การฟัง", "เล่าเรื่อง", "อ่านนิทาน",
+        )
+    ):
+        story_hint = (
+            "This step calls for listening or narrative — use a short story "
+            "excerpt, fairy-tale scene, or mini dialogue the user can follow.\n"
+        )
+    category_formats = {
+        "learning_language": (
+            "Format: short dialogue or connected phrases in the target language "
+            "that practice today's topic — user shadows or repeats after listening."
+        ),
+        "learning": (
+            "Format: spoken walkthrough of the key concept or example from the "
+            "material — user listens then recalls the main point."
+        ),
+        "math": (
+            "Format: spoken step-by-step solution of one problem from the "
+            "material — user follows the reasoning aloud."
+        ),
+        "science": (
+            "Format: narrated explanation of the mechanism or example — user "
+            "listens for cause-and-effect and key terms."
+        ),
+        "economics": (
+            "Format: spoken scenario applying the model with numbers — user "
+            "tracks the logic while listening."
+        ),
+        "arts": (
+            "Format: guided technique cues read slowly — user performs the "
+            "exercise while listening."
+        ),
+        "psychology": (
+            "Format: short real-life scenario illustrating the concept — user "
+            "notices how it shows up."
+        ),
+        "exercise": (
+            "Format: guided rep counts, tempo, and form cues — user moves "
+            "along with the audio."
+        ),
+        "travel": (
+            "Format: mini travel dialogue or phrase drill in context — user "
+            "rehearses pronunciation and meaning."
+        ),
+        "finance": (
+            "Format: spoken money scenario with figures — user follows the "
+            "calculation or decision logic."
+        ),
+        "health": (
+            "Format: calm guided protocol (breathing, mindfulness, or "
+            "body cue) — user follows along in real time."
+        ),
+        "personal_development": (
+            "Format: reflective guided prompt or short scenario — user "
+            "listens then does the 2-minute action."
+        ),
+        "other": (
+            "Format: whichever fits the step — story excerpt, scenario, "
+            "walkthrough, or guided practice."
+        ),
+    }
+    fmt = category_formats.get(category_key, category_formats["other"])
+    return (
+        "LISTEN-ALONG SPEECH (required — `speech` in JSON):\n"
+        f"- `script`: ONLY what TTS speaks, max {_TASK_CONTENT_SPEECH_MAX_CHARS} "
+        f"characters, in {script_lang}. Must relate to this step's topic.\n"
+        f"- `instruction`: one sentence in {coaching_language} — what the user "
+        "should do while listening (shadow, repeat, note facts, follow cues, etc.).\n"
+        f"- `title`: short 2–4 word play-button label in {coaching_language}.\n"
+        f"{story_hint}"
+        f"{fmt}"
+    )
+
+
 def _quiz_question_key(question: str) -> str:
     return " ".join(str(question or "").lower().split())[:240]
 
@@ -4094,6 +4220,7 @@ def generate_task_content(req: https_fn.Request) -> https_fn.Response:
                         data={
                             "content": cached.get("content"),
                             "quiz": quiz,
+                            "speech": _normalize_speech(cached.get("speech")),
                             "tier": tier,
                             "source": "cache",
                             "used": count,
@@ -4221,6 +4348,17 @@ def generate_task_content(req: https_fn.Request) -> https_fn.Response:
             user_prompt_lines.append(
                 "(recovery: missed yesterday — gentle return rep; no streak shame.)"
             )
+        user_prompt_lines += [
+            "",
+            _task_content_speech_guidance(
+                category_key,
+                coaching_language,
+                practice_language,
+                is_language_plan,
+                task_title,
+                task_detail,
+            ),
+        ]
         user_prompt_lines.append("")
         if is_language_plan:
             produce_line = (
@@ -4326,6 +4464,9 @@ def generate_task_content(req: https_fn.Request) -> https_fn.Response:
             parsed.get("quiz") if isinstance(parsed, dict) else None,
             max_items=_TASK_CONTENT_QUIZ_FIRST_BATCH,
         )
+        speech = _normalize_speech(
+            parsed.get("speech") if isinstance(parsed, dict) else None
+        )
         if not content:
             return create_response(
                 success=False, message='Bad model output',
@@ -4374,6 +4515,9 @@ def generate_task_content(req: https_fn.Request) -> https_fn.Response:
                         retry_parsed.get("quiz"),
                         max_items=_TASK_CONTENT_QUIZ_FIRST_BATCH,
                     )
+                    retry_speech = _normalize_speech(retry_parsed.get("speech"))
+                    if retry_speech:
+                        speech = retry_speech
                     logger.info(
                         "generate_task_content: correction succeeded uid=%s task=%s",
                         uid, task_id,
@@ -4406,6 +4550,7 @@ def generate_task_content(req: https_fn.Request) -> https_fn.Response:
         normalized = {
             "content": content,
             "quiz": quiz,
+            "speech": speech,
             "stepFingerprint": step_fingerprint or None,
             "model_used": model,
             "model_tier": model_tier,
@@ -4424,6 +4569,7 @@ def generate_task_content(req: https_fn.Request) -> https_fn.Response:
             data={
                 "content": content,
                 "quiz": quiz,
+                "speech": speech,
                 "tier": tier,
                 "source": "fresh",
                 "used": count,
@@ -5347,93 +5493,7 @@ def progress(req: https_fn.Request) -> https_fn.Response:
             user_query = "Help me understand this todo and what to do next."
 
         # Optional short chat history from client to preserve intent.
-        chat_history = data.get('chat_history', [])
-        history_lines: List[str] = []
-        if isinstance(chat_history, list):
-            for message in chat_history[-20:]:
-                if not isinstance(message, dict):
-                    continue
-                role = message.get('role')
-                text = message.get('text')
-                if role in {'user', 'assistant'} and isinstance(text, str) and text.strip():
-                    history_lines.append(f"{role}: {text.strip()}")
-
-        if history_lines:
-            history_text = "\n".join(history_lines)
-            enriched_query = (
-                f"Latest user question: {user_query}\n"
-                f"Recent chat context:\n{history_text}\n"
-                "Use recent context only if relevant to the latest question."
-            )
-        else:
-            enriched_query = user_query
-
-        calendar_block = _calendar_context_from_request(data)
-        if calendar_block:
-            enriched_query = (
-                f"{enriched_query}\n\n{calendar_block}\n"
-                "Important: If calendar data above shows tasks this month, do NOT say the month is empty."
-            )
-
-        planner_block = _planner_context_from_request(data)
-        if planner_block:
-            enriched_query = (
-                f"{enriched_query}\n\n{planner_block}\n"
-                "Important: When planner content is present, explain what the relevant plan/day "
-                "is about using Planner summary and day steps — not only the calendar reminder title. "
-                "Ground suggestions in that plan content."
-            )
-
-        if general_coach and isinstance(data.get('today_todos'), list):
-            focus_row = data.get("focus_todo")
-            plan_rows = []
-            if isinstance(focus_row, dict) and str(
-                focus_row.get("planId") or focus_row.get("plan_id") or ""
-            ).strip():
-                plan_rows.append(focus_row)
-            for row in data.get('today_todos') or []:
-                if isinstance(row, dict) and row not in plan_rows:
-                    plan_rows.append(row)
-
-            for row in plan_rows:
-                if not isinstance(row, dict):
-                    continue
-                plan_id = str(row.get("planId") or row.get("plan_id") or "").strip()
-                if not plan_id:
-                    continue
-                plan_day = _infer_plan_day_number(row)
-                user_id = data.get("user_id")
-                plan_ctx = _load_practice_plan_context(user_id, plan_id, plan_day)
-                if plan_ctx:
-                    plan_ctx_block = _format_practice_plan_context_block(plan_ctx)
-                    enriched_query = (
-                        f"{enriched_query}\n\n{plan_ctx_block}\n"
-                        "This is today's focus plan from the calendar — cite what this plan day "
-                        "covers (topic + steps) when answering."
-                    )
-                break
-
-        if not general_coach and isinstance(todo_data, dict):
-            plan_id = str(
-                todo_data.get("planId")
-                or todo_data.get("plan_id")
-                or ""
-            ).strip()
-            if plan_id:
-                plan_day = (
-                    todo_data.get("planDayNumber")
-                    or todo_data.get("progressDay")
-                    or todo_data.get("plan_day_number")
-                )
-                user_id = data.get("user_id")
-                plan_ctx = _load_practice_plan_context(user_id, plan_id, plan_day)
-                if plan_ctx:
-                    plan_ctx_block = _format_practice_plan_context_block(plan_ctx)
-                    enriched_query = (
-                        f"{enriched_query}\n\n{plan_ctx_block}\n"
-                        "Use this PLAN ARC for the linked calendar task — suggest steps that match "
-                        "the plan day focus and main goal."
-                    )
+        enriched_query = _build_progress_enriched_query(data, user_query)
 
         # Normalize language field to avoid accidental unsupported values.
         language = data.get('language', 'thai')
@@ -5467,7 +5527,7 @@ def progress(req: https_fn.Request) -> https_fn.Response:
         )
         
     except Exception as e:
-        logger.error(f"Error in todo_assistant: {str(e)}")
+        logger.error(f"Error in progress: {str(e)}")
         return create_response(
             success=False,
             message='Todo assistant failed',
@@ -5538,7 +5598,7 @@ def coach(req: https_fn.Request) -> https_fn.Response:
         )
 
 # Encourage the user to start the day using ChatGPT (when user_id present, RAG is consulted before generating)
-@https_fn.on_request(memory=1024, max_instances=3, timeout_sec=540, cpu=1)  # 5 min timeout for ChatGPT + RAG
+@https_fn.on_request(memory=1024, max_instances=3, timeout_sec=540, cpu=1, secrets=_LLM_SECRETS)  # 5 min timeout for ChatGPT + RAG
 def encourage_in_the_morning(req: https_fn.Request) -> https_fn.Response:
     """Encourage the user to start the day. If user_id is provided, look into RAG (user todo memory) before generating; if missing/empty, don't include RAG context."""
     if req.method == 'OPTIONS':
@@ -5614,6 +5674,55 @@ def encourage_in_the_morning(req: https_fn.Request) -> https_fn.Response:
             success=False,
             message='Response generation failed',
             error=f'Failed to generate response: {str(e)}',
+            status_code=500
+        )
+
+
+@https_fn.on_request(memory=512, max_instances=5, timeout_sec=60, cpu=1, secrets=_LLM_SECRETS)
+def evening_compliment(req: https_fn.Request) -> https_fn.Response:
+    """Generate a single evening compliment for push notifications (light model)."""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+
+    if req.method != 'POST':
+        return create_response(
+            success=False,
+            message='Method not allowed',
+            error='Only POST method is allowed',
+            status_code=405
+        )
+
+    try:
+        data = req.get_json() or {}
+        today_list = data.get('today_todo_list_data')
+        if today_list is not None and not isinstance(today_list, list):
+            return create_response(
+                success=False,
+                message='Invalid field',
+                error='today_todo_list_data must be an array',
+                status_code=400
+            )
+
+        pu = get_planner_utils()
+        response = pu.evening_compliment_message(
+            today_todo_list_data=today_list if isinstance(today_list, list) else [],
+            language=data.get('languageSelected', 'thai'),
+            first_name=data.get('first_name') or data.get('firstName'),
+            identity_context=data.get('identity_context')
+            if isinstance(data.get('identity_context'), dict)
+            else None,
+            today_date=data.get('today_date'),
+        )
+        return create_response(
+            data={'response': response},
+            message='Evening compliment generated successfully'
+        )
+    except Exception as e:
+        logger.error("Error in evening_compliment: %s", str(e))
+        return create_response(
+            success=False,
+            message='Evening compliment generation failed',
+            error=str(e),
             status_code=500
         )
 
@@ -6178,7 +6287,7 @@ def summary_this_month_todos(req: https_fn.Request) -> https_fn.Response:
         )
 
 # Generate rune-based daily guidance using ChatGPT
-@https_fn.on_request(memory=1024, max_instances=3, timeout_sec=540, cpu=1)
+@https_fn.on_request(memory=1024, max_instances=3, timeout_sec=540, cpu=1, secrets=_LLM_SECRETS)
 def todo_fate_prediction(req: https_fn.Request) -> https_fn.Response:
     """Generate rune-based daily guidance (Elder Futhark by default) from the user's todos using ChatGPT."""
     if req.method == 'OPTIONS':
@@ -6343,6 +6452,20 @@ def generate_todo_data_from_user_input(req: https_fn.Request) -> https_fn.Respon
                 f"{enriched_user_input}\n\n"
                 f"[RECENT_CHAT_HISTORY]\n{chr(10).join(history_lines)}\n"
                 "Use this conversation history to infer user intent, constraints, and whether they want rest vs challenge."
+            )
+        coach_context = data.get("coach_context")
+        user_goal_context = data.get("user_goal_context")
+        if isinstance(user_goal_context, str) and user_goal_context.strip():
+            enriched_user_input = (
+                f"{enriched_user_input}\n\n"
+                f"[USER_GOAL]\n{user_goal_context.strip()}\n"
+                "Personalize calendar actions to this goal — do not copy text verbatim."
+            )
+        if isinstance(coach_context, str) and coach_context.strip():
+            enriched_user_input = (
+                f"{enriched_user_input}\n\n"
+                f"[EVO_COACH_ADVICE]\n{coach_context.strip()[:1200]}\n"
+                "Translate this coaching into concrete calendar changes suited to the user's goal."
             )
 
         merged_existing = list(existing_todos) if isinstance(existing_todos, list) else []
@@ -7169,6 +7292,1320 @@ def get_user_intent_profile(req: https_fn.Request) -> https_fn.Response:
             error=str(e),
             status_code=500
         )
+
+
+def _upload_ai_coach_image_b64(image_b64: str, *, user_id: str = "anonymous") -> str:
+    """Persist generated image bytes to Firebase Storage and return a download URL."""
+    if not image_b64:
+        raise ValueError("empty image payload")
+
+    raw = base64.b64decode(image_b64)
+    bucket = storage.bucket()
+    token = str(uuid.uuid4())
+    object_path = f"ai-coach-images/{user_id}/{uuid.uuid4()}.png"
+    blob = bucket.blob(object_path)
+    blob.upload_from_string(raw, content_type="image/png")
+    blob.metadata = {"firebaseStorageDownloadTokens": token}
+    blob.patch()
+
+    encoded_path = requests.utils.quote(object_path, safe="")
+    return (
+        f"https://firebasestorage.googleapis.com/v0/b/{bucket.name}/o/{encoded_path}"
+        f"?alt=media&token={token}"
+    )
+
+
+@https_fn.on_request(memory=1024, max_instances=2, timeout_sec=120, cpu=1, secrets=_LLM_SECRETS)
+def evo_image_generation(req: https_fn.Request) -> https_fn.Response:
+    """Generate a lifestyle-coach inspirational image (gpt-5.4 + image_generation tool)."""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+
+    if req.method != 'POST':
+        return create_response(
+            success=False,
+            message='Method not allowed',
+            error='Only POST method is allowed',
+            status_code=405
+        )
+
+    # Imported before the try so RateLimitExceededError is always bound when
+    # the except clause below is evaluated (e.g. on a malformed JSON body).
+    from chatgpt_wrapper import get_default_wrapper, RateLimitExceededError
+
+    try:
+        data = req.get_json() or {}
+        prompt = data.get('prompt') or data.get('user_message') or data.get('user_input')
+        if not isinstance(prompt, str) or not prompt.strip():
+            return create_response(
+                success=False,
+                message='Missing required field',
+                error='prompt is required',
+                status_code=400
+            )
+
+        lifestyle = data.get('lifestyle_context') or data.get('lifestyle_context_text') or ''
+        plan_ctx = data.get('plan_context_text') or ''
+        enriched = str(prompt).strip()
+        if lifestyle or plan_ctx:
+            enriched = (
+                f"{enriched}\n\nSoft visual context (warm, minimal, lifestyle — no text in image):\n"
+                f"{str(lifestyle)[:300]}\n{str(plan_ctx)[:200]}".strip()
+            )
+
+        allowed_sizes = {"1024x1024", "1024x1792", "1792x1024", "1024x1536", "1536x1024"}
+        size = str(data.get("size") or data.get("image_size") or "1024x1792").strip()
+        if size not in allowed_sizes:
+            size = "1024x1792"
+
+        wrapper = get_default_wrapper()
+        generated = wrapper.generate_image(enriched, size=size)
+        image_b64 = generated.get("b64_json")
+        if not image_b64:
+            raise RuntimeError("No image was returned")
+
+        user_id = str(data.get("user_id") or data.get("userId") or "anonymous").strip() or "anonymous"
+        image_url = _upload_ai_coach_image_b64(image_b64, user_id=user_id)
+
+        return create_response(
+            data={
+                'image_url': image_url,
+                'prompt': enriched[:500],
+                'size': generated.get("size") or size,
+                'aspect_ratio': '9:16' if size == '1024x1792' else ('16:9' if size == '1792x1024' else '1:1'),
+            },
+            message='Image generated successfully'
+        )
+    except RateLimitExceededError:
+        return create_response(
+            success=False,
+            message='Rate limit exceeded',
+            error='Too many image requests. Please try again later.',
+            status_code=429
+        )
+    except Exception as e:
+        logger.error("Error in evo_image_generation: %s", str(e))
+        return create_response(
+            success=False,
+            message='Image generation failed',
+            error=str(e),
+            status_code=500
+        )
+
+
+def _resolve_voice_reply_language(user_text: str, app_language: str) -> Tuple[bool, str]:
+    """Match reply language to what the user actually spoke, with app setting as fallback."""
+    text = str(user_text or "")
+    thai_chars = len(re.findall(r"[\u0E00-\u0E7F]", text))
+    latin_chars = len(re.findall(r"[a-zA-Z]", text))
+    if thai_chars >= 2 and thai_chars >= latin_chars:
+        return True, "thai"
+    if latin_chars >= 4 and thai_chars == 0:
+        return False, "english"
+    app = str(app_language or "english").strip().lower()
+    is_thai = app in {"thai", "th", "ไทย"}
+    return is_thai, "thai" if is_thai else "english"
+
+
+def _build_voice_context_light(data: Dict[str, Any]) -> str:
+    """On-demand context for voice: fetch calendar/plans only when the user asks."""
+    user_id = data.get("user_id")
+    user_text = str(data.get("user_text") or data.get("userText") or "").strip()
+    chat_history = data.get("chat_history") or data.get("chatHistory") or []
+
+    parts: List[str] = []
+
+    if user_id and user_text:
+        try:
+            from voice_tools import build_voice_tool_context
+
+            tool_block = build_voice_tool_context(user_id, user_text, chat_history, data)
+            if tool_block:
+                parts.append(tool_block)
+        except Exception as tool_error:
+            logger.warning("Voice tool context skipped: %s", tool_error)
+
+    todo_data = data.get("todo_data")
+    if isinstance(todo_data, dict):
+        title = str(todo_data.get("title") or "").strip()
+        if title:
+            bits = [f"Focused task: {title}"]
+            plan = str(todo_data.get("planName") or "").strip()
+            if plan:
+                bits.append(f"plan {plan}")
+            day = todo_data.get("date")
+            if day:
+                bits.append(str(day))
+            todo_id = str(todo_data.get("todoID") or todo_data.get("todo_id") or "").strip()
+            if todo_id:
+                bits.append(f"todo_id {todo_id}")
+            parts.append(" ".join(bits))
+
+        task_detail = str(todo_data.get("detail") or "").strip()
+        if task_detail:
+            trimmed = task_detail[:2000]
+            suffix = "…" if len(task_detail) > 2000 else ""
+            parts.append(
+                f"Task detail:\n{trimmed}{suffix}\n"
+                "(Ground voice replies in this task content.)"
+            )
+
+    return "\n\n".join(parts)
+
+
+def _build_progress_enriched_query(data: Dict[str, Any], user_query: str) -> str:
+    """Shared coach context builder for progress + voice chat endpoints."""
+    chat_history = data.get("chat_history", [])
+    history_lines: List[str] = []
+    if isinstance(chat_history, list):
+        for message in chat_history[-20:]:
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            text = message.get("text")
+            if role in {"user", "assistant"} and isinstance(text, str) and text.strip():
+                history_lines.append(f"{role}: {text.strip()}")
+
+    if history_lines:
+        history_text = "\n".join(history_lines)
+        enriched_query = (
+            f"Latest user question: {user_query}\n"
+            f"Recent chat context:\n{history_text}\n"
+            "Use recent context only if relevant to the latest question."
+        )
+    else:
+        enriched_query = user_query
+
+    calendar_block = _calendar_context_from_request(data)
+    if calendar_block:
+        enriched_query = (
+            f"{enriched_query}\n\n{calendar_block}\n"
+            "Important: If calendar data above shows tasks this month, do NOT say the month is empty."
+        )
+
+    planner_block = _planner_context_from_request(data)
+    if planner_block:
+        enriched_query = (
+            f"{enriched_query}\n\n{planner_block}\n"
+            "Important: When planner content is present, explain what the relevant plan/day "
+            "is about using Planner summary and day steps — not only the calendar reminder title. "
+            "Ground suggestions in that plan content."
+        )
+
+    lifestyle_block = data.get("lifestyle_context_text")
+    if isinstance(lifestyle_block, str) and lifestyle_block.strip():
+        enriched_query = (
+            f"{enriched_query}\n\n{lifestyle_block.strip()}\n"
+            "Use lifestyle profile and MBTI (when set) to personalize tasks, plans, and stress-reduction advice."
+        )
+
+    evo_ai_block = data.get("evo_ai_context_text")
+    if isinstance(evo_ai_block, str) and evo_ai_block.strip():
+        enriched_query = f"{enriched_query}\n\n{evo_ai_block.strip()}"
+
+    ai_summaries_block = data.get("ai_summaries_text")
+    if isinstance(ai_summaries_block, str) and ai_summaries_block.strip():
+        enriched_query = (
+            f"{enriched_query}\n\n{ai_summaries_block.strip()}\n"
+            "Use morning or weekly summaries above when the user asks about today or the week ahead."
+        )
+
+    behavior_block = data.get("behavior_context_text")
+    if isinstance(behavior_block, str) and behavior_block.strip():
+        enriched_query = (
+            f"{enriched_query}\n\n{behavior_block.strip()}\n"
+            "Lead with return rhythm and consistency — not streak guilt or shame."
+        )
+
+    missing_profile = data.get("missing_coach_profile_fields")
+    if isinstance(missing_profile, list) and missing_profile:
+        fields = [str(f).strip() for f in missing_profile if str(f).strip()]
+        if fields:
+            enriched_query = (
+                f"{enriched_query}\n\n"
+                f"Missing saved profile fields: {', '.join(fields)}. "
+                "When personalization would clearly help, ask for ONE missing field in a warm, optional way. "
+                "Tell the user the app can save their answer to their profile for better future advice."
+            )
+
+    todo_data = data.get("todo_data") if isinstance(data.get("todo_data"), dict) else {}
+    general_coach = not todo_data
+    if general_coach and isinstance(data.get("today_todos"), list):
+        focus_row = data.get("focus_todo")
+        plan_rows = []
+        if isinstance(focus_row, dict) and str(
+            focus_row.get("planId") or focus_row.get("plan_id") or ""
+        ).strip():
+            plan_rows.append(focus_row)
+        for row in data.get("today_todos") or []:
+            if isinstance(row, dict) and row not in plan_rows:
+                plan_rows.append(row)
+
+        for row in plan_rows:
+            if not isinstance(row, dict):
+                continue
+            plan_id = str(row.get("planId") or row.get("plan_id") or "").strip()
+            if not plan_id:
+                continue
+            plan_day = _infer_plan_day_number(row)
+            user_id = data.get("user_id")
+            plan_ctx = _load_practice_plan_context(user_id, plan_id, plan_day)
+            if plan_ctx:
+                plan_ctx_block = _format_practice_plan_context_block(plan_ctx)
+                enriched_query = (
+                    f"{enriched_query}\n\n{plan_ctx_block}\n"
+                    "This is today's focus plan from the calendar — cite what this plan day "
+                    "covers (topic + steps) when answering."
+                )
+            break
+
+    if not general_coach and isinstance(todo_data, dict):
+        plan_id = str(
+            todo_data.get("planId")
+            or todo_data.get("plan_id")
+            or ""
+        ).strip()
+        if plan_id:
+            plan_day = (
+                todo_data.get("planDayNumber")
+                or todo_data.get("progressDay")
+                or todo_data.get("plan_day_number")
+            )
+            user_id = data.get("user_id")
+            plan_ctx = _load_practice_plan_context(user_id, plan_id, plan_day)
+            if plan_ctx:
+                plan_ctx_block = _format_practice_plan_context_block(plan_ctx)
+                enriched_query = (
+                    f"{enriched_query}\n\n{plan_ctx_block}\n"
+                    "Use this PLAN ARC for the linked calendar task — suggest steps that match "
+                    "the plan day focus and main goal."
+                )
+
+        task_detail = str(todo_data.get("detail") or "").strip()
+        if task_detail:
+            trimmed_detail = task_detail[:3500]
+            enriched_query = (
+                f"{enriched_query}\n\n"
+                f"TASK DETAIL (ground your answer in this specific task content):\n"
+                f"{trimmed_detail}\n"
+                "Discuss the steps, notes, and plan content above — not only the task title."
+            )
+
+    return enriched_query
+
+
+@https_fn.on_request(memory=512, max_instances=3, timeout_sec=60, cpu=1, secrets=_LLM_SECRETS)
+def evo_speech_transcription(req: https_fn.Request) -> https_fn.Response:
+    """Transcribe voice input for EVO AI chat (gpt-4o-transcribe)."""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+
+    if req.method != 'POST':
+        return create_response(
+            success=False,
+            message='Method not allowed',
+            error='Only POST method is allowed',
+            status_code=405
+        )
+
+    try:
+        data = req.get_json() or {}
+        audio_b64 = data.get('audio_base64') or data.get('audioBase64')
+        if not isinstance(audio_b64, str) or not audio_b64.strip():
+            return create_response(
+                success=False,
+                message='Missing required field',
+                error='audio_base64 is required',
+                status_code=400
+            )
+
+        if len(audio_b64) > 25_000_000:
+            return create_response(
+                success=False,
+                message='Audio too large',
+                error='Recording exceeds maximum upload size',
+                status_code=413
+            )
+
+        from chatgpt_wrapper import get_default_wrapper, RateLimitExceededError
+
+        filename = str(data.get('filename') or 'speech.m4a').strip() or 'speech.m4a'
+        language = str(data.get('language') or '').strip().lower() or None
+        if language and len(language) > 8:
+            language = language[:8]
+
+        audio_bytes = base64.b64decode(audio_b64)
+        if not audio_bytes:
+            return create_response(
+                success=False,
+                message='Invalid audio',
+                error='Could not decode audio payload',
+                status_code=400
+            )
+
+        buffer = io.BytesIO(audio_bytes)
+        buffer.name = filename
+
+        wrapper = get_default_wrapper()
+        text = wrapper.transcribe_audio(buffer, language=language)
+
+        return create_response(
+            data={'text': text},
+            message='Transcription successful'
+        )
+    except RateLimitExceededError:
+        return create_response(
+            success=False,
+            message='Rate limit exceeded',
+            error='Too many transcription requests. Please try again later.',
+            status_code=429
+        )
+    except Exception as e:
+        logger.error("Error in evo_speech_transcription: %s", str(e))
+        return create_response(
+            success=False,
+            message='Transcription failed',
+            error=str(e),
+            status_code=500
+        )
+
+
+@https_fn.on_request(memory=1024, max_instances=3, timeout_sec=120, cpu=1, secrets=_LLM_SECRETS)
+def evo_voice_chat(req: https_fn.Request) -> https_fn.Response:
+    """Two-way voice chat with EVO AI (gpt-audio-1.5): audio in, text + spoken reply out."""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+
+    if req.method != 'POST':
+        return create_response(
+            success=False,
+            message='Method not allowed',
+            error='Only POST method is allowed',
+            status_code=405
+        )
+
+    try:
+        data = req.get_json() or {}
+        audio_b64 = data.get('audio_base64') or data.get('audioBase64') or ''
+        precomputed_text = data.get('user_text') or data.get('userText')
+        text_only = bool(data.get('text_only') or data.get('textOnly'))
+        has_precomputed = isinstance(precomputed_text, str) and precomputed_text.strip()
+
+        if not has_precomputed and (not isinstance(audio_b64, str) or not audio_b64.strip()):
+            return create_response(
+                success=False,
+                message='Missing required field',
+                error='audio_base64 or user_text is required',
+                status_code=400
+            )
+
+        if audio_b64 and len(audio_b64) > 25_000_000:
+            return create_response(
+                success=False,
+                message='Audio too large',
+                error='Recording exceeds maximum upload size',
+                status_code=413
+            )
+
+        from chatgpt_wrapper import get_default_wrapper, RateLimitExceededError
+
+        filename = str(data.get('filename') or 'speech.m4a').strip() or 'speech.m4a'
+        ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else 'm4a'
+        audio_format = str(data.get('audio_format') or data.get('audioFormat') or ext).strip().lower()
+
+        language = data.get('language') or data.get('languageSelected') or 'english'
+        if not isinstance(language, str) or not language.strip():
+            language = 'english'
+        else:
+            language = language.strip().lower()
+
+        is_thai = language in {'thai', 'th', 'ไทย'}
+        voice = str(data.get('voice') or 'alloy').strip() or 'alloy'
+
+        wrapper = get_default_wrapper()
+        transcribe_lang = 'th' if is_thai else 'en'
+
+        if has_precomputed or text_only:
+            user_text = precomputed_text.strip() if has_precomputed else ''
+            audio_bytes = b''
+        else:
+            audio_bytes = base64.b64decode(audio_b64)
+            if not audio_bytes:
+                return create_response(
+                    success=False,
+                    message='Invalid audio',
+                    error='Could not decode audio payload',
+                    status_code=400
+                )
+            buffer = io.BytesIO(audio_bytes)
+            buffer.name = filename
+            try:
+                user_text = wrapper.transcribe_audio(buffer, language=transcribe_lang)
+            except Exception as transcribe_error:
+                logger.warning("Voice chat transcription fallback: %s", transcribe_error)
+                user_text = ""
+
+        if not user_text:
+            user_text = "(voice message)"
+
+        is_thai, language = _resolve_voice_reply_language(user_text, language)
+        data["language"] = language
+        data["languageSelected"] = language
+        # Inject transcript early so on-demand voice tools can read the question.
+        data["user_text"] = user_text
+        data["userText"] = user_text
+        if not data.get("chat_history"):
+            data["chat_history"] = data.get("chatHistory") or []
+
+        enriched_query = _build_voice_context_light(data)
+
+        lang_instruction = (
+            "CRITICAL: The user spoke in Thai. Your entire spoken and written reply MUST be in Thai only. "
+            "Do not reply in English."
+            if is_thai
+            else "CRITICAL: The user spoke in English. Your entire spoken and written reply MUST be in English only. "
+            "Do not reply in Thai."
+        )
+
+        system_prompt = (
+            "You are EVO AI — the voice assistant inside the EVO lifestyle planner app. "
+            "The user is speaking in a fast back-and-forth conversation. "
+            "Keep every reply very short — 1-2 sentences, under ~12 seconds when spoken. "
+            "Lead with the direct answer; no preamble or recap. "
+            "Calendar, plan, and profile data appear below ONLY when fetched for this question — "
+            "use that data when present; do not invent events or plans. "
+            "If no fetched data block is present, answer from the conversation or general coaching. "
+            "When they ask to add, schedule, move, reschedule, or delete tasks, acknowledge what you understood "
+            "in one short sentence and tell them to say 'confirm' (or 'ยืนยัน') to save the draft. "
+            "The app will draft create, update, and delete actions for their review — do not claim changes are already saved. "
+            + lang_instruction
+        )
+
+        pending_actions = data.get('pending_actions') or data.get('pendingActions') or []
+        pending_block = ""
+        if isinstance(pending_actions, list) and pending_actions:
+            titles = []
+            for item in pending_actions[:6]:
+                if not isinstance(item, dict):
+                    continue
+                todo = item.get('todo') if isinstance(item.get('todo'), dict) else item
+                title = str((todo or {}).get('title') or '').strip()
+                if title:
+                    titles.append(title)
+            if titles:
+                pending_block = (
+                    "Pending calendar drafts awaiting user confirmation: "
+                    + "; ".join(titles)
+                    + ". Ask them to say confirm to save or describe changes to refine."
+                )
+                system_prompt += " " + pending_block
+
+        chat_history = data.get('chat_history') or []
+        history_for_model = []
+        if isinstance(chat_history, list):
+            for message in chat_history[-6:]:
+                if isinstance(message, dict):
+                    history_for_model.append(message)
+
+        context_text = (
+            (f"Brief context for this voice turn:\n{enriched_query}\n\n" if enriched_query else "")
+            + lang_instruction
+            + "\nRespond to what the user said in the recording."
+        )
+
+        voice_result = wrapper.voice_chat_completion(
+            audio_bytes=audio_bytes,
+            audio_format=audio_format,
+            system_prompt=system_prompt,
+            user_text=user_text,
+            context_text=context_text,
+            chat_history=history_for_model,
+            voice=voice,
+            output_format="mp3",
+        )
+
+        assistant_text = voice_result.get("text") or ""
+        assistant_audio = voice_result.get("audio_base64") or ""
+        if not assistant_text and not assistant_audio:
+            raise RuntimeError("Empty voice response")
+
+        return create_response(
+            data={
+                'user_text': user_text,
+                'assistant_text': assistant_text,
+                'assistant_audio_base64': assistant_audio,
+                'audio_format': voice_result.get('audio_format') or 'mp3',
+            },
+            message='Voice chat successful'
+        )
+    except RateLimitExceededError:
+        return create_response(
+            success=False,
+            message='Rate limit exceeded',
+            error='Too many voice requests. Please try again later.',
+            status_code=429
+        )
+    except Exception as e:
+        logger.error("Error in evo_voice_chat: %s", str(e))
+        return create_response(
+            success=False,
+            message='Voice chat failed',
+            error=str(e),
+            status_code=500
+        )
+
+
+def _realtime_voice_tool_specs() -> list:
+    """Function tools the Realtime model can call mid-conversation (on-demand fetch)."""
+    return [
+        {
+            "type": "function",
+            "name": "get_calendar",
+            "description": (
+                "Fetch the user's calendar todos for a time window. Call this ONLY when the user "
+                "asks about their schedule/tasks for a specific period (today, tomorrow, this week, "
+                "this month). Do not call it for general chat."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "window": {
+                        "type": "string",
+                        "enum": ["today", "tomorrow", "yesterday", "week", "month"],
+                        "description": "Which time window to fetch.",
+                    }
+                },
+                "required": ["window"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "get_task_detail",
+            "description": (
+                "Read the full detail/notes of ONE specific task so you can discuss it with the user "
+                "(e.g. they ask 'what's in my workout?', 'remind me the steps', 'what did I plan for this'). "
+                "get_calendar items include has_detail — if true, you can pull the full text here. Use todo_id "
+                "from get_calendar (or title). To CHANGE the detail afterward, call set_task_detail."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todo_id": {"type": "string", "description": "todoID from a get_calendar item (preferred)."},
+                    "title": {"type": "string", "description": "Task title, if todo_id is unknown."},
+                    "date": {"type": "string", "description": "Date YYYY-MM-DD, to disambiguate."},
+                },
+                "required": [],
+            },
+        },
+        {
+            "type": "function",
+            "name": "get_active_plans",
+            "description": "Fetch the user's active lifestyle plans. Call only when they ask about their plans/programs.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        {
+            "type": "function",
+            "name": "get_goals",
+            "description": (
+                "Fetch the user's north star — their life goal, identity (who they want to become), "
+                "and key personal context (MBTI, work). Call at the start of any goal/meaning/direction "
+                "conversation, and before suggesting plans, so your advice connects to their why."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+        {
+            "type": "function",
+            "name": "set_goal",
+            "description": (
+                "Save or refine the user's life goal / what they want to become. Call when the user "
+                "states or updates a long-term goal, purpose, or identity. Confirm it out loud after saving."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string", "description": "The user's life goal / identity statement, in their words."}
+                },
+                "required": ["goal"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "remember_about_user",
+            "description": (
+                "Save a durable personal fact or preference about the user to long-term memory — e.g. "
+                "'likes IPA beer', 'works night shifts', 'hates mornings', 'allergic to peanuts'. Call "
+                "whenever the user asks you to remember something or shares a lasting preference. Confirm briefly."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note": {"type": "string", "description": "The fact/preference to remember, in the user's words."},
+                    "category": {"type": "string", "description": "Optional tag, e.g. food, work, health, sleep."},
+                },
+                "required": ["note"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "recall_user_notes",
+            "description": (
+                "Look up what you've saved about the user (preferences/facts). Call when a personal detail "
+                "would help your answer or the user asks what you remember. Optional topic to filter."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {"type": "string", "description": "Optional keyword to filter notes, e.g. 'beer'."}
+                },
+                "required": [],
+            },
+        },
+        {
+            "type": "function",
+            "name": "find_places",
+            "description": (
+                "Find real places (bars, cafes, restaurants, gyms, etc.) via Google Places. Use the user's "
+                "saved tastes to shape the query (e.g. they like IPA → query 'craft beer bar'). Returns real "
+                "venues with rating, open-now, and a maps link. Recommend 1-3 and mention rating/open status."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "What to look for, e.g. 'craft beer bar', 'specialty coffee'."},
+                    "area": {"type": "string", "description": "Where, e.g. 'Thonglor, Bangkok'. OMIT this to search near the user's CURRENT location (use for 'near me' / 'nearby')."},
+                    "open_now": {"type": "boolean", "description": "Only return places open now."},
+                },
+                "required": ["query"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "get_conditions",
+            "description": (
+                "Get current weather and air quality for the user's location. Call when suggesting outdoor "
+                "activity (run, cycle, walk, anything outside) or when the user asks about weather/air. Adapt "
+                "the suggestion: unhealthy AQI or rain/extreme heat -> indoor alternative or a better time; "
+                "great conditions -> encourage getting outside."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "lat": {"type": "number", "description": "Optional latitude; omit to use the device location."},
+                    "lng": {"type": "number", "description": "Optional longitude; omit to use the device location."},
+                },
+                "required": [],
+            },
+        },
+        {
+            "type": "function",
+            "name": "get_google_calendar",
+            "description": (
+                "Read the user's connected Google Calendar (real external events/meetings) so you can plan "
+                "EVO tasks around them. Returns connected:false if they haven't linked it — then suggest they "
+                "connect Google Calendar from the EVO menu. Use when scheduling or asked about their real day."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer", "description": "How many days ahead to fetch (default 7, max 30)."},
+                },
+                "required": [],
+            },
+        },
+        {
+            "type": "function",
+            "name": "open_map",
+            "description": (
+                "Open a place or location in the maps app for the user. Call after recommending a place "
+                "(pass its place_id from find_places) or when the user asks to see/navigate to somewhere."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "place_id": {"type": "string", "description": "place_id from a find_places result (most precise)."},
+                    "name": {"type": "string", "description": "Place name (fallback if no place_id)."},
+                    "query": {"type": "string", "description": "Free-text location to search (fallback)."},
+                    "area": {"type": "string", "description": "Area to disambiguate the fallback search."},
+                },
+                "required": [],
+            },
+        },
+        {
+            "type": "function",
+            "name": "get_profile",
+            "description": "Fetch the user's streak/profile summary. Call only when they ask about streaks, goals, or progress identity.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        {
+            "type": "function",
+            "name": "get_planner_overview",
+            "description": (
+                "Get a planner overview for a period: how many tasks are done vs planned (adherence) "
+                "plus the user's active plans, their progress, and relevant day content. Use when the user "
+                "asks how their day/week/month looks overall, their progress, or wants a review/summary."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "period": {
+                        "type": "string",
+                        "enum": ["day", "week", "month"],
+                        "description": "Which period to summarize.",
+                    }
+                },
+                "required": ["period"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "prioritize_tasks",
+            "description": (
+                "Rank the user's tasks into a focus order (by goal/plan alignment, recovering missed "
+                "reps, and time-sensitivity) with a load cap. Call when the user asks what to focus on, "
+                "what's most important, where to start, or to prioritize their day/week."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "period": {
+                        "type": "string",
+                        "enum": ["day", "week", "month"],
+                        "description": "Scope to prioritize. Default day.",
+                    }
+                },
+                "required": [],
+            },
+        },
+        {
+            "type": "function",
+            "name": "get_plan_detail",
+            "description": (
+                "Get the detailed content of a lifestyle plan — its summary and day-by-day steps. "
+                "Call this when a calendar task is linked to a plan (it has a plan_id from get_calendar) "
+                "and the user wants to know more about that plan or a specific day."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "plan_id": {"type": "string", "description": "planId from a get_calendar item."},
+                    "day": {"type": "integer", "description": "Optional plan day number to focus on."},
+                },
+                "required": ["plan_id"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "create_task",
+            "description": (
+                "Create a new calendar task/todo for the user. Call when they ask to add, schedule, "
+                "or remind them of something. When the user wants help DOING the task (e.g. 'I want to "
+                "do shoulder weight training today'), generate a concrete how-to and put it in `detail` — "
+                "exercises with sets/reps, or clear sub-steps. Confirm out loud after creating."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Short task title."},
+                    "date": {"type": "string", "description": "Date as YYYY-MM-DD. Default today if unsaid."},
+                    "time": {"type": "string", "description": "Start time as 24h HH:MM. Omit if no specific time."},
+                    "detail": {"type": "string", "description": "Concrete how-to steps for the task (exercises/sets/reps, or sub-steps) when guidance helps; else short notes."},
+                    "location": {"type": "string", "description": "Optional location."},
+                },
+                "required": ["title"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "set_task_detail",
+            "description": (
+                "Write a concrete how-to plan onto an EXISTING task's detail — e.g. a shoulder-workout "
+                "breakdown (exercises, sets/reps), a study outline, or step-by-step instructions. First "
+                "find the task via get_calendar for its todo_id, then call this with the detail you generated. "
+                "Set append=true to add to existing notes instead of replacing. Confirm and read the key points."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todo_id": {"type": "string", "description": "todoID from a prior get_calendar result."},
+                    "title": {"type": "string", "description": "Task title, as a fallback if todo_id is unknown."},
+                    "date": {"type": "string", "description": "Date YYYY-MM-DD, to disambiguate which instance."},
+                    "detail": {"type": "string", "description": "The concrete how-to steps to save on the task."},
+                    "append": {"type": "boolean", "description": "Default behavior ADDS to existing notes (preserves the user's own writing). Pass append=false only if the user explicitly wants to replace existing detail."},
+                },
+                "required": ["detail"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "move_task",
+            "description": (
+                "Reschedule an existing task to a new date and/or time. First identify the task via "
+                "get_calendar to obtain its todo_id, then call this. Confirm the change out loud."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todo_id": {"type": "string", "description": "todoID from a prior get_calendar result."},
+                    "title": {"type": "string", "description": "Task title, as a fallback if todo_id is unknown."},
+                    "current_date": {"type": "string", "description": "Current date YYYY-MM-DD, to disambiguate."},
+                    "new_date": {"type": "string", "description": "New date YYYY-MM-DD. Omit to keep the date."},
+                    "new_time": {"type": "string", "description": "New start time HH:MM. Omit to keep the time."},
+                },
+                "required": [],
+            },
+        },
+        {
+            "type": "function",
+            "name": "delete_task",
+            "description": (
+                "Delete/cancel an existing task. First identify it via get_calendar to obtain its todo_id. "
+                "SAFETY: call once WITHOUT confirmed to get a confirmation prompt, ask the user out loud, "
+                "and only call again with confirmed=true after they clearly agree."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todo_id": {"type": "string", "description": "todoID from a prior get_calendar result."},
+                    "title": {"type": "string", "description": "Task title, as a fallback if todo_id is unknown."},
+                    "date": {"type": "string", "description": "Date YYYY-MM-DD, to disambiguate which instance."},
+                    "confirmed": {"type": "boolean", "description": "Set true ONLY after the user confirmed the deletion."},
+                },
+                "required": [],
+            },
+        },
+        {
+            "type": "function",
+            "name": "restore_task",
+            "description": (
+                "Undo the most recent delete_task, restoring the deleted task. Call when the user says "
+                "undo / restore / bring it back / put it back right after a deletion."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    ]
+
+
+def _realtime_instructions(is_thai: bool, today_str: str = "", tz_label: str = "") -> str:
+    date_line = ""
+    if today_str:
+        date_line = (
+            f"Today's date is {today_str}"
+            + (f" ({tz_label} time). " if tz_label else ". ")
+            + "Resolve relative dates yourself: 'tomorrow' is the day after today's date, "
+            "'next week' is 7 days out, etc. Always pass an explicit YYYY-MM-DD date to the "
+            "task tools — never assume today unless the user clearly means today. "
+        )
+    base = (
+        "You are EVO AI — the realtime voice coach inside the EVO lifestyle app. Your mission is to "
+        "understand the user's lifestyle and help them evolve toward their life goal and meaning — through "
+        "small, consistent, recoverable practice (neuroplasticity), not streak pressure. Missed days are "
+        "information; returning is what compounds. Balance pushing them (challenge) with permission to rest. "
+        + date_line
+        + "Speak in a fast, natural back-and-forth. Keep replies very short — 1-2 sentences. "
+        "Lead with the direct answer; no preamble. "
+        "Know their north star: call get_goals at the start of any direction/meaning conversation and "
+        "before suggesting plans, and connect tasks and plans back to that goal and who they're becoming. "
+        "When they state or refine a life goal, call set_goal to remember it. "
+        "When the user shares a lasting personal fact or preference, or asks you to remember something "
+        "(e.g. 'remember I like IPA beer'), call remember_about_user so it persists — then briefly confirm. "
+        "When they ask for a place (bar, cafe, restaurant, gym…), call find_places — shape the query with "
+        "what you know they like (e.g. likes IPA → 'craft beer bar'). For 'near me'/'nearby' OMIT area so it "
+        "searches the user's current location; pass area only when they name a place. Recommend 1-3 real venues "
+        "with rating and whether they're open, then offer to open one with open_map. Don't invent addresses — "
+        "if find_places returns nothing, say so rather than guessing. When you SAVE a recommended place onto a "
+        "task (create_task/set_task_detail), write each on its own line as 'Name — full address' (you may also "
+        "include its maps_url); the app turns addresses into a tappable Open-in-Maps link. "
+        "get_conditions already uses the current location automatically. "
+        "When a suggestion depends on being outside (running, cycling, a walk), or the user asks about weather/air, "
+        "call get_conditions and adapt: unhealthy air quality or rain/extreme heat → suggest an indoor option or a "
+        "better time window; good conditions → encourage getting out. Factor this into prioritization and the daily focus. "
+        "When scheduling or asked about their real day, call get_google_calendar to see external meetings and plan "
+        "EVO tasks around them; if it returns connected:false, suggest they connect Google Calendar from the EVO menu. "
+        "Known notes about the user may appear in your context; when a saved detail would help, you can also "
+        "call recall_user_notes. Use these to feel like you genuinely know them. "
+        "Use the get_calendar / get_active_plans / get_profile tools ONLY when the user asks about "
+        "their schedule, plans, or progress — never for casual chat. Do not invent calendar events. "
+        "If a task from get_calendar has a plan_id and the user wants to dig into the plan or that day, "
+        "call get_plan_detail with that plan_id (and day) and explain the content. "
+        "For an overview, progress, or review of the user's day, week, or month (how many tasks are done "
+        "vs planned, plus plan progress), call get_planner_overview with the matching period. "
+        "When they ask what to focus on, what's most important, or where to start, call prioritize_tasks: "
+        "lead with the #1 focus and WHY it matters for their goal; if there's a load note, gently suggest "
+        "deferring or resting the optional ones — never guilt. "
+        "To add a task, call create_task. To reschedule, call move_task; to cancel, call delete_task — "
+        "for move/delete, first call get_calendar to find the task's todo_id, then pass that todo_id. "
+        "When the user asks about an existing task's details — what's in it, the steps, 'remind me what I "
+        "planned' — call get_task_detail (use the todo_id from get_calendar; items show has_detail) and discuss "
+        "it conversationally. If they then want to change/replace those details, call set_task_detail "
+        "(append=false to replace, true to add). "
+        "When the user wants guidance on HOW to do something (e.g. 'I want to do shoulder weight training "
+        "today', 'help me study chapter 3'), generate a concrete, practical plan — exercises with sets/reps, "
+        "or clear sub-steps — and SAVE it onto the task: put it in create_task's `detail` for a new task, or "
+        "call set_task_detail (find the existing task's todo_id via get_calendar first). set_task_detail ADDS "
+        "to any existing notes by default, so you never erase the user's own writing — only pass append=false "
+        "if they explicitly ask to replace. Then read the key points out loud. Keep saved detail concrete and "
+        "usable, not vague. "
+        "For delete_task: never delete without confirming — call it first without confirmed to get a prompt, "
+        "ask the user out loud, and only resend with confirmed=true once they agree. After a delete, tell them "
+        "they can say 'undo' (which calls restore_task). "
+        "Other actions take effect immediately, so after the tool returns, confirm out loud exactly what "
+        "you did (e.g. 'Added gym tomorrow at 6 PM'). If a tool reports it couldn't find the task, say so. "
+    )
+    return base + ("Reply in Thai." if is_thai else "Reply in English.")
+
+
+@https_fn.on_request(memory=256, min_instances=0, max_instances=5, timeout_sec=30, cpu=1, secrets=_LLM_SECRETS)
+def evo_realtime_session(req: https_fn.Request) -> https_fn.Response:
+    """Mint a short-lived OpenAI Realtime ephemeral token for client-side WebRTC voice.
+
+    The real API key never leaves the server. The client uses the returned token to open a
+    WebRTC peer connection straight to OpenAI, then applies the returned `session` config
+    (instructions, voice, turn detection, tools) via a session.update over the data channel.
+    """
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+
+    if req.method != 'POST':
+        return create_response(
+            success=False,
+            message='Method not allowed',
+            error='Only POST method is allowed',
+            status_code=405
+        )
+
+    try:
+        import requests
+        from openai_api_key import resolve_openai_api_key
+
+        api_key = resolve_openai_api_key()
+        if not api_key:
+            return create_response(
+                success=False,
+                message='Realtime unavailable',
+                error='OpenAI API key is not configured',
+                status_code=503
+            )
+
+        data = req.get_json(silent=True) or {}
+        model = str(data.get('model') or 'gpt-realtime').strip() or 'gpt-realtime'
+        voice = str(data.get('voice') or 'alloy').strip() or 'alloy'
+        language = str(data.get('language') or data.get('languageSelected') or 'english').strip().lower()
+        is_thai = language in {'thai', 'th', 'ไทย'}
+
+        # Prefer the client's local date (device truth); fall back to a tz-aware server date.
+        today_str = str(data.get('today') or data.get('todayYmd') or '').strip()[:10]
+        tz_label = str(data.get('timezone') or data.get('timeZone') or '').strip()
+        if not today_str:
+            try:
+                from zoneinfo import ZoneInfo
+                tz = ZoneInfo(tz_label) if tz_label else ZoneInfo('Asia/Bangkok')
+                today_str = datetime.now(tz).strftime('%Y-%m-%d')
+                if not tz_label:
+                    tz_label = 'Asia/Bangkok'
+            except Exception:
+                today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+
+        instructions = _realtime_instructions(is_thai, today_str, tz_label)
+
+        # Optional screen context (e.g. the task/plan the user is currently viewing).
+        context_hint = str(data.get('context') or data.get('contextHint') or '').strip()
+        if context_hint:
+            instructions = (
+                f"{instructions} The user is currently viewing this in the app: "
+                f"{context_hint[:400]} Use it to ground your answers when relevant."
+            )
+
+        tools = _realtime_voice_tool_specs()
+
+        headers = {
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json',
+        }
+
+        token = ""
+        expires_at = None
+        # Preferred: GA client_secrets endpoint.
+        try:
+            resp = requests.post(
+                'https://api.openai.com/v1/realtime/client_secrets',
+                headers=headers,
+                json={'session': {'type': 'realtime', 'model': model}},
+                timeout=15,
+            )
+            if resp.status_code < 300:
+                body = resp.json() or {}
+                token = str(body.get('value') or '')
+                expires_at = body.get('expires_at')
+            else:
+                logger.warning("client_secrets mint failed (%s): %s", resp.status_code, resp.text[:300])
+        except Exception as primary_error:
+            logger.warning("client_secrets mint error: %s", primary_error)
+
+        # Fallback: legacy sessions endpoint (gpt-4o-realtime-preview era).
+        if not token:
+            resp = requests.post(
+                'https://api.openai.com/v1/realtime/sessions',
+                headers=headers,
+                json={'model': model, 'voice': voice},
+                timeout=15,
+            )
+            if resp.status_code >= 300:
+                return create_response(
+                    success=False,
+                    message='Realtime session mint failed',
+                    error=f'HTTP {resp.status_code}: {resp.text[:300]}',
+                    status_code=502
+                )
+            body = resp.json() or {}
+            secret = body.get('client_secret') or {}
+            token = str(secret.get('value') or '')
+            expires_at = secret.get('expires_at')
+
+        if not token:
+            return create_response(
+                success=False,
+                message='Realtime session mint failed',
+                error='No ephemeral token returned by OpenAI',
+                status_code=502
+            )
+
+        return create_response(
+            data={
+                'token': token,
+                'expires_at': expires_at,
+                'model': model,
+                # Client applies this via session.update after the WebRTC connection opens.
+                'session': {
+                    'instructions': instructions,
+                    'voice': voice,
+                    'modalities': ['audio', 'text'],
+                    'turn_detection': {
+                        'type': 'server_vad',
+                        'silence_duration_ms': 500,
+                        'prefix_padding_ms': 300,
+                        'threshold': 0.5,
+                    },
+                    'tools': tools,
+                    'tool_choice': 'auto',
+                },
+            },
+            message='Realtime session ready'
+        )
+    except Exception as e:
+        logger.error("Error in evo_realtime_session: %s", str(e))
+        return create_response(
+            success=False,
+            message='Realtime session failed',
+            error=str(e),
+            status_code=500
+        )
+
+
+@https_fn.on_request(memory=512, max_instances=3, timeout_sec=60, cpu=1, secrets=_LLM_SECRETS)
+def evo_voice_synthesis(req: https_fn.Request) -> https_fn.Response:
+    """Speak a short assistant line (OpenAI TTS, alloy) for voice confirm/dismiss acks."""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+
+    if req.method != 'POST':
+        return create_response(
+            success=False,
+            message='Method not allowed',
+            error='Only POST method is allowed',
+            status_code=405
+        )
+
+    try:
+        data = req.get_json() or {}
+        text = data.get('text') or data.get('message') or data.get('assistant_text')
+        if not isinstance(text, str) or not text.strip():
+            return create_response(
+                success=False,
+                message='Missing required field',
+                error='text is required',
+                status_code=400
+            )
+
+        from chatgpt_wrapper import get_default_wrapper, RateLimitExceededError
+
+        voice = str(data.get('voice') or 'alloy').strip() or 'alloy'
+        audio_format = str(data.get('audio_format') or data.get('audioFormat') or 'mp3').strip().lower()
+
+        wrapper = get_default_wrapper()
+        synthesized = wrapper.synthesize_speech(text.strip(), voice=voice, response_format=audio_format)
+
+        return create_response(
+            data={
+                'audio_base64': synthesized.get('audio_base64'),
+                'audio_format': synthesized.get('audio_format') or audio_format,
+            },
+            message='Voice synthesis successful'
+        )
+    except RateLimitExceededError:
+        return create_response(
+            success=False,
+            message='Rate limit exceeded',
+            error='Too many synthesis requests. Please try again later.',
+            status_code=429
+        )
+    except Exception as e:
+        logger.error("Error in evo_voice_synthesis: %s", str(e))
+        return create_response(
+            success=False,
+            message='Voice synthesis failed',
+            error=str(e),
+            status_code=500
+        )
+
+
+@https_fn.on_request(memory=512, max_instances=5, timeout_sec=60, cpu=1, secrets=_LLM_SECRETS)
+def evo_daily_brief(req: https_fn.Request) -> https_fn.Response:
+    """Proactive coaching brief: today's one focus tied to the user's goal + a humane note on
+    recent consistency. Gathers goal/today/7-day return-rate from Firestore, then generates a
+    short brief. Designed to be called in-app now and scheduled/pushed later."""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+    if req.method != 'POST':
+        return create_response(success=False, message='Method not allowed',
+                               error='Only POST method is allowed', status_code=405)
+
+    try:
+        from chatgpt_wrapper import RateLimitExceededError
+        from voice_tools import (
+            fetch_todos_for_date,
+            fetch_todos_range,
+            _user_timezone,
+            _tool_goals,
+            _score_task,
+            _priority_range,
+        )
+
+        data = req.get_json(silent=True) or {}
+        uid = str(data.get('user_id') or data.get('uid') or '').strip()
+        if not uid:
+            return create_response(success=False, message='Missing user', error='user_id is required', status_code=400)
+
+        language = str(data.get('language') or 'english').strip().lower()
+        is_thai = language in {'thai', 'th', 'ไทย'}
+        moment = str(data.get('moment') or 'morning').strip().lower()
+        if moment not in {'morning', 'evening'}:
+            moment = 'morning'
+
+        tz = _user_timezone(uid)
+        today_str = str(data.get('today') or data.get('todayYmd') or '').strip()[:10]
+        if not today_str:
+            today_str = datetime.now(tz).strftime('%Y-%m-%d')
+
+        try:
+            today_date = datetime.strptime(today_str, '%Y-%m-%d').date()
+        except Exception:
+            today_date = datetime.now(tz).date()
+            today_str = today_date.strftime('%Y-%m-%d')
+
+        # Today's tasks
+        today_todos = fetch_todos_for_date(uid, today_str)
+        today_total = len(today_todos)
+        today_done = sum(1 for t in today_todos if t.get('completed') is True)
+        today_titles = [str(t.get('title') or '').strip() for t in today_todos if str(t.get('title') or '').strip()]
+
+        # Last 7 days: completion + return rhythm (distinct active days, not a streak)
+        week_start = (today_date - timedelta(days=6)).strftime('%Y-%m-%d')
+        week = fetch_todos_range(uid, week_start, today_str)
+        week_total = len(week)
+        week_done = sum(1 for t in week if t.get('completed') is True)
+        active_days = len({
+            str(t.get('date') or '')[:10]
+            for t in week
+            if t.get('completed') is True and str(t.get('date') or '')
+        })
+
+        goals_block = _tool_goals(uid, is_thai) or ("Life goal: not set yet." if not is_thai else "เป้าหมายชีวิต: ยังไม่ได้ตั้ง")
+
+        context_lines = [
+            goals_block,
+            f"Today ({today_str}): {today_total} tasks, {today_done} done."
+            + (f" Titles: {', '.join(today_titles[:6])}." if today_titles else " Nothing scheduled yet."),
+            f"Last 7 days: {week_done}/{week_total} tasks done; active on {active_days} of 7 days.",
+        ]
+
+        # Run the prioritizer (incl. overdue lookback) so the morning focus is principled,
+        # not guessed — the brief leads with the engine's #1.
+        top_focus = None
+        if moment == 'morning':
+            p_start, p_end = _priority_range('day', tz)
+            p_todos = fetch_todos_range(uid, p_start.strftime('%Y-%m-%d'), p_end.strftime('%Y-%m-%d'))
+            p_pending = [t for t in p_todos if t.get('completed') is not True]
+            ranked = sorted(((_score_task(t, today_str), t) for t in p_pending), key=lambda x: -x[0][0])
+            if ranked:
+                top_focus = {
+                    'title': str(ranked[0][1].get('title') or '').strip(),
+                    'reason': ranked[0][0][1],
+                }
+                order = "; ".join(
+                    f"{i + 1}) {str(t.get('title') or '').strip()} ({reason})"
+                    for i, ((_pts, reason), t) in enumerate(ranked[:3])
+                )
+                context_lines.append(f"Priority order (engine): {order}.")
+                if len(p_pending) > 3:
+                    context_lines.append(
+                        f"Load: {len(p_pending)} open — protect rest; the rest can wait."
+                    )
+
+        context_block = "\n".join(context_lines)
+
+        if moment == 'evening':
+            instruction = (
+                "Write a SHORT evening reflection (2-3 sentences, warm, no guilt for misses). "
+                "Acknowledge what they did today, then ask ONE gentle reflective question (what worked / "
+                "how it felt) to help the learning consolidate, connected to their life goal."
+            )
+        else:
+            focus_clause = (
+                f"Make today's ONE focus exactly this task: \"{top_focus['title']}\" ({top_focus['reason']}). "
+                if top_focus and top_focus.get('title')
+                else "Name ONE concrete focus for today (from the tasks if present). "
+            )
+            instruction = (
+                "Write a SHORT morning coaching brief (2-3 sentences, warm, no streak guilt). "
+                + focus_clause
+                + "Tie that focus to the user's life goal / who they're becoming. Add one honest, encouraging "
+                "note on their recent consistency — their return rhythm, not perfection. If they've been "
+                "inactive or overloaded, gently suggest one small rep or a lighter load with real rest."
+            )
+
+        brief_query = (
+            f"{instruction}\n\nReply in {'Thai' if is_thai else 'English'}.\n\n"
+            f"User context:\n{context_block}"
+        )
+
+        pu = get_planner_utils()
+        brief = pu.get_todo_information(brief_query, {}, language, general_coach=True)
+        brief = str(brief or "").strip()
+        if not brief:
+            raise RuntimeError("Empty brief")
+
+        return create_response(
+            data={
+                'brief': brief,
+                'moment': moment,
+                'date': today_str,
+                'signals': {
+                    'today_total': today_total,
+                    'today_done': today_done,
+                    'week_done': week_done,
+                    'week_total': week_total,
+                    'active_days_7': active_days,
+                },
+                'focus': top_focus,
+            },
+            message='Daily brief ready'
+        )
+    except RateLimitExceededError:
+        return create_response(success=False, message='Rate limit exceeded',
+                               error='Too many requests. Please try again later.', status_code=429)
+    except Exception as e:
+        logger.error("Error in evo_daily_brief: %s", str(e))
+        return create_response(success=False, message='Daily brief failed', error=str(e), status_code=500)
 
 
 # @https_fn.on_request(memory=2048, max_instances=3, cpu=2, timeout_sec=300)

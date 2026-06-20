@@ -38,9 +38,12 @@ def get_openai_client():
     """Get or create OpenAI client with lazy initialization."""
     global _openai_client
     if _openai_client is None:
-        api_key = os.getenv("OPENAI_API_KEY")
+        from openai_api_key import resolve_openai_api_key
+        api_key = resolve_openai_api_key()
         if not api_key:
-            raise ValueError("OPENAI_API_KEY environment variable is not set")
+            raise ValueError(
+                "OPENAI_API_KEY is not set (env/Secret Manager or Firestore ai_api_key/open-api-key)"
+            )
         _openai_client = OpenAI(api_key=api_key)
     return _openai_client
 

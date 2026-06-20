@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from dotenv import load_dotenv
 
+from openai_api_key import resolve_openai_api_key
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,7 +33,7 @@ class LogLevel(Enum):
 @dataclass
 class OpenAIConfig:
     """OpenAI API configuration"""
-    api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
+    api_key: str = field(default_factory=resolve_openai_api_key)
     model: str = field(default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-5-mini"))
     max_completion_tokens: int = field(default_factory=lambda: int(os.getenv("OPENAI_max_completion_tokens", "300")))
     temperature: float = field(default_factory=lambda: float(os.getenv("OPENAI_TEMPERATURE", "1.0")))
@@ -94,7 +96,9 @@ class AppConfig:
     def _validate_config(self):
         """Validate configuration values"""
         if not self.openai.api_key:
-            raise ValueError("OPENAI_API_KEY environment variable is required")
+            raise ValueError(
+                "OPENAI_API_KEY is not set (env/Secret Manager or Firestore ai_api_key/open-api-key)"
+            )
         
         if not self.firebase.project_id:
             logger.warning("FIREBASE_PROJECT_ID not set, using default")
