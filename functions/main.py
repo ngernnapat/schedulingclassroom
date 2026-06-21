@@ -7882,10 +7882,11 @@ def _realtime_voice_tool_specs() -> list:
             "type": "function",
             "name": "get_task_detail",
             "description": (
-                "Read the full detail/notes of ONE specific task so you can discuss it with the user "
-                "(e.g. they ask 'what's in my workout?', 'remind me the steps', 'what did I plan for this'). "
-                "get_calendar items include has_detail — if true, you can pull the full text here. Use todo_id "
-                "from get_calendar (or title). To CHANGE the detail afterward, call set_task_detail."
+                "Fetch the full detail/notes of ONE specific task for your context when the user asks about it "
+                "(e.g. 'what's in my workout?', 'remind me the steps'). get_calendar items include has_detail — "
+                "if true, pull the text here. Use todo_id from get_calendar (or title). Summarize aloud in 1-2 "
+                "short sentences — do NOT read the entire saved text unless the user explicitly asks for full "
+                "details ('read it all', 'every step', 'the whole thing'). To CHANGE the detail, call set_task_detail."
             ),
             "parameters": {
                 "type": "object",
@@ -7902,6 +7903,44 @@ def _realtime_voice_tool_specs() -> list:
             "name": "get_active_plans",
             "description": "Fetch the user's active lifestyle plans. Call only when they ask about their plans/programs.",
             "parameters": {"type": "object", "properties": {}},
+        },
+        {
+            "type": "function",
+            "name": "get_daily_notes",
+            "description": (
+                "Read the user's recent DAILY NOTES — short free-form journal entries about how they're "
+                "feeling and how life is going (NOT calendar tasks). Call this when the conversation is about "
+                "mood, energy, stress, reflection, how their week/days have been, or before giving emotional "
+                "support or lifestyle advice, so your response fits how they've actually been. Returns notes "
+                "with dates and optional mood tags."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer", "description": "How many days back to read (default 14, max 60)."}
+                },
+                "required": [],
+            },
+        },
+        {
+            "type": "function",
+            "name": "add_daily_note",
+            "description": (
+                "Log a DAILY NOTE for the user — a short journal entry capturing how they feel or what "
+                "happened today (e.g. 'work was rough, skipped the gym, feeling drained'). Call this when the "
+                "user is venting, reflecting, or asks you to note/journal how their day went — distinct from "
+                "create_task (a to-do). Write the note in their own words, capture an optional one-word mood, "
+                "then respond with genuine empathy."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "The journal entry, in the user's words."},
+                    "mood": {"type": "string", "description": "Optional one-word feeling, e.g. tired, anxious, proud, calm."},
+                    "date": {"type": "string", "description": "Date YYYY-MM-DD the note is about. Default today."},
+                },
+                "required": ["text"],
+            },
         },
         {
             "type": "function",
@@ -7994,6 +8033,27 @@ def _realtime_voice_tool_specs() -> list:
                     "lng": {"type": "number", "description": "Optional longitude; omit to use the device location."},
                 },
                 "required": [],
+            },
+        },
+        {
+            "type": "function",
+            "name": "find_videos",
+            "description": (
+                "Find real YouTube tutorial videos. COST: metered API — call ONLY when the user EXPLICITLY asks "
+                "for a video, tutorial, or something to watch (e.g. 'find me a video', 'show me a tutorial'). "
+                "Do NOT offer or call this proactively — never suggest videos just because a topic is hands-on. "
+                "Build a specific query (e.g. 'tom yum goong recipe', 'beginner squat form'). Returns title, "
+                "channel, and watch URL. Recommend 1-2 by title and channel ONLY — NEVER read URLs aloud; save "
+                "links onto the task with create_task/set_task_detail for tap-to-open."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "What tutorial to find, e.g. 'tom yum recipe', 'squat form'."},
+                    "max": {"type": "integer", "description": "How many results (1-5, default 3)."},
+                    "lang": {"type": "string", "description": "Optional language hint 'th' or 'en' (auto-detected otherwise)."},
+                },
+                "required": ["query"],
             },
         },
         {
@@ -8100,7 +8160,8 @@ def _realtime_voice_tool_specs() -> list:
                 "Create a new calendar task/todo for the user. Call when they ask to add, schedule, "
                 "or remind them of something. When the user wants help DOING the task (e.g. 'I want to "
                 "do shoulder weight training today'), generate a concrete how-to and put it in `detail` — "
-                "exercises with sets/reps, or clear sub-steps. Confirm out loud after creating."
+                "exercises with sets/reps, or clear sub-steps. Confirm the task was created; if you saved "
+                "detail, say it was added to the task — do NOT read the saved detail text aloud."
             ),
             "parameters": {
                 "type": "object",
@@ -8121,7 +8182,8 @@ def _realtime_voice_tool_specs() -> list:
                 "Write a concrete how-to plan onto an EXISTING task's detail — e.g. a shoulder-workout "
                 "breakdown (exercises, sets/reps), a study outline, or step-by-step instructions. First "
                 "find the task via get_calendar for its todo_id, then call this with the detail you generated. "
-                "Set append=true to add to existing notes instead of replacing. Confirm and read the key points."
+                "Set append=true to add to existing notes instead of replacing. Confirm that detail was saved "
+                "to the task — do NOT read the saved text, steps, or links aloud."
             ),
             "parameters": {
                 "type": "object",
@@ -8182,6 +8244,61 @@ def _realtime_voice_tool_specs() -> list:
             ),
             "parameters": {"type": "object", "properties": {}},
         },
+        {
+            "type": "function",
+            "name": "generate_plan",
+            "description": (
+                "Kick off a full multi-day lifestyle PLAN (a structured day-by-day program), NOT a single "
+                "task — e.g. a travel itinerary, a learning/skill program, a workout plan, a budgeting or "
+                "habit plan. Call this ONLY after the user agrees to create the plan and you have gathered "
+                "enough detail to make it fit their life (what they want, their level, constraints, and how "
+                "long/how much time per day). Generation runs in the BACKGROUND — this returns immediately; "
+                "tell the user it's being built and they'll be notified to review the draft. Do NOT use "
+                "create_task for multi-day programs. First call get_goals (and recall_user_notes) so the plan "
+                "connects to their north star and preferences."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "enum": [
+                            "learning",
+                            "exercise",
+                            "travel",
+                            "finance",
+                            "health",
+                            "personal_development",
+                            "other",
+                        ],
+                        "description": "Plan type. Infer it if obvious; pick the closest match.",
+                    },
+                    "goal": {
+                        "type": "string",
+                        "description": (
+                            "Rich, specific summary of what the plan is for, in the user's words — their "
+                            "objective, current level, constraints, equipment/destinations, and anything "
+                            "personal that should shape it. The more concrete, the better the plan."
+                        ),
+                    },
+                    "plan_name": {"type": "string", "description": "Optional short name for the plan."},
+                    "total_days": {"type": "integer", "description": "Length in days (1-90). Omit for a category-typical default."},
+                    "minutes_per_day": {"type": "integer", "description": "Daily time budget in minutes (10-480). Omit for a default."},
+                    "intensity": {
+                        "type": "string",
+                        "enum": ["easy", "moderate", "hard"],
+                        "description": "How challenging the plan should be. Omit for a default.",
+                    },
+                    "start_date": {"type": "string", "description": "Optional preferred start date YYYY-MM-DD."},
+                    "time_of_day": {
+                        "type": "string",
+                        "enum": ["morning", "afternoon", "evening", "flexible"],
+                        "description": "Optional preferred time of day for the activities.",
+                    },
+                },
+                "required": ["goal"],
+            },
+        },
     ]
 
 
@@ -8201,8 +8318,12 @@ def _realtime_instructions(is_thai: bool, today_str: str = "", tz_label: str = "
         "small, consistent, recoverable practice (neuroplasticity), not streak pressure. Missed days are "
         "information; returning is what compounds. Balance pushing them (challenge) with permission to rest. "
         + date_line
-        + "Speak in a fast, natural back-and-forth. Keep replies very short — 1-2 sentences. "
-        "Lead with the direct answer; no preamble. "
+        + "DEFAULT voice style: fast, natural back-and-forth. Keep every reply short — usually 1-2 sentences, "
+        "one key point at a time. Lead with the direct answer; no preamble, no recap of what they just said, "
+        "and no spoken lists unless they asked for steps. "
+        "Expand only when the user asks for more — e.g. 'tell me more', 'go deeper', 'explain that', "
+        "'why?', 'what about…', 'read it all', 'every step' — then give a fuller spoken answer; "
+        "still clear and structured, not an essay. Match the depth they requested. "
         "Know their north star: call get_goals at the start of any direction/meaning conversation and "
         "before suggesting plans, and connect tasks and plans back to that goal and who they're becoming. "
         "When they state or refine a life goal, call set_goal to remember it. "
@@ -8223,6 +8344,12 @@ def _realtime_instructions(is_thai: bool, today_str: str = "", tz_label: str = "
         "EVO tasks around them; if it returns connected:false, suggest they connect Google Calendar from the EVO menu. "
         "Known notes about the user may appear in your context; when a saved detail would help, you can also "
         "call recall_user_notes. Use these to feel like you genuinely know them. "
+        "The user can also keep DAILY NOTES — short journal entries about how they feel and how life is going "
+        "(separate from tasks). When the talk turns to mood, energy, stress, or reflection, call get_daily_notes "
+        "to see how they've actually been and respond with empathy grounded in that — never generic positivity. "
+        "When they vent, reflect, or ask you to jot down how their day went, call add_daily_note (their words + an "
+        "optional one-word mood) and acknowledge it warmly; use create_task only for actual to-dos, not feelings. "
+        "Connect patterns you notice in their notes back to their goal and to recoverable next steps, gently. "
         "Use the get_calendar / get_active_plans / get_profile tools ONLY when the user asks about "
         "their schedule, plans, or progress — never for casual chat. Do not invent calendar events. "
         "If a task from get_calendar has a plan_id and the user wants to dig into the plan or that day, "
@@ -8235,19 +8362,38 @@ def _realtime_instructions(is_thai: bool, today_str: str = "", tz_label: str = "
         "To add a task, call create_task. To reschedule, call move_task; to cancel, call delete_task — "
         "for move/delete, first call get_calendar to find the task's todo_id, then pass that todo_id. "
         "When the user asks about an existing task's details — what's in it, the steps, 'remind me what I "
-        "planned' — call get_task_detail (use the todo_id from get_calendar; items show has_detail) and discuss "
-        "it conversationally. If they then want to change/replace those details, call set_task_detail "
+        "planned' — call get_task_detail for context (use todo_id from get_calendar; items show has_detail), "
+        "but answer with a brief 1-2 sentence summary — do NOT read the full saved text aloud. Only recite the "
+        "full/long detail if they explicitly ask ('read it all', 'every step', 'the whole thing'). "
+        "If they want to change/replace those details, call set_task_detail "
         "(append=false to replace, true to add). "
-        "When the user wants guidance on HOW to do something (e.g. 'I want to do shoulder weight training "
-        "today', 'help me study chapter 3'), generate a concrete, practical plan — exercises with sets/reps, "
-        "or clear sub-steps — and SAVE it onto the task: put it in create_task's `detail` for a new task, or "
-        "call set_task_detail (find the existing task's todo_id via get_calendar first). set_task_detail ADDS "
-        "to any existing notes by default, so you never erase the user's own writing — only pass append=false "
-        "if they explicitly ask to replace. Then read the key points out loud. Keep saved detail concrete and "
-        "usable, not vague. "
+        "When the user wants to know HOW to do something (cook a dish, do an exercise, study a topic, fix "
+        "something), give a brief spoken answer first — one or two sentences or a tiny hint — then offer "
+        "to go deeper if they want. Only walk through full steps aloud when they ask you to expand; "
+        "otherwise save the concrete how-to (ingredients, sets/reps, sub-steps, links) onto the task via "
+        "create_task/set_task_detail so they can read it in the app. Answer with your own words first — do NOT "
+        "offer videos or call find_videos by default; only call find_videos when the user explicitly asks for "
+        "a video, tutorial, or something to watch (it's a metered API). Never read YouTube URLs aloud — "
+        "mention title and channel only, and save the link on the task for tap-to-open. "
+        "When the guidance belongs on a task they'll do later, SAVE it onto the task: put the steps (and a "
+        "chosen video link on its own line) in create_task's `detail` for a new task, or call set_task_detail "
+        "(find the existing task's todo_id via get_calendar first). set_task_detail ADDS to any existing notes "
+        "by default, so you never erase the user's own writing — only pass append=false if they explicitly ask "
+        "to replace. After saving, tell them briefly that you added the detail to the task (they can open it "
+        "in the app) — do NOT read back any of the saved text, steps, or links. Keep saved detail concrete "
+        "and usable, not vague. "
         "For delete_task: never delete without confirming — call it first without confirmed to get a prompt, "
         "ask the user out loud, and only resend with confirmed=true once they agree. After a delete, tell them "
         "they can say 'undo' (which calls restore_task). "
+        "When the user wants to PLAN something bigger than a single task — a trip/itinerary, learning a skill, "
+        "a workout program, budgeting or a new habit — offer to build a full multi-day plan with generate_plan "
+        "(not create_task). First understand the goal: ask 1-2 quick questions for the details that make it fit "
+        "their life (what exactly they want, their level/constraints, how many days, and how much time per day), "
+        "and pull their north star with get_goals plus any saved preferences. Briefly confirm the shape out loud "
+        "('a 7-day Tokyo food-and-temples trip, ~4 hours a day — want me to build it?'). Only after they agree, "
+        "call generate_plan with a rich `goal` describing all of that. It generates in the BACKGROUND and returns "
+        "right away — so tell them it's being built and they'll be notified to review the draft; do NOT wait, "
+        "recite the day-by-day, or claim it's finished. If it asks for more detail, ask one more question and retry. "
         "Other actions take effect immediately, so after the tool returns, confirm out loud exactly what "
         "you did (e.g. 'Added gym tomorrow at 6 PM'). If a tool reports it couldn't find the task, say so. "
     )
@@ -8311,8 +8457,8 @@ def evo_realtime_session(req: https_fn.Request) -> https_fn.Response:
         context_hint = str(data.get('context') or data.get('contextHint') or '').strip()
         if context_hint:
             instructions = (
-                f"{instructions} The user is currently viewing this in the app: "
-                f"{context_hint[:400]} Use it to ground your answers when relevant."
+                f"{instructions} Context about the user (current screen, saved notes, recent daily notes): "
+                f"{context_hint[:1200]} Use it to ground your answers when relevant."
             )
 
         tools = _realtime_voice_tool_specs()
