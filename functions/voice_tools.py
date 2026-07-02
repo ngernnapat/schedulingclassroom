@@ -363,6 +363,14 @@ def detect_voice_tool_requests(
     ):
         tools.add("user_notes")
 
+    if re.search(
+        r"\bbook\b|booking|reserve|\brent\b|rental|borrow|\bhire\b|marketplace|"
+        r"things to book|find me a|looking for a|จอง|เช่า|ยืม|ตลาด|หาคน|หาช่าง|หาแม่บ้าน",
+        blob,
+        re.I,
+    ):
+        tools.add("bookable")
+
     return tools
 
 
@@ -622,6 +630,47 @@ def _tool_active_plans(user_id: str) -> str:
         return ""
 
 
+def _tool_bookable(is_thai: bool) -> str:
+    """Public bookable offerings in the marketplace (discovery context). The
+    voice-secretary path is fetch-only, so this surfaces what's bookable; the
+    realtime voice coach is where an actual booking/demand is created."""
+    db = _evo_db()
+    if not db:
+        return ""
+    try:
+        snap = db.collection("bookingServices").get()
+        items: List[Tuple[str, Any, str]] = []
+        for doc in snap:
+            row = doc.to_dict() or {}
+            if row.get("status") is False:
+                continue
+            title = row.get("bookingItem") or row.get("bookingTitle") or ""
+            if not title:
+                continue
+            loc = row.get("location") or {}
+            place = ""
+            if isinstance(loc, dict):
+                place = loc.get("placeName") or loc.get("address") or ""
+            items.append((title, row.get("bookingPrice"), place))
+        if not items:
+            return ""
+        header = "บริการที่จองได้ในตลาด:" if is_thai else "Bookable in the marketplace:"
+        lines = []
+        for title, price, place in items[:6]:
+            line = f"• {_truncate(title, MAX_TITLE_CHARS)}"
+            if price:
+                line += f" — {price}"
+            if place:
+                line += f" · {place}"
+            lines.append(line)
+        if len(items) > 6:
+            lines.append(f"• +{len(items) - 6} more")
+        return header + "\n" + "\n".join(lines)
+    except Exception as exc:
+        logger.warning("voice_tools bookable failed: %s", exc)
+        return ""
+
+
 def _tool_profile(user_id: str) -> str:
     db = _evo_db()
     if not db or not user_id:
@@ -784,6 +833,10 @@ def build_voice_tool_context(
         plan_block = _tool_active_plans(uid)
         if plan_block:
             blocks.append(plan_block)
+    if "bookable" in tool_ids:
+        bookable_block = _tool_bookable(is_thai)
+        if bookable_block:
+            blocks.append(bookable_block)
     if "profile" in tool_ids:
         profile_block = _tool_profile(uid)
         if profile_block:

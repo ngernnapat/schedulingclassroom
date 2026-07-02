@@ -5678,6 +5678,86 @@ def encourage_in_the_morning(req: https_fn.Request) -> https_fn.Response:
         )
 
 
+@https_fn.on_request(memory=512, max_instances=5, timeout_sec=90, cpu=1, secrets=_LLM_SECRETS)
+def suggest_personalized_content(req: https_fn.Request) -> https_fn.Response:
+    """Rank booking + planner candidates for a user; used by backend suggestion cache."""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+
+    if req.method != 'POST':
+        return create_response(
+            success=False,
+            message='Method not allowed',
+            error='Only POST method is allowed',
+            status_code=405
+        )
+
+    try:
+        data = req.get_json() or {}
+        booking_candidates = data.get('booking_candidates')
+        planner_candidates = data.get('planner_candidates')
+        if booking_candidates is not None and not isinstance(booking_candidates, list):
+            return create_response(
+                success=False,
+                message='Invalid field',
+                error='booking_candidates must be an array',
+                status_code=400
+            )
+        if planner_candidates is not None and not isinstance(planner_candidates, list):
+            return create_response(
+                success=False,
+                message='Invalid field',
+                error='planner_candidates must be an array',
+                status_code=400
+            )
+
+        user_context = data.get('user_context')
+        if user_context is not None and not isinstance(user_context, dict):
+            user_context = None
+
+        user_id = data.get('user_id')
+        if user_id and isinstance(user_id, str) and user_id.strip():
+            try:
+                from user_memory import retrieve_user_context
+                rag = retrieve_user_context(
+                    user_id.strip(),
+                    "goals habits interests booking planner lifestyle",
+                    top_k=4
+                )
+                if rag:
+                    user_context = dict(user_context or {})
+                    user_context['rag_snippets'] = rag[:4]
+            except Exception as e:
+                logger.warning("RAG retrieval failed in suggest_personalized_content: %s", e)
+
+        pu = get_planner_utils()
+        suggestions = pu.suggest_personalized_content(
+            user_context=user_context,
+            booking_candidates=booking_candidates if isinstance(booking_candidates, list) else [],
+            planner_candidates=planner_candidates if isinstance(planner_candidates, list) else [],
+            language=data.get('language', 'english'),
+        )
+        if suggestions is None:
+            return create_response(
+                success=False,
+                message='Suggestion generation failed',
+                error='Could not rank candidates',
+                status_code=500
+            )
+        return create_response(
+            data={'suggestions': suggestions},
+            message='Personalized suggestions generated successfully'
+        )
+    except Exception as e:
+        logger.error("Error in suggest_personalized_content: %s", str(e))
+        return create_response(
+            success=False,
+            message='Suggestion generation failed',
+            error=str(e),
+            status_code=500
+        )
+
+
 @https_fn.on_request(memory=512, max_instances=5, timeout_sec=60, cpu=1, secrets=_LLM_SECRETS)
 def evening_compliment(req: https_fn.Request) -> https_fn.Response:
     """Generate a single evening compliment for push notifications (light model)."""
@@ -6365,6 +6445,81 @@ def todo_fate_prediction(req: https_fn.Request) -> https_fn.Response:
             error=f'Failed to generate todo fate prediction: {str(e)}',
             status_code=500
         )
+
+
+@https_fn.on_request(memory=512, max_instances=3, timeout_sec=60, cpu=1, secrets=_LLM_SECRETS)
+def evo_fate_reading(req: https_fn.Request) -> https_fn.Response:
+    """Thai-style spoken fate reading for realtime voice (birth-day symbolism + topic)."""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+
+    if req.method != 'POST':
+        return create_response(
+            success=False,
+            message='Method not allowed',
+            error='Only POST method is allowed',
+            status_code=405
+        )
+
+    try:
+        data = req.get_json(silent=True) or {}
+        birth_date = str(data.get('birth_date') or data.get('dateOfBirth') or '').strip()[:10]
+        if not birth_date:
+            return create_response(
+                success=False,
+                message='Missing required field',
+                error='birth_date is required (YYYY-MM-DD)',
+                status_code=400
+            )
+
+        topic = str(data.get('topic') or 'general').strip().lower() or 'general'
+        language = str(data.get('languageSelected') or data.get('language') or 'thai').strip().lower()
+        birth_time = str(data.get('birth_time') or data.get('birthTime') or '').strip() or None
+        thai_birth_day = data.get('thai_birth_day') if isinstance(data.get('thai_birth_day'), dict) else None
+        todo_data = data.get('todo_data') if isinstance(data.get('todo_data'), list) else None
+        profile_hints = data.get('profile_hints') if isinstance(data.get('profile_hints'), dict) else None
+
+        pu = get_planner_utils()
+        response = pu.predict_thai_fate_reading(
+            birth_date=birth_date,
+            topic=topic,
+            language=language,
+            birth_time=birth_time,
+            thai_birth_day=thai_birth_day,
+            todo_data=todo_data,
+            profile_hints=profile_hints,
+        )
+        if not response:
+            return create_response(
+                success=False,
+                message='Fate reading generation failed',
+                error='Empty response from model',
+                status_code=502
+            )
+        return create_response(
+            data={'reading': response, 'topic': topic, 'birth_date': birth_date},
+            message='Fate reading generated'
+        )
+    except Exception as e:
+        from chatgpt_wrapper import RateLimitExceededError
+        if isinstance(e, RateLimitExceededError):
+            retry_after = getattr(e, 'retry_after', None)
+            extra_headers = {'Retry-After': str(int(retry_after))} if retry_after else None
+            return create_response(
+                success=False,
+                message='Rate limit exceeded',
+                error='Too many requests. Please try again later.',
+                status_code=429,
+                extra_headers=extra_headers
+            )
+        logger.error("Error in evo_fate_reading: %s", str(e))
+        return create_response(
+            success=False,
+            message='Fate reading failed',
+            error=str(e),
+            status_code=500
+        )
+
 
 @https_fn.on_request(memory=1024, max_instances=3, timeout_sec=540, cpu=1, secrets=_LLM_SECRETS)
 def generate_todo_data_from_user_input(req: https_fn.Request) -> https_fn.Response:
@@ -7924,13 +8079,24 @@ def _realtime_voice_tool_specs() -> list:
         },
         {
             "type": "function",
+            "name": "get_runes",
+            "description": (
+                "Read the Elder Futhark runes the user has EARNED in EVO — each is an identity "
+                "milestone with a divinatory meaning (e.g. Fehu = wealth/completing what you begin). "
+                "Call this when giving the user a fate/fortune reading so you can weave the meanings of "
+                "their actual earned runes into it. Returns each rune's name, meaning, and becoming-phrase."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+        {
+            "type": "function",
             "name": "add_daily_note",
             "description": (
                 "Log a DAILY NOTE for the user — a short journal entry capturing how they feel or what "
                 "happened today (e.g. 'work was rough, skipped the gym, feeling drained'). Call this when the "
                 "user is venting, reflecting, or asks you to note/journal how their day went — distinct from "
                 "create_task (a to-do). Write the note in their own words, capture an optional one-word mood, "
-                "then respond with genuine empathy."
+                "then briefly tell them the note was saved and respond with genuine empathy."
             ),
             "parameters": {
                 "type": "object",
@@ -8037,6 +8203,27 @@ def _realtime_voice_tool_specs() -> list:
         },
         {
             "type": "function",
+            "name": "get_location_time",
+            "description": (
+                "Get the user's CURRENT local time, date, weekday, timezone, and approximate location "
+                "(latitude/longitude + a human area name like 'Thonglor, Bangkok'). Call this when the user "
+                "asks where they are or what time it is, or when a suggestion should be grounded in their real "
+                "place or the current moment (what to do right now, nearby ideas, time-of-day planning). "
+                "Location is permission-gated — if it returns null, just use the time and don't guess where they are."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "include_location": {
+                        "type": "boolean",
+                        "description": "Set false to get time only (skips the GPS lookup). Default true.",
+                    }
+                },
+                "required": [],
+            },
+        },
+        {
+            "type": "function",
             "name": "find_videos",
             "description": (
                 "Find real YouTube tutorial videos. COST: metered API — call ONLY when the user EXPLICITLY asks "
@@ -8076,15 +8263,19 @@ def _realtime_voice_tool_specs() -> list:
             "type": "function",
             "name": "open_map",
             "description": (
-                "Open a place or location in the maps app for the user. Call after recommending a place "
-                "(pass its place_id from find_places) or when the user asks to see/navigate to somewhere."
+                "Open a place or location in the maps app for the user. After find_places, pass maps_url "
+                "(preferred) or place_id + name + address from the result. Do not call with only a vague name."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "place_id": {"type": "string", "description": "place_id from a find_places result (most precise)."},
-                    "name": {"type": "string", "description": "Place name (fallback if no place_id)."},
-                    "query": {"type": "string", "description": "Free-text location to search (fallback)."},
+                    "maps_url": {"type": "string", "description": "maps_url from find_places (preferred — opens the exact place)."},
+                    "place_id": {"type": "string", "description": "place_id from find_places (use with name and address)."},
+                    "name": {"type": "string", "description": "Place name from find_places."},
+                    "address": {"type": "string", "description": "Full address from find_places."},
+                    "lat": {"type": "number", "description": "Latitude from find_places (optional fallback)."},
+                    "lng": {"type": "number", "description": "Longitude from find_places (optional fallback)."},
+                    "query": {"type": "string", "description": "Free-text location to search (only if no find_places result)."},
                     "area": {"type": "string", "description": "Area to disambiguate the fallback search."},
                 },
                 "required": [],
@@ -8160,8 +8351,9 @@ def _realtime_voice_tool_specs() -> list:
                 "Create a new calendar task/todo for the user. Call when they ask to add, schedule, "
                 "or remind them of something. When the user wants help DOING the task (e.g. 'I want to "
                 "do shoulder weight training today'), generate a concrete how-to and put it in `detail` — "
-                "exercises with sets/reps, or clear sub-steps. Confirm the task was created; if you saved "
-                "detail, say it was added to the task — do NOT read the saved detail text aloud."
+                "exercises with sets/reps, or clear sub-steps. After saving, briefly tell the user the task "
+                "was added to their calendar; if you saved detail, say it was added to the task — do NOT read "
+                "the saved detail text aloud."
             ),
             "parameters": {
                 "type": "object",
@@ -8170,7 +8362,10 @@ def _realtime_voice_tool_specs() -> list:
                     "date": {"type": "string", "description": "Date as YYYY-MM-DD. Default today if unsaid."},
                     "time": {"type": "string", "description": "Start time as 24h HH:MM. Omit if no specific time."},
                     "detail": {"type": "string", "description": "Concrete how-to steps for the task (exercises/sets/reps, or sub-steps) when guidance helps; else short notes."},
-                    "location": {"type": "string", "description": "Optional location."},
+                    "location": {"type": "string", "description": "Optional location label (legacy). Prefer address + lat/lng from find_places."},
+                    "address": {"type": "string", "description": "Full venue address from find_places (shows map preview on the task)."},
+                    "lat": {"type": "number", "description": "Latitude from find_places."},
+                    "lng": {"type": "number", "description": "Longitude from find_places."},
                 },
                 "required": ["title"],
             },
@@ -8299,28 +8494,353 @@ def _realtime_voice_tool_specs() -> list:
                 "required": ["goal"],
             },
         },
+        {
+            "type": "function",
+            "name": "get_fate_context",
+            "description": (
+                "Gather saved birth/fate data before a ดูดวง / fortune / fate reading. Call when the user "
+                "asks to see their fortune, horoscope, or Thai-style path reading. Returns birth date from "
+                "profile, any fate notes saved earlier, Thai birth-day symbolism, and what's still missing. "
+                "If birth_date or topic is missing, ask the user out loud for it — do NOT call read_fate yet."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "enum": ["love", "career", "money", "health", "general"],
+                        "description": "What area to read, if the user already said (else omit).",
+                    }
+                },
+                "required": [],
+            },
+        },
+        {
+            "type": "function",
+            "name": "read_fate",
+            "description": (
+                "Generate a Thai-style spoken fate reading once you have birth_date (YYYY-MM-DD) and a topic. "
+                "Call get_fate_context first. If birth_time is unknown, proceed without it. Returns reading text "
+                "to speak aloud — poetic หมอดู tone, agency-forward. After delivering it, offer to save birth "
+                "details with save_fate_profile so the next reading is faster."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "birth_date": {"type": "string", "description": "Birth date YYYY-MM-DD (from profile or user)."},
+                    "birth_time": {"type": "string", "description": "Optional birth time HH:MM (24h)."},
+                    "topic": {
+                        "type": "string",
+                        "enum": ["love", "career", "money", "health", "general"],
+                        "description": "Area to read. Default general.",
+                    },
+                },
+                "required": ["birth_date", "topic"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "save_fate_profile",
+            "description": (
+                "Save birth/fate details for reuse next time — birth date, birth time, or other divination "
+                "preferences. Call when the user agrees to remember their birth info after a reading, or when "
+                "they share birth details you should keep. Confirm briefly out loud after saving."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "birth_date": {"type": "string", "description": "Birth date YYYY-MM-DD to save on profile."},
+                    "birth_time": {"type": "string", "description": "Birth time HH:MM to remember."},
+                    "note": {"type": "string", "description": "Any extra fate preference in the user's words."},
+                },
+                "required": [],
+            },
+        },
+        {
+            "type": "function",
+            "name": "find_offerings",
+            "description": (
+                "Search bookable offerings other EVO users host — rooms/stays, gear/apparatus to borrow or "
+                "rent, services, classes, experiences. Call this when the user wants to BOOK or RENT something, "
+                "or asks what's available to book (e.g. 'find a place to stay', 'rent a bike', 'book a tennis "
+                "court', 'book apparatus at Khon Kaen'). When they name a place or city, pass it as `area` and "
+                "keep `query` to the thing itself (e.g. query='apparatus', area='Khon Kaen'). Returns each "
+                "offering's title, price, type, capacity, location, and the booking_item_id + owner_uid needed "
+                "to check availability or book. Omit query to list what's available."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Keyword(s): what they want to book (e.g. 'kayak', 'studio', 'apparatus')."},
+                    "area": {"type": "string", "description": "Location/city/neighborhood to filter by, if they mention one (e.g. 'Khon Kaen')."},
+                    "max": {"type": "integer", "description": "Max results (default 10)."},
+                },
+                "required": [],
+            },
+        },
+        {
+            "type": "function",
+            "name": "get_offering_availability",
+            "description": (
+                "Check which days/slots an offering is open and roughly how many spots remain, before booking. "
+                "Call after find_offerings (use its booking_item_id + owner_uid) when the user picks something "
+                "and you need to confirm a date works. Returns per-day availability over a window (default the "
+                "next 2 weeks); pass start_date/end_date to narrow it. Remaining counts are advisory — the final "
+                "capacity check happens when you book."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "booking_item_id": {"type": "string", "description": "From a find_offerings result."},
+                    "owner_uid": {"type": "string", "description": "Offering owner uid from find_offerings."},
+                    "start_date": {"type": "string", "description": "Window start YYYY-MM-DD (default today)."},
+                    "end_date": {"type": "string", "description": "Window end YYYY-MM-DD (default +13 days)."},
+                },
+                "required": ["booking_item_id"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "book_offering",
+            "description": (
+                "Book an offering for the user. Two-phase like delete: call FIRST without confirmed to get a "
+                "summary (title, date, time, price, whether it needs the host's approval), read it back and ask "
+                "the user to confirm out loud, then call again with confirmed=true. Use booking_item_id + "
+                "owner_uid from find_offerings and an explicit YYYY-MM-DD date. For time-slot offerings pass the "
+                "chosen slot in `time` (from get_offering_availability); all-day/stay offerings need no time. "
+                "Capacity, price, and availability are verified server-side; if it returns an error (e.g. fully "
+                "booked) tell the user. If it returns needs_input='date' (with available_dates) or "
+                "needs_input='time' (with available_slots), offer those options, ask the user to pick, then call "
+                "again with their choice. After a successful booking, confirm what was booked, and note if it's "
+                "pending the host's approval."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "booking_item_id": {"type": "string", "description": "From a find_offerings result."},
+                    "owner_uid": {"type": "string", "description": "Offering owner uid from find_offerings."},
+                    "date": {"type": "string", "description": "Date to book, YYYY-MM-DD."},
+                    "time": {"type": "string", "description": "Time slot HH:MM for slot offerings; omit for all-day/stay."},
+                    "units": {"type": "integer", "description": "Quantity to book (default 1)."},
+                    "confirmed": {"type": "boolean", "description": "Pass true ONLY after the user confirms out loud."},
+                },
+                "required": ["booking_item_id", "owner_uid", "date"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "create_demand",
+            "description": (
+                "Post a REQUEST (a 'demand') to the EVO marketplace when the user wants something NOBODY has "
+                "listed yet — they want to hire a person/service or rent gear, and you should let hosts come to "
+                "them (e.g. 'find me a cleaner this weekend', 'I need a drone to rent Saturday', 'looking for a "
+                "math tutor'). Use this when find_offerings has nothing matching, or the user clearly wants to "
+                "broadcast a need rather than book an existing listing. Two-phase like booking: call FIRST "
+                "without confirmed to get a summary, read it back (what, type, when, where) and ask the user to "
+                "confirm, then call again with confirmed=true. After posting, tell them hosts can now respond and "
+                "they'll be notified — they can check offers later (get_my_demands)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Short request title, e.g. 'House cleaner', 'Drone rental'."},
+                    "description": {"type": "string", "description": "Any details that help hosts respond (scope, size, preferences)."},
+                    "experience_type": {
+                        "type": "string",
+                        "enum": ["human_service", "gadget"],
+                        "description": "human_service = hiring a person/service; gadget = renting/borrowing a thing. Inferred if omitted.",
+                    },
+                    "date": {"type": "string", "description": "Date wanted YYYY-MM-DD (or omit if flexible)."},
+                    "time_start": {"type": "string", "description": "Optional start time HH:MM."},
+                    "time_end": {"type": "string", "description": "Optional end time HH:MM."},
+                    "flexible_time": {"type": "boolean", "description": "True if timing is flexible."},
+                    "area": {"type": "string", "description": "Where the user needs it (neighborhood/city), if mentioned."},
+                    "confirmed": {"type": "boolean", "description": "Pass true ONLY after the user confirms out loud."},
+                },
+                "required": ["title"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "get_my_demands",
+            "description": (
+                "List the user's own marketplace requests (demands) they've posted, with how many hosts have "
+                "responded to each. Call when the user asks about their requests / whether anyone replied / the "
+                "status of something they asked you to find. Returns title, type, date, status, and response count."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+        {
+            "type": "function",
+            "name": "find_open_requests",
+            "description": (
+                "Find OPEN requests OTHER people posted that the user could fulfil and offer on — the marketplace "
+                "demand board (e.g. 'what can I help with', 'any requests near me', 'who needs a drone'). Returns "
+                "each request's demand_id, title, type, date, area, and requester_name. Pass `area` for a place/city "
+                "and/or `query` for keywords. To actually offer on one, use offer_on_request with its demand_id."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Keyword(s) for the kind of request (e.g. 'cleaner', 'drone')."},
+                    "area": {"type": "string", "description": "Location/city to filter by, if mentioned."},
+                    "max": {"type": "integer", "description": "Max results (default 10)."},
+                },
+                "required": [],
+            },
+        },
+        {
+            "type": "function",
+            "name": "get_demand_offers",
+            "description": (
+                "List the OFFERS the user has received on THEIR OWN requests, with each responder's name, price, "
+                "pickup, message and rating/review_count. Call when the user asks who offered / to compare offers / "
+                "to check a responder's reviews before choosing. The user picks/chats with an offer in the app's "
+                "Requests screen (View offers)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "max": {"type": "integer", "description": "Max requests to include (default 10)."}
+                },
+                "required": [],
+            },
+        },
+        {
+            "type": "function",
+            "name": "offer_on_request",
+            "description": (
+                "Offer to fulfil someone else's open request, opening a deal chat with them. Two-phase like "
+                "book_offering: call FIRST without confirmed to get a summary, read back the request + your price, "
+                "ask the user to confirm out loud, then call again with confirmed=true. Use a demand_id from "
+                "find_open_requests. After it returns, tell them the deal chat is open (or that their offer is queued)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "demand_id": {"type": "string", "description": "From a find_open_requests result."},
+                    "price": {"type": "string", "description": "The price the user offers (THB), if stated."},
+                    "pickup": {"type": "string", "description": "Pickup/meet-up location, if relevant."},
+                    "message": {"type": "string", "description": "Short note to the requester (how they can help)."},
+                    "confirmed": {"type": "boolean", "description": "Pass true ONLY after the user confirms out loud."},
+                },
+                "required": ["demand_id"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "get_booking_suggestions",
+            "description": (
+                "Get bookable experiences worth SUGGESTING to the user — ranked against their life goal and "
+                "active plans. Call this to proactively recommend something to do when the user has free time, "
+                "asks what to do / for an idea / is bored, or when a real experience would serve a goal you're "
+                "discussing. Returns offerings with a short reason; suggest ONE warmly, tie it to their goal, "
+                "then offer to check availability (get_offering_availability) or book it (book_offering)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "max": {"type": "integer", "description": "How many to consider (default 3)."}
+                },
+                "required": [],
+            },
+        },
+        {
+            "type": "function",
+            "name": "get_planner_suggestions",
+            "description": (
+                "Get lifestyle PLANS / programs worth SUGGESTING to the user — public planner content ranked "
+                "against their life goal and active plans. Call this when the user wants a routine or program to "
+                "follow, asks you to recommend or find a plan, or when a structured multi-day plan would serve a "
+                "goal you're discussing. Returns plans with a short reason; suggest ONE warmly, tie it to their "
+                "goal, then offer to open it so they can explore or add it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "max": {"type": "integer", "description": "How many to consider (default 3)."}
+                },
+                "required": [],
+            },
+        },
+        {
+            "type": "function",
+            "name": "get_bookings_to_reflect",
+            "description": (
+                "List experiences the user BOOKED whose date has recently passed and that they haven't reflected "
+                "on yet. Call at a natural moment (start of a session, or when talk turns to how things are going) "
+                "so you can proactively ask how a past booking went. Returns each booking's todo_id, title, date."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer", "description": "How many days back to look (default 7)."}
+                },
+                "required": [],
+            },
+        },
+        {
+            "type": "function",
+            "name": "reflect_on_booking",
+            "description": (
+                "Save the user's reflection on a past booked experience (how it went, how it felt, what they "
+                "learned). Call after they share it, using the todo_id from get_bookings_to_reflect. Capture their "
+                "words; pass an optional 1-5 rating. The reflection is saved on the booking and into your long-term "
+                "memory, so connect it back to their goal and growth. Confirm briefly after saving."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todo_id": {"type": "string", "description": "todo_id from get_bookings_to_reflect."},
+                    "reflection": {"type": "string", "description": "The user's reflection, in their own words."},
+                    "title": {"type": "string", "description": "Booking title, for the saved note."},
+                    "rating": {"type": "integer", "description": "Optional satisfaction rating 1-5."},
+                },
+                "required": ["todo_id", "reflection"],
+            },
+        },
     ]
 
 
-def _realtime_instructions(is_thai: bool, today_str: str = "", tz_label: str = "") -> str:
+def _realtime_instructions(is_thai: bool, today_str: str = "", tz_label: str = "", now_time: str = "") -> str:
     date_line = ""
     if today_str:
+        time_part = f" The current local time is {now_time}." if now_time else ""
         date_line = (
             f"Today's date is {today_str}"
-            + (f" ({tz_label} time). " if tz_label else ". ")
-            + "Resolve relative dates yourself: 'tomorrow' is the day after today's date, "
+            + (f" ({tz_label} time)." if tz_label else ".")
+            + time_part
+            + " Resolve relative dates yourself: 'tomorrow' is the day after today's date, "
             "'next week' is 7 days out, etc. Always pass an explicit YYYY-MM-DD date to the "
-            "task tools — never assume today unless the user clearly means today. "
+            "task tools — never assume today unless the user clearly means today. For the precise "
+            "current time or the user's location, call get_location_time. "
         )
     base = (
-        "You are EVO AI — the realtime voice coach inside the EVO lifestyle app. Your mission is to "
-        "understand the user's lifestyle and help them evolve toward their life goal and meaning — through "
-        "small, consistent, recoverable practice (neuroplasticity), not streak pressure. Missed days are "
-        "information; returning is what compounds. Balance pushing them (challenge) with permission to rest. "
+        "You are EVO AI — the realtime voice assistant inside the EVO lifestyle app. You are the user's personal "
+        "lifestyle assistant, not only a goal coach: help them DESIGN the life they want and actually GET it, "
+        "across both INTERNAL growth (self-improvement, habits, learning, focus, wellbeing, meaning) and EXTERNAL "
+        "wants (real-world experiences, places, bookings, services, things to do). FIRST understand them — pay "
+        "attention and ask to learn their lifestyle and what they like; keep the conversation clean and let the "
+        "user lead. Do NOT pitch suggestions, plans, or bookings unprompted or at the start of a session. Only "
+        "when they ASK (or when it clearly serves what you're already discussing) suggest an experience, place, "
+        "plan or booking, then help them act on it — schedule it, plan it, or book it. "
+        "DISCOVERABILITY (so they know what you can do without you pitching): if the user seems unsure what to "
+        "ask, goes quiet, or asks what you can do, briefly name a few things that fit them — plan their day or a "
+        "multi-day plan, find places and experiences near them, book or rent things, journal how they're feeling, "
+        "or talk through their goals — then let them pick one. And when a chance naturally fits what you're "
+        "already discussing, you MAY offer ONE relevant next step (a plan, a place, a booking) — one idea, only "
+        "when it serves the moment, never a list of pitches. "
+        "Growth comes through small, consistent, recoverable practice (neuroplasticity), "
+        "not streak pressure; missed days are information and returning is what compounds; balance challenge with "
+        "permission to rest. "
         + date_line
         + "DEFAULT voice style: fast, natural back-and-forth. Keep every reply short — usually 1-2 sentences, "
         "one key point at a time. Lead with the direct answer; no preamble, no recap of what they just said, "
         "and no spoken lists unless they asked for steps. "
+        "NEVER sit in silence while a tool runs: the moment you decide to look something up, book, or plan, say "
+        "a quick natural filler first (e.g. 'Let me check…', 'One sec…', 'เดี๋ยวเช็คให้นะ') so the user hears "
+        "that you're on it, then speak the result when the tool returns. For a multi-step flow (booking, plan "
+        "building) keep up a light running word as you go rather than going quiet between steps. "
         "Expand only when the user asks for more — e.g. 'tell me more', 'go deeper', 'explain that', "
         "'why?', 'what about…', 'read it all', 'every step' — then give a fuller spoken answer; "
         "still clear and structured, not an essay. Match the depth they requested. "
@@ -8332,10 +8852,11 @@ def _realtime_instructions(is_thai: bool, today_str: str = "", tz_label: str = "
         "When they ask for a place (bar, cafe, restaurant, gym…), call find_places — shape the query with "
         "what you know they like (e.g. likes IPA → 'craft beer bar'). For 'near me'/'nearby' OMIT area so it "
         "searches the user's current location; pass area only when they name a place. Recommend 1-3 real venues "
-        "with rating and whether they're open, then offer to open one with open_map. Don't invent addresses — "
-        "if find_places returns nothing, say so rather than guessing. When you SAVE a recommended place onto a "
-        "task (create_task/set_task_detail), write each on its own line as 'Name — full address' (you may also "
-        "include its maps_url); the app turns addresses into a tappable Open-in-Maps link. "
+        "with rating and whether they're open, then offer to open one with open_map — pass maps_url from the "
+        "find_places result (or place_id + name + address); never call open_map with only a bare name. "
+        "Don't invent addresses — if find_places returns nothing, say so rather than guessing. When you SAVE a "
+        "recommended place onto a task (create_task), pass address + lat + lng from find_places so the calendar "
+        "shows a map preview; also put 'Name — full address' and maps_url in detail. "
         "get_conditions already uses the current location automatically. "
         "When a suggestion depends on being outside (running, cycling, a walk), or the user asks about weather/air, "
         "call get_conditions and adapt: unhealthy air quality or rain/extreme heat → suggest an indoor option or a "
@@ -8348,8 +8869,26 @@ def _realtime_instructions(is_thai: bool, today_str: str = "", tz_label: str = "
         "(separate from tasks). When the talk turns to mood, energy, stress, or reflection, call get_daily_notes "
         "to see how they've actually been and respond with empathy grounded in that — never generic positivity. "
         "When they vent, reflect, or ask you to jot down how their day went, call add_daily_note (their words + an "
-        "optional one-word mood) and acknowledge it warmly; use create_task only for actual to-dos, not feelings. "
+        "optional one-word mood), then briefly tell them the note was saved; use create_task only for actual "
+        "to-dos, not feelings. "
         "Connect patterns you notice in their notes back to their goal and to recoverable next steps, gently. "
+        "A 'Who this user is' summary (their goal/identity, personality, work, saved preferences, and recent "
+        "mood pattern) may appear in your context. Use ALL of it to build a real sense of WHO this person is, "
+        "and tailor every suggestion to their character and rhythm — never generic advice. The more they talk "
+        "with you, the better you should know them: when you learn a durable trait, value, or preference, save "
+        "it with remember_about_user so your understanding keeps deepening over time. "
+        "If the user asks for a 'reading', their fortune, fate, what's ahead, or 'ดูดวง', give a SHORT, warm, "
+        "personal reading of their path — grounded in what you actually know about them (goal/identity, recent "
+        "moods and journal, and how consistently they show up), like a caring friend with a little intuition, "
+        "not a fairground psychic. You may call get_goals, get_daily_notes, prioritize_tasks, or get_runes to "
+        "ground it — when they ask for a reading, prefer calling get_runes and weave the meanings of the Elder "
+        "Futhark runes they've actually earned into what you sense about their path. "
+        "Each time pick only ONE or TWO of: their future direction, hidden potential, love, or karma — never all "
+        "at once. Add one encouraging insight and, gently, one thing to be careful of. Frame fate the EVO way: "
+        "their path is shaped by what they repeatedly practice — small consistent actions are the karma that "
+        "bends their future — so it stays hopeful and in their hands, never fatalistic or scary. Keep it to "
+        "2-4 sentences and end on something that makes them feel truly seen; if you don't know enough yet, read "
+        "what you can and warmly invite them to share more. "
         "Use the get_calendar / get_active_plans / get_profile tools ONLY when the user asks about "
         "their schedule, plans, or progress — never for casual chat. Do not invent calendar events. "
         "If a task from get_calendar has a plan_id and the user wants to dig into the plan or that day, "
@@ -8394,13 +8933,66 @@ def _realtime_instructions(is_thai: bool, today_str: str = "", tz_label: str = "
         "call generate_plan with a rich `goal` describing all of that. It generates in the BACKGROUND and returns "
         "right away — so tell them it's being built and they'll be notified to review the draft; do NOT wait, "
         "recite the day-by-day, or claim it's finished. If it asks for more detail, ask one more question and retry. "
+        "FATE / ดูดวง: when the user asks for fortune, horoscope, or a Thai-style path reading, call get_fate_context "
+        "first. If birth_date is missing, ask for it (and optionally birth time) before read_fate. Pick topic from "
+        "what they said (love, career, money, health, or general). Call read_fate with birth_date + topic, then speak "
+        "the returned reading in a warm หมอดู tone — do not invent a second reading. Afterward, offer to save their "
+        "birth details with save_fate_profile so next time is instant; only call save_fate_profile after they agree. "
+        "BOOKING (discover → check → book): EVO unifies bookable experiences into the planner, so when the user "
+        "wants to book, rent, reserve, or borrow something — a stay, gear, a court, a class, a service — call "
+        "find_offerings (shape the query from what they want). Recommend 1-2 real matches with price and where "
+        "they are; never invent offerings — if it returns nothing, say so. When they pick one, call "
+        "get_offering_availability (booking_item_id + owner_uid) to confirm the date is open, and offer the "
+        "nearest open day if theirs is full. To book, call book_offering FIRST without confirmed to get the "
+        "summary, read back the title/date/time/price (and whether it needs the host's approval), and ask them "
+        "to confirm — only then call book_offering again with confirmed=true. After it succeeds, say exactly "
+        "what you booked and, if it's pending the host's approval, that they'll be notified when it's confirmed. "
+        "POSTING A REQUEST (the other direction): when the user wants something NOBODY has listed — hire a person "
+        "or service, or rent gear that find_offerings didn't turn up ('find me a cleaner this weekend', 'I need a "
+        "drone Saturday', 'looking for a tutor') — offer to POST A REQUEST so hosts come to them. Gather the "
+        "essentials in 1-2 quick questions (what exactly, when, and roughly where), then call create_demand FIRST "
+        "without confirmed to get the summary, read it back and ask them to confirm, and only then call it again "
+        "with confirmed=true. Tell them the request is live, hosts can now respond, and they'll be notified — they "
+        "can ask you anytime how many offers came in (get_my_demands), or to see the actual offers with each "
+        "responder's price and rating (get_demand_offers) so they can compare before choosing in the app. Prefer "
+        "booking an existing listing when one fits (find_offerings); use create_demand when nothing matches or they "
+        "clearly want to broadcast a need. "
+        "REQUEST MARKETPLACE (responder side): when the user wants to HELP others / earn / find requests to fulfil "
+        "('what can I help with', 'any requests near me', 'who needs X'), call find_open_requests (pass area/query) "
+        "and read back a couple. To offer on one, use offer_on_request with its demand_id — two-phase: call without "
+        "confirmed to summarize the request + their price, confirm out loud, then call with confirmed=true; tell them "
+        "the deal chat is open (or their offer is queued). "
+        "GUIDED VOICE BOOKING — when the user wants to book or rent something, carry it all the way to a confirmed "
+        "booking, gathering details ONE step at a time (never ask for everything at once, and never re-ask what they "
+        "already told you): (1) if you don't already have a specific listing, call find_offerings and read back the "
+        "best one or two matches; (2) once they choose one, if you don't have a date, ask for it, then call "
+        "get_offering_availability to confirm that day is open; (3) for time-slot offerings, ask which slot from the "
+        "open ones; (4) ask how many only if more than one is possible; (5) call book_offering WITHOUT confirmed to "
+        "get the summary, read back the title, date, time, price and whether it needs the host's approval, and ask "
+        "them to confirm out loud; (6) only then call book_offering with confirmed=true. Let the tool returns guide "
+        "you: needs_input='date' comes with available_dates and needs_input='time' with available_slots — offer "
+        "those and ask which; if a date is unavailable or it comes back fully booked, DON'T stop — suggest the next "
+        "open date or slot and keep going until it's booked or the user calls it off. After it books, confirm exactly "
+        "what was booked and say if it's pending the host's approval. "
+        "SUGGESTING IS REACTIVE — never at the start of a session, never unprompted: only when the user ASKS what "
+        "to do / for an idea / something to book, call get_booking_suggestions and offer ONE that fits, tied to "
+        "their goal (e.g. 'this pottery class fits your make-more-scroll-less goal'), then offer to check "
+        "availability or book it. When they ask you to recommend or find a plan, call get_planner_suggestions the "
+        "same way and offer ONE plan, then offer to open it. Let the user lead; one idea at a time, only when asked. "
+        "CLOSE THE LOOP with reflection: a booked experience only compounds if they reflect on it. NOT at the "
+        "start — only once the talk naturally turns to how things are going, call get_bookings_to_reflect; if "
+        "something recently passed, warmly ask how it went (e.g. 'how was the cooking class on Saturday?'). When "
+        "they answer, call reflect_on_booking with their words (and a 1-5 rating if given) — it is saved and "
+        "remembered — then connect what they felt back to their goal and a small next step. One at a time; never nag. "
         "Other actions take effect immediately, so after the tool returns, confirm out loud exactly what "
         "you did (e.g. 'Added gym tomorrow at 6 PM'). If a tool reports it couldn't find the task, say so. "
     )
     return base + ("Reply in Thai." if is_thai else "Reply in English.")
 
 
-@https_fn.on_request(memory=256, min_instances=0, max_instances=5, timeout_sec=30, cpu=1, secrets=_LLM_SECRETS)
+# min_instances=1: keep one warm so the day's first "tap to talk" doesn't eat a cold start
+# (time-to-talk is the make-or-break first impression for a voice feature).
+@https_fn.on_request(memory=256, min_instances=1, max_instances=5, timeout_sec=30, cpu=1, secrets=_LLM_SECRETS)
 def evo_realtime_session(req: https_fn.Request) -> https_fn.Response:
     """Mint a short-lived OpenAI Realtime ephemeral token for client-side WebRTC voice.
 
@@ -8451,14 +9043,15 @@ def evo_realtime_session(req: https_fn.Request) -> https_fn.Response:
             except Exception:
                 today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
 
-        instructions = _realtime_instructions(is_thai, today_str, tz_label)
+        now_time = str(data.get('now_time') or data.get('nowTime') or '').strip()[:5]
+        instructions = _realtime_instructions(is_thai, today_str, tz_label, now_time)
 
         # Optional screen context (e.g. the task/plan the user is currently viewing).
         context_hint = str(data.get('context') or data.get('contextHint') or '').strip()
         if context_hint:
             instructions = (
                 f"{instructions} Context about the user (current screen, saved notes, recent daily notes): "
-                f"{context_hint[:1200]} Use it to ground your answers when relevant."
+                f"{context_hint[:1800]} Use it to ground your answers when relevant."
             )
 
         tools = _realtime_voice_tool_specs()
@@ -8476,7 +9069,10 @@ def evo_realtime_session(req: https_fn.Request) -> https_fn.Response:
                 'https://api.openai.com/v1/realtime/client_secrets',
                 headers=headers,
                 json={'session': {'type': 'realtime', 'model': model}},
-                timeout=15,
+                # 8s (was 15): if GA is slow we still have room to fall through to the legacy
+                # mint AND answer within the client's 25s connect watchdog, instead of the
+                # client timing out while two 15s mints ran back to back.
+                timeout=8,
             )
             if resp.status_code < 300:
                 body = resp.json() or {}
@@ -8527,7 +9123,9 @@ def evo_realtime_session(req: https_fn.Request) -> https_fn.Response:
                     'modalities': ['audio', 'text'],
                     'turn_detection': {
                         'type': 'server_vad',
-                        'silence_duration_ms': 500,
+                        # 800ms (was 500): a half-second pause mid-thought was grabbing the turn and
+                        # cutting users off — especially slower / Thai speakers who pause naturally.
+                        'silence_duration_ms': 800,
                         'prefix_padding_ms': 300,
                         'threshold': 0.5,
                     },
@@ -8542,6 +9140,214 @@ def evo_realtime_session(req: https_fn.Request) -> https_fn.Response:
         return create_response(
             success=False,
             message='Realtime session failed',
+            error=str(e),
+            status_code=500
+        )
+
+
+def _coach_chat_tool_specs() -> list:
+    """Chat Completions variant of the realtime tool specs (nested `function` key)."""
+    specs = []
+    for tool in _realtime_voice_tool_specs():
+        name = tool.get("name")
+        if not name:
+            continue
+        specs.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": tool.get("description") or "",
+                "parameters": tool.get("parameters") or {"type": "object", "properties": {}},
+            },
+        })
+    return specs
+
+
+_COACH_CHAT_TEXT_MODE = (
+    " TEXT MODE: this is the typed chat, not voice — everything above about speaking applies to WRITING. "
+    "No spoken filler ('One sec…'); the app shows a progress indicator while your tools run. "
+    "Keep replies short (2-4 sentences); a short list or a little **bold** is fine when it genuinely helps. "
+    "Don't paste long raw URLs into the reply — mention the title and save links onto tasks via set_task_detail. "
+    "Tools work exactly like in voice: call them to read real data or act — never guess calendar/plan contents."
+)
+
+_COACH_CHAT_ALLOWED_ROLES = {"user", "assistant", "tool"}
+_COACH_CHAT_MAX_MESSAGES = 60
+_COACH_CHAT_MAX_CONTENT_CHARS = 8000
+_COACH_CHAT_MODELS = {"gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini"}
+
+
+def _sanitize_coach_chat_messages(raw) -> list:
+    """Keep only OpenAI-valid chat messages with whitelisted keys and capped content."""
+    if not isinstance(raw, list):
+        return []
+    cleaned = []
+    for item in raw[-_COACH_CHAT_MAX_MESSAGES:]:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip()
+        if role not in _COACH_CHAT_ALLOWED_ROLES:
+            continue
+        msg = {"role": role}
+        content = item.get("content")
+        if isinstance(content, str):
+            msg["content"] = content[:_COACH_CHAT_MAX_CONTENT_CHARS]
+        else:
+            msg["content"] = None if role == "assistant" else ""
+        if role == "assistant" and isinstance(item.get("tool_calls"), list):
+            tool_calls = []
+            for tc in item["tool_calls"][:8]:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                tc_id = str(tc.get("id") or "").strip()
+                fn_name = str(fn.get("name") or "").strip()
+                if not tc_id or not fn_name:
+                    continue
+                tool_calls.append({
+                    "id": tc_id,
+                    "type": "function",
+                    "function": {
+                        "name": fn_name,
+                        "arguments": str(fn.get("arguments") or "{}")[:_COACH_CHAT_MAX_CONTENT_CHARS],
+                    },
+                })
+            if tool_calls:
+                msg["tool_calls"] = tool_calls
+        if role == "tool":
+            tc_id = str(item.get("tool_call_id") or "").strip()
+            if not tc_id:
+                continue
+            msg["tool_call_id"] = tc_id
+            if not isinstance(msg.get("content"), str):
+                msg["content"] = ""
+        cleaned.append(msg)
+    return cleaned
+
+
+@https_fn.on_request(memory=1024, max_instances=3, timeout_sec=120, cpu=1, secrets=_LLM_SECRETS)
+def evo_coach_chat(req: https_fn.Request) -> https_fn.Response:
+    """Text-chat coach with the SAME tool surface as the realtime voice assistant.
+
+    Runs ONE model step per call. Tools execute on the CLIENT (same handlers as the
+    realtime voice path): when the model requests tools, this returns the pending
+    tool_calls and the client POSTs again with the tool results appended to `messages`.
+    """
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+
+    if req.method != 'POST':
+        return create_response(
+            success=False,
+            message='Method not allowed',
+            error='Only POST method is allowed',
+            status_code=405
+        )
+
+    try:
+        from openai import OpenAI
+        from openai_api_key import resolve_openai_api_key
+
+        api_key = resolve_openai_api_key()
+        if not api_key:
+            return create_response(
+                success=False,
+                message='Coach chat unavailable',
+                error='OpenAI API key is not configured',
+                status_code=503
+            )
+
+        data = req.get_json(silent=True) or {}
+        language = str(data.get('language') or data.get('languageSelected') or 'english').strip().lower()
+        is_thai = language in {'thai', 'th', 'ไทย'}
+
+        messages = _sanitize_coach_chat_messages(data.get('messages'))
+        if not any(m.get('role') == 'user' for m in messages):
+            return create_response(
+                success=False,
+                message='Missing required field',
+                error='messages must include at least one user message',
+                status_code=400
+            )
+
+        # Prefer the client's local date/time (device truth); mirror evo_realtime_session.
+        today_str = str(data.get('today') or data.get('todayYmd') or '').strip()[:10]
+        tz_label = str(data.get('timezone') or data.get('timeZone') or '').strip()
+        if not today_str:
+            try:
+                from zoneinfo import ZoneInfo
+                tz = ZoneInfo(tz_label) if tz_label else ZoneInfo('Asia/Bangkok')
+                today_str = datetime.now(tz).strftime('%Y-%m-%d')
+                if not tz_label:
+                    tz_label = 'Asia/Bangkok'
+            except Exception:
+                today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        now_time = str(data.get('now_time') or data.get('nowTime') or '').strip()[:5]
+
+        instructions = _realtime_instructions(is_thai, today_str, tz_label, now_time) + _COACH_CHAT_TEXT_MODE
+
+        context_hint = str(data.get('context') or data.get('contextHint') or '').strip()
+        if context_hint:
+            instructions = (
+                f"{instructions} Context about the user (profile, goals, saved notes, recent moods, "
+                f"today's plan): {context_hint[:6000]} Use it to ground your answers when relevant."
+            )
+
+        model = str(data.get('model') or '').strip()
+        if model not in _COACH_CHAT_MODELS:
+            model = 'gpt-4o'
+        # `final=true` forces a plain-text answer (client's last round after the tool budget is spent).
+        final_round = bool(data.get('final'))
+
+        client = OpenAI(api_key=api_key, timeout=45)
+        request_kwargs = {
+            'model': model,
+            'messages': [{'role': 'system', 'content': instructions}] + messages,
+            'temperature': 0.6,
+            'max_tokens': 900,
+        }
+        if not final_round:
+            request_kwargs['tools'] = _coach_chat_tool_specs()
+            request_kwargs['tool_choice'] = 'auto'
+
+        completion = client.chat.completions.create(**request_kwargs)
+        choice = (completion.choices or [None])[0]
+        msg = getattr(choice, 'message', None)
+        if msg is None:
+            raise RuntimeError('Empty completion from model')
+
+        if getattr(msg, 'tool_calls', None):
+            tool_calls = []
+            for tc in msg.tool_calls:
+                tool_calls.append({
+                    'id': tc.id,
+                    'type': 'function',
+                    'function': {
+                        'name': tc.function.name,
+                        'arguments': tc.function.arguments or '{}',
+                    },
+                })
+            return create_response(
+                data={
+                    'type': 'tool_calls',
+                    'assistant': {
+                        'role': 'assistant',
+                        'content': msg.content or None,
+                        'tool_calls': tool_calls,
+                    },
+                },
+                message='Tool calls pending'
+            )
+
+        return create_response(
+            data={'type': 'message', 'text': msg.content or ''},
+            message='Coach reply ready'
+        )
+    except Exception as e:
+        logger.error("Error in evo_coach_chat: %s", str(e))
+        return create_response(
+            success=False,
+            message='Coach chat failed',
             error=str(e),
             status_code=500
         )

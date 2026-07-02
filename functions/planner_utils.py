@@ -359,6 +359,25 @@ class PromptBuilder:
                 "Use 0-1 emoji."
             )
         return system_prompt, user_prompt
+
+    @staticmethod
+    def build_personalized_suggestions_prompt() -> tuple[str, str]:
+        """Rank booking + planner candidates with personalized reasons (JSON output)."""
+        system_prompt = (
+            "You are EVO — a lifestyle planner coach. Given a user's goals, plans, recent todos, "
+            "and pre-scored candidate bookings/plans, pick the best matches and write short, "
+            "specific reasons (one sentence each). Prefer items that advance their stated goals "
+            "and complement what they already do. Include one exploratory pick when scores are low. "
+            "Output ONLY valid JSON with this exact shape:\n"
+            '{"bookings":[{"booking_item_id":"...","reason":"..."}],'
+            '"planners":[{"plan_id":"...","reason":"..."}]}\n'
+            "Use only IDs from the candidate lists. Max 3 bookings and 3 planners."
+        )
+        user_prompt = (
+            "Rank the candidates below for this user. Reasons must be in the requested language, "
+            "warm and practical — no streak guilt, no invented facts."
+        )
+        return system_prompt, user_prompt
     
     @staticmethod
     def build_todo_info_prompt(
@@ -709,6 +728,122 @@ class PlannerUtils:
             if language == "thai":
                 return "วันนี้คุณทำดีแล้ว — พักผ่อนให้หัวใจเบาลงนะ 💛"
             return "You showed up today — that's worth being proud of. Rest well. 💛"
+
+    def suggest_personalized_content(
+        self,
+        user_context: Optional[Dict[str, Any]] = None,
+        booking_candidates: Optional[List[Dict[str, Any]]] = None,
+        planner_candidates: Optional[List[Dict[str, Any]]] = None,
+        language: str = "english",
+    ) -> Optional[Dict[str, Any]]:
+        """Rank booking + planner candidates; return structured suggestions for the backend cache."""
+        bookings_in = [b for b in (booking_candidates or []) if isinstance(b, dict)]
+        planners_in = [p for p in (planner_candidates or []) if isinstance(p, dict)]
+        if not bookings_in and not planners_in:
+            return None
+
+        try:
+            normalized_language = self.validator.validate_language(language)
+            system_prompt, user_prompt = self.prompt_builder.build_personalized_suggestions_prompt()
+
+            ctx = user_context if isinstance(user_context, dict) else {}
+            ctx_lines = []
+            if ctx.get("life_goals"):
+                ctx_lines.append(f"Life goals: {str(ctx['life_goals'])[:300]}")
+            active = ctx.get("active_plans") or []
+            if active:
+                ctx_lines.append(
+                    "Active plans: "
+                    + ", ".join(
+                        str(p.get("planName") or p.get("plan_name") or "")[:40]
+                        for p in active[:5]
+                        if isinstance(p, dict)
+                    )
+                )
+            todos = ctx.get("recent_todos") or []
+            if todos:
+                todo_titles = [
+                    str(t.get("title") or "")[:48]
+                    for t in todos[:10]
+                    if isinstance(t, dict) and t.get("title")
+                ]
+                if todo_titles:
+                    ctx_lines.append("Recent todos: " + "; ".join(todo_titles))
+
+            if ctx_lines:
+                user_prompt += "\n\nUser context:\n" + "\n".join(ctx_lines)
+
+            if bookings_in:
+                booking_lines = "\n".join([
+                    f"- id={b.get('booking_item_id')} title={str(b.get('title', ''))[:60]} "
+                    f"type={b.get('experience_type') or ''} score={b.get('score', 0)}"
+                    for b in bookings_in[:8]
+                ])
+                user_prompt += f"\n\nBooking candidates:\n{booking_lines}"
+
+            if planners_in:
+                planner_lines = "\n".join([
+                    f"- id={p.get('plan_id')} name={str(p.get('plan_name', ''))[:60]} "
+                    f"category={p.get('category') or ''} score={p.get('score', 0)}"
+                    for p in planners_in[:6]
+                ])
+                user_prompt += f"\n\nPlanner candidates:\n{planner_lines}"
+
+            user_prompt += f"\n\nWrite reasons in {normalized_language}."
+
+            response = self._safe_chat_call(
+                system_prompt,
+                user_prompt,
+                language=normalized_language,
+                model="gpt-5.4-mini",
+                max_completion_tokens=600,
+                temperature=0.6,
+            )
+            text = (response or "").strip()
+            if not text:
+                return None
+
+            parsed = None
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                match = re.search(r"\{[\s\S]*\}", text)
+                if match:
+                    parsed = json.loads(match.group(0))
+
+            if not isinstance(parsed, dict):
+                return None
+
+            out_bookings = []
+            for row in (parsed.get("bookings") or [])[:3]:
+                if not isinstance(row, dict):
+                    continue
+                bid = row.get("booking_item_id") or row.get("id")
+                if not bid:
+                    continue
+                out_bookings.append({
+                    "booking_item_id": str(bid),
+                    "reason": str(row.get("reason") or "")[:200],
+                })
+
+            out_planners = []
+            for row in (parsed.get("planners") or [])[:3]:
+                if not isinstance(row, dict):
+                    continue
+                pid = row.get("plan_id") or row.get("id")
+                if not pid:
+                    continue
+                out_planners.append({
+                    "plan_id": str(pid),
+                    "reason": str(row.get("reason") or "")[:200],
+                })
+
+            if not out_bookings and not out_planners:
+                return None
+            return {"bookings": out_bookings, "planners": out_planners}
+        except Exception as e:
+            logger.error("Failed to suggest personalized content: %s", e)
+            return None
     
     def get_todo_information_generator_response(
         self,
@@ -1865,6 +2000,95 @@ class PlannerUtils:
         except Exception as e:
             logger.error(f"Failed to generate today's todo fate prediction: {str(e)}")
             return None
+
+    def predict_thai_fate_reading(
+        self,
+        birth_date: str,
+        topic: str = "general",
+        language: str = "thai",
+        birth_time: Optional[str] = None,
+        thai_birth_day: Optional[Dict[str, Any]] = None,
+        todo_data: Optional[List[Dict[str, Any]]] = None,
+        profile_hints: Optional[Dict[str, Any]] = None,
+        model: str = "gpt-4o-mini",
+    ) -> str:
+        """
+        Thai-style path reading for voice/realtime — poetic fortune-teller tone grounded in
+        birth-day symbolism and the user's real context, not supernatural certainty.
+        """
+        try:
+            normalized_language = self.validator.validate_language(language)
+            normalized_topic = (topic or "general").strip().lower()
+            topic_labels = {
+                "love": "love / relationships",
+                "career": "career / work",
+                "money": "money / finances",
+                "health": "health / energy",
+                "general": "general life direction",
+            }
+            topic_label = topic_labels.get(normalized_topic, topic_labels["general"])
+
+            birth_block = f"Birth date: {birth_date}"
+            if birth_time:
+                birth_block += f"\nBirth time: {birth_time}"
+            if thai_birth_day and isinstance(thai_birth_day, dict):
+                birth_block += (
+                    "\nThai birth-day symbolism (use as vocabulary, not literal fate): "
+                    f"day={thai_birth_day.get('day')}, color={thai_birth_day.get('color')}, "
+                    f"element={thai_birth_day.get('element')}"
+                )
+
+            profile_bits = []
+            if profile_hints and isinstance(profile_hints, dict):
+                for k in ("mbti", "currentWork", "lifeGoals"):
+                    if profile_hints.get(k):
+                        profile_bits.append(f"{k}: {profile_hints[k]}")
+            profile_block = (
+                "Saved profile hints:\n" + "\n".join(profile_bits)
+                if profile_bits
+                else ""
+            )
+
+            todo_block = (
+                f"Today's todos (titles/completion):\n{todo_data}\n"
+                if todo_data
+                else ""
+            )
+
+            system_prompt = (
+                "You are Evo, a warm Thai-style fortune guide inside the EVO lifestyle app. "
+                "Use a poetic, gentle หมอดู/ดูดวง *tone* — imagery, birth-day color/element symbolism, "
+                "and seasonal rhythm — but every claim must stay compatible with psychology, agency, "
+                "and neuroplasticity (small choices compound; returning after setbacks matters). "
+                "Never claim supernatural certainty, curses, fixed destiny, or medical/legal facts. "
+                "Frame outcomes as tendencies shaped by habits, context, and attention — not magic. "
+                "Do not mention lucky colors as prescriptions. Write entirely in the user's language. "
+                "For voice: 3–5 short sentences (~400–700 characters Thai; ~350–550 English). "
+                "Open with one vivid image, weave the topic, end with one gentle reflective question "
+                "or actionable nudge. At most 2 emojis."
+            )
+            user_prompt = (
+                f"{birth_block}\n\nTopic: {topic_label}\n"
+                + (f"\n{profile_block}\n" if profile_block else "")
+                + (f"\n{todo_block}\n" if todo_block else "")
+                + f"\nGive the spoken fate reading in {normalized_language}."
+            )
+            response = self._safe_chat_call(
+                system_prompt,
+                user_prompt,
+                max_completion_tokens=800,
+                temperature=0.92,
+                language=normalized_language,
+                model=model,
+            )
+            logger.info("Thai-style fate reading generated successfully")
+            return response
+        except RateLimitExceededError:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to generate Thai fate reading: {str(e)}")
+            return None
+
 # Global instance for backward compatibility
 _default_planner = None
 
@@ -1928,6 +2152,22 @@ def evening_compliment_message(
         first_name=first_name,
         identity_context=identity_context,
         today_date=today_date,
+    )
+
+
+def suggest_personalized_content(
+    user_context: Optional[Dict[str, Any]] = None,
+    booking_candidates: Optional[List[Dict[str, Any]]] = None,
+    planner_candidates: Optional[List[Dict[str, Any]]] = None,
+    language: str = "english",
+) -> Optional[Dict[str, Any]]:
+    """Backward compatibility wrapper for personalized booking/planner suggestions."""
+    planner = get_default_planner()
+    return planner.suggest_personalized_content(
+        user_context=user_context,
+        booking_candidates=booking_candidates,
+        planner_candidates=planner_candidates,
+        language=language,
     )
 
 def message_in_the_morning(
@@ -2113,4 +2353,26 @@ def predict_today_todo_fate(
         earned_runes=earned_runes,
         behavior_stats=behavior_stats,
         output_style=output_style,
+    )
+
+
+def predict_thai_fate_reading(
+    birth_date: str,
+    topic: str = "general",
+    language: str = "thai",
+    birth_time: Optional[str] = None,
+    thai_birth_day: Optional[Dict[str, Any]] = None,
+    todo_data: Optional[List[Dict[str, Any]]] = None,
+    profile_hints: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Backward compatibility function for Thai-style fate readings."""
+    planner = get_default_planner()
+    return planner.predict_thai_fate_reading(
+        birth_date=birth_date,
+        topic=topic,
+        language=language,
+        birth_time=birth_time,
+        thai_birth_day=thai_birth_day,
+        todo_data=todo_data,
+        profile_hints=profile_hints,
     )
