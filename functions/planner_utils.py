@@ -844,7 +844,128 @@ class PlannerUtils:
         except Exception as e:
             logger.error("Failed to suggest personalized content: %s", e)
             return None
-    
+
+    def synthesize_user_memory(
+        self,
+        signals: Optional[Dict[str, Any]] = None,
+        language: str = "english",
+    ) -> Optional[Dict[str, Any]]:
+        """Distill a user's raw behavioral signals into an evolving synthesis.
+
+        Input `signals` comes from the backend nightly job: profile snippets,
+        daily notes with moods, completed/missed task titles, booking
+        reflections, coach-saved notes, weekday completion ratios, and the
+        PRIOR synthesis summary (so the memory evolves rather than resets).
+
+        Returns {"summary": str, "facets": {life_season, energy_pattern,
+        working_well, struggles, recent_wins, preferences}} or None.
+        """
+        s = signals if isinstance(signals, dict) else {}
+        try:
+            normalized_language = self.validator.validate_language(language)
+
+            def _fmt_list(items, fmt, cap):
+                rows = []
+                for item in (items or [])[:cap]:
+                    try:
+                        rows.append(fmt(item))
+                    except Exception:
+                        continue
+                return "\n".join(rows)
+
+            profile = s.get("profile") or {}
+            profile_lines = "\n".join(
+                f"{k}: {str(v)[:300]}" for k, v in profile.items() if v
+            )
+            notes_block = _fmt_list(
+                s.get("daily_notes"),
+                lambda n: f"- {n.get('date')}: mood={n.get('mood') or '-'} | {n.get('text') or ''}",
+                14,
+            )
+            completed_block = ", ".join(str(t) for t in (s.get("completed_titles") or [])[:40])
+            missed_block = ", ".join(str(t) for t in (s.get("missed_titles") or [])[:25])
+            reflections_block = _fmt_list(
+                s.get("booking_reflections"),
+                lambda r: f"- {r.get('title')}: {r.get('reflection')}",
+                10,
+            )
+            coach_notes_block = _fmt_list(
+                s.get("coach_notes"),
+                lambda n: f"- [{n.get('category') or 'note'}] {n.get('text')}",
+                20,
+            )
+            weekday_block = ", ".join(
+                f"{['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][w.get('weekday', 0)]} {w.get('done', 0)}/{w.get('total', 0)}"
+                for w in (s.get("weekday_completion") or [])
+                if isinstance(w, dict) and w.get("total")
+            )
+            prior_summary = str(s.get("prior_summary") or "").strip()
+
+            system_prompt = (
+                "You maintain the evolving memory of one user for their intelligent lifestyle "
+                "assistant. You are given their recent behavioral record and the previous "
+                "synthesis. Produce an UPDATED synthesis that a coach-like assistant will read "
+                "at the start of every conversation.\n"
+                "Principles: be honest and specific, never flattering; treat missed days as "
+                "information, not failure; carry forward still-true facts from the previous "
+                "synthesis and drop stale ones; prefer patterns over one-off events; note "
+                "capacity/energy rhythms (which days or contexts work); keep the user's own "
+                "words for goals and struggles when possible.\n"
+                "Return STRICT JSON only:\n"
+                '{"summary": "<=180 words, second person (\'they\'), the assistant-facing digest", '
+                '"facets": {"life_season": "...", "energy_pattern": "...", "working_well": "...", '
+                '"struggles": "...", "recent_wins": "...", "preferences": "..."}}\n'
+                "Each facet <=30 words; empty string when unknown. No markdown, no extra keys."
+            )
+
+            user_prompt = (
+                f"PREVIOUS SYNTHESIS (may be empty):\n{prior_summary or '(none)'}\n\n"
+                f"PROFILE:\n{profile_lines or '(none)'}\n\n"
+                f"DAILY NOTES (newest first):\n{notes_block or '(none)'}\n\n"
+                f"COMPLETED RECENTLY: {completed_block or '(none)'}\n"
+                f"MISSED RECENTLY: {missed_block or '(none)'}\n"
+                f"WEEKDAY COMPLETION: {weekday_block or '(none)'}\n\n"
+                f"EXPERIENCE REFLECTIONS:\n{reflections_block or '(none)'}\n\n"
+                f"THINGS THE USER ASKED THE ASSISTANT TO REMEMBER:\n{coach_notes_block or '(none)'}\n\n"
+                f"Write the summary and facets in {normalized_language}."
+            )
+
+            response = self._safe_chat_call(
+                system_prompt,
+                user_prompt,
+                language=normalized_language,
+                model="gpt-5.4-mini",
+                max_completion_tokens=700,
+                temperature=0.4,
+            )
+            text = (response or "").strip()
+            if not text:
+                return None
+
+            parsed = None
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                match = re.search(r"\{[\s\S]*\}", text)
+                if match:
+                    parsed = json.loads(match.group(0))
+
+            if not isinstance(parsed, dict) or not str(parsed.get("summary") or "").strip():
+                return None
+
+            facets_in = parsed.get("facets") if isinstance(parsed.get("facets"), dict) else {}
+            facet_keys = [
+                "life_season", "energy_pattern", "working_well",
+                "struggles", "recent_wins", "preferences",
+            ]
+            return {
+                "summary": str(parsed["summary"]).strip()[:1600],
+                "facets": {k: str(facets_in.get(k) or "").strip()[:240] for k in facet_keys},
+            }
+        except Exception as e:
+            logger.error("Failed to synthesize user memory: %s", e)
+            return None
+
     def get_todo_information_generator_response(
         self,
         user_query: str,

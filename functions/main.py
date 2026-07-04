@@ -5758,6 +5758,62 @@ def suggest_personalized_content(req: https_fn.Request) -> https_fn.Response:
         )
 
 
+@https_fn.on_request(memory=512, max_instances=5, timeout_sec=120, cpu=1, secrets=_LLM_SECRETS)
+def synthesize_user_memory(req: https_fn.Request) -> https_fn.Response:
+    """Distill a user's behavioral signals into an evolving assistant memory.
+
+    Called by the backend nightly job (V2_synthesizeUserMemory); the result is
+    cached at users/{uid}/aiMemory/synthesis and injected into both voice and
+    text assistant sessions as "who this user is right now" context.
+    """
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+
+    if req.method != 'POST':
+        return create_response(
+            success=False,
+            message='Method not allowed',
+            error='Only POST method is allowed',
+            status_code=405
+        )
+
+    try:
+        data = req.get_json() or {}
+        signals = data.get('signals')
+        if not isinstance(signals, dict):
+            return create_response(
+                success=False,
+                message='Invalid field',
+                error='signals must be an object',
+                status_code=400
+            )
+
+        pu = get_planner_utils()
+        synthesis = pu.synthesize_user_memory(
+            signals=signals,
+            language=data.get('language', 'english'),
+        )
+        if synthesis is None:
+            return create_response(
+                success=False,
+                message='Synthesis failed',
+                error='Could not synthesize user memory',
+                status_code=500
+            )
+        return create_response(
+            data={'synthesis': synthesis},
+            message='User memory synthesized successfully'
+        )
+    except Exception as e:
+        logger.error("Error in synthesize_user_memory: %s", str(e))
+        return create_response(
+            success=False,
+            message='Synthesis failed',
+            error=str(e),
+            status_code=500
+        )
+
+
 @https_fn.on_request(memory=512, max_instances=5, timeout_sec=60, cpu=1, secrets=_LLM_SECRETS)
 def evening_compliment(req: https_fn.Request) -> https_fn.Response:
     """Generate a single evening compliment for push notifications (light model)."""
@@ -8017,9 +8073,12 @@ def _realtime_voice_tool_specs() -> list:
             "type": "function",
             "name": "get_calendar",
             "description": (
-                "Fetch the user's calendar todos for a time window. Call this ONLY when the user "
-                "asks about their schedule/tasks for a specific period (today, tomorrow, this week, "
-                "this month). Do not call it for general chat."
+                "Fetch the user's calendar todos. Call this ONLY when the user asks about their "
+                "schedule/tasks. For relative periods use `window`; for a SPECIFIC day or range "
+                "(e.g. 'August 10', 'next month', 'the 15th to the 20th') pass date or "
+                "start_date+end_date instead — windows cannot see past the current month. "
+                "If the result has next_offset, more items exist: call again with that offset "
+                "when the user wants the rest. Do not call it for general chat."
             ),
             "parameters": {
                 "type": "object",
@@ -8027,8 +8086,24 @@ def _realtime_voice_tool_specs() -> list:
                     "window": {
                         "type": "string",
                         "enum": ["today", "tomorrow", "yesterday", "week", "month"],
-                        "description": "Which time window to fetch.",
-                    }
+                        "description": "Relative time window (week = next 7 days, month = current month).",
+                    },
+                    "date": {
+                        "type": "string",
+                        "description": "One specific day, YYYY-MM-DD. Overrides window.",
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "description": "Range start, YYYY-MM-DD. Overrides window. Any dates allowed, incl. beyond this month.",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "Range end, YYYY-MM-DD (inclusive).",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Skip this many items (paging). Use next_offset from the previous result.",
+                    },
                 },
                 "required": ["window"],
             },
@@ -8564,16 +8639,52 @@ def _realtime_voice_tool_specs() -> list:
                 "rent, services, classes, experiences. Call this when the user wants to BOOK or RENT something, "
                 "or asks what's available to book (e.g. 'find a place to stay', 'rent a bike', 'book a tennis "
                 "court', 'book apparatus at Khon Kaen'). When they name a place or city, pass it as `area` and "
-                "keep `query` to the thing itself (e.g. query='apparatus', area='Khon Kaen'). Returns each "
-                "offering's title, price, type, capacity, location, and the booking_item_id + owner_uid needed "
+                "keep `query` to the thing itself (e.g. query='apparatus', area='Khon Kaen'). When they name "
+                "the PROVIDER/host they want to book from (e.g. 'book something from SP Lab', 'what does SP "
+                "Lab offer?'), pass that name as `host` — with `query` empty it returns that provider's FULL "
+                "inventory; putting the provider name in `query` instead misses items. Returns each offering's "
+                "host name, title, price, type, capacity, location, and the booking_item_id + owner_uid needed "
                 "to check availability or book. Omit query to list what's available."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Keyword(s): what they want to book (e.g. 'kayak', 'studio', 'apparatus')."},
+                    "query": {"type": "string", "description": "Keyword(s): what they want to book (e.g. 'kayak', 'studio', 'apparatus'). NOT the provider name — use host."},
                     "area": {"type": "string", "description": "Location/city/neighborhood to filter by, if they mention one (e.g. 'Khon Kaen')."},
-                    "max": {"type": "integer", "description": "Max results (default 10)."},
+                    "host": {"type": "string", "description": "Provider/host name when the user names WHO to book from (e.g. 'SP Lab'). Returns only their offerings; empty query = their whole inventory."},
+                    "max": {"type": "integer", "description": "Max results (default 10; raise to ~25 when listing a host's whole inventory)."},
+                },
+                "required": [],
+            },
+        },
+        {
+            "type": "function",
+            "name": "get_my_offerings",
+            "description": (
+                "List EVERY service/offering THIS user hosts as a provider — their own complete "
+                "inventory (title, price, type, capacity, location, active flag). Call when the "
+                "user asks about their OWN listings/services/business (e.g. 'what services do I "
+                "offer?', 'list my rentals', 'is my studio listing active?'). Do NOT use "
+                "find_offerings for this — that is a keyword search over the public marketplace "
+                "and can miss the user's own items."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+        {
+            "type": "function",
+            "name": "get_booking_requests",
+            "description": (
+                "Provider dashboard: pending approval requests on the user's offerings plus "
+                "upcoming booking events — split into received_bookings (customers booked THEM) "
+                "and my_bookings_as_customer (bookings they made elsewhere). Call when the user "
+                "asks about incoming bookings, reservation requests, who booked them, or their "
+                "upcoming bookings (e.g. 'any new booking requests?', 'who booked my court this "
+                "week?'). Looks ahead 60 days by default; pass days to widen."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer", "description": "How many days ahead to scan (default 60, max 120)."},
                 },
                 "required": [],
             },
@@ -8636,9 +8747,11 @@ def _realtime_voice_tool_specs() -> list:
                 "them (e.g. 'find me a cleaner this weekend', 'I need a drone to rent Saturday', 'looking for a "
                 "math tutor'). Use this when find_offerings has nothing matching, or the user clearly wants to "
                 "broadcast a need rather than book an existing listing. Two-phase like booking: call FIRST "
-                "without confirmed to get a summary, read it back (what, type, when, where) and ask the user to "
-                "confirm, then call again with confirmed=true. After posting, tell them hosts can now respond and "
-                "they'll be notified — they can check offers later (get_my_demands)."
+                "without confirmed to get a summary, read it back (what, type, when, where, offers wanted, price) "
+                "and ask the user to confirm, then call again with confirmed=true. Ask how many offers to compare "
+                "(offers_wanted, default 1) and whether they have a fixed budget (request_price) or flexible price. "
+                "Reference photos must be added in the app after posting. After posting, tell them hosts can now "
+                "respond and they'll be notified — they can check offers later (get_my_demands)."
             ),
             "parameters": {
                 "type": "object",
@@ -8655,6 +8768,18 @@ def _realtime_voice_tool_specs() -> list:
                     "time_end": {"type": "string", "description": "Optional end time HH:MM."},
                     "flexible_time": {"type": "boolean", "description": "True if timing is flexible."},
                     "area": {"type": "string", "description": "Where the user needs it (neighborhood/city), if mentioned."},
+                    "offers_wanted": {
+                        "type": "integer",
+                        "description": "How many host offers the user wants to compare (1-10, default 1).",
+                    },
+                    "request_price": {
+                        "type": "string",
+                        "description": "Fixed budget in THB if the user states a target price. Omit for flexible price.",
+                    },
+                    "flexible_price": {
+                        "type": "boolean",
+                        "description": "True if price is open for hosts to propose (default). False when request_price is set.",
+                    },
                     "confirmed": {"type": "boolean", "description": "Pass true ONLY after the user confirms out loud."},
                 },
                 "required": ["title"],
@@ -8666,7 +8791,8 @@ def _realtime_voice_tool_specs() -> list:
             "description": (
                 "List the user's own marketplace requests (demands) they've posted, with how many hosts have "
                 "responded to each. Call when the user asks about their requests / whether anyone replied / the "
-                "status of something they asked you to find. Returns title, type, date, status, and response count."
+                "status of something they asked you to find. Returns title, type, date, status, response count, "
+                "offers_wanted, flexible_price, request_price, and whether photos are attached."
             ),
             "parameters": {"type": "object", "properties": {}},
         },
@@ -8676,8 +8802,9 @@ def _realtime_voice_tool_specs() -> list:
             "description": (
                 "Find OPEN requests OTHER people posted that the user could fulfil and offer on — the marketplace "
                 "demand board (e.g. 'what can I help with', 'any requests near me', 'who needs a drone'). Returns "
-                "each request's demand_id, title, type, date, area, and requester_name. Pass `area` for a place/city "
-                "and/or `query` for keywords. To actually offer on one, use offer_on_request with its demand_id."
+                "each request's demand_id, title, type, date, area, requester_name, offers_wanted, flexible_price, "
+                "request_price, and response count. Pass `area` for a place/city and/or `query` for keywords. "
+                "To actually offer on one, use offer_on_request with its demand_id."
             ),
             "parameters": {
                 "type": "object",
@@ -8694,9 +8821,9 @@ def _realtime_voice_tool_specs() -> list:
             "name": "get_demand_offers",
             "description": (
                 "List the OFFERS the user has received on THEIR OWN requests, with each responder's name, price, "
-                "pickup, message and rating/review_count. Call when the user asks who offered / to compare offers / "
-                "to check a responder's reviews before choosing. The user picks/chats with an offer in the app's "
-                "Requests screen (View offers)."
+                "quantity, pickup, message, photos flag, and rating/review_count. Call when the user asks who offered / "
+                "to compare offers / to check a responder's reviews before choosing. The user picks/chats with an offer "
+                "in the app's Requests screen (View offers)."
             ),
             "parameters": {
                 "type": "object",
@@ -8711,20 +8838,57 @@ def _realtime_voice_tool_specs() -> list:
             "name": "offer_on_request",
             "description": (
                 "Offer to fulfil someone else's open request, opening a deal chat with them. Two-phase like "
-                "book_offering: call FIRST without confirmed to get a summary, read back the request + your price, "
-                "ask the user to confirm out loud, then call again with confirmed=true. Use a demand_id from "
-                "find_open_requests. After it returns, tell them the deal chat is open (or that their offer is queued)."
+                "book_offering: call FIRST without confirmed to get a summary, read back the request + your price + "
+                "quantity, ask the user to confirm out loud, then call again with confirmed=true. Use a demand_id from "
+                "find_open_requests. If the request has flexible_price, you MUST pass price (THB). If the requester "
+                "set a fixed budget (request_price), match or propose your price. Pass quantity when offering more than "
+                "one unit (e.g. group deal). Photo attachments on offers must be added in the app. After it returns, "
+                "tell them the deal chat is open (or that their offer is queued)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "demand_id": {"type": "string", "description": "From a find_open_requests result."},
-                    "price": {"type": "string", "description": "The price the user offers (THB), if stated."},
+                    "price": {"type": "string", "description": "The price the user offers (THB). Required when request has flexible price."},
+                    "quantity": {"type": "integer", "description": "Units/quantity offered (default 1, e.g. 2 tents for friends)."},
                     "pickup": {"type": "string", "description": "Pickup/meet-up location, if relevant."},
                     "message": {"type": "string", "description": "Short note to the requester (how they can help)."},
                     "confirmed": {"type": "boolean", "description": "Pass true ONLY after the user confirms out loud."},
                 },
                 "required": ["demand_id"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "get_my_deals",
+            "description": (
+                "List the user's active deal chats (marketplace negotiations). Returns deal_id, title, other party, "
+                "status, price, quantity, and last message preview. Call before send_deal_message or when the user "
+                "asks about their deal chats / negotiating a request."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "max": {"type": "integer", "description": "Max deals to return (default 10)."}
+                },
+                "required": [],
+            },
+        },
+        {
+            "type": "function",
+            "name": "send_deal_message",
+            "description": (
+                "Send a TEXT message in an existing deal chat. Use get_my_deals to find deal_id. Images in deal chat "
+                "must be sent from the Deal space screen in the app — you can only send text here. Call when the user "
+                "asks you to message the other person in a deal."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "deal_id": {"type": "string", "description": "From get_my_deals."},
+                    "message": {"type": "string", "description": "The text to send in the deal chat."},
+                },
+                "required": ["deal_id", "message"],
             },
         },
         {
@@ -8940,7 +9104,9 @@ def _realtime_instructions(is_thai: bool, today_str: str = "", tz_label: str = "
         "birth details with save_fate_profile so next time is instant; only call save_fate_profile after they agree. "
         "BOOKING (discover → check → book): EVO unifies bookable experiences into the planner, so when the user "
         "wants to book, rent, reserve, or borrow something — a stay, gear, a court, a class, a service — call "
-        "find_offerings (shape the query from what they want). Recommend 1-2 real matches with price and where "
+        "find_offerings (shape the query from what they want; if they name the provider/host — 'book from SP "
+        "Lab' — pass it as host with query empty to get that provider's full inventory). Recommend 1-2 real "
+        "matches with price and where "
         "they are; never invent offerings — if it returns nothing, say so. When they pick one, call "
         "get_offering_availability (booking_item_id + owner_uid) to confirm the date is open, and offer the "
         "nearest open day if theirs is full. To book, call book_offering FIRST without confirmed to get the "
@@ -8950,18 +9116,30 @@ def _realtime_instructions(is_thai: bool, today_str: str = "", tz_label: str = "
         "POSTING A REQUEST (the other direction): when the user wants something NOBODY has listed — hire a person "
         "or service, or rent gear that find_offerings didn't turn up ('find me a cleaner this weekend', 'I need a "
         "drone Saturday', 'looking for a tutor') — offer to POST A REQUEST so hosts come to them. Gather the "
-        "essentials in 1-2 quick questions (what exactly, when, and roughly where), then call create_demand FIRST "
-        "without confirmed to get the summary, read it back and ask them to confirm, and only then call it again "
-        "with confirmed=true. Tell them the request is live, hosts can now respond, and they'll be notified — they "
-        "can ask you anytime how many offers came in (get_my_demands), or to see the actual offers with each "
-        "responder's price and rating (get_demand_offers) so they can compare before choosing in the app. Prefer "
-        "booking an existing listing when one fits (find_offerings); use create_demand when nothing matches or they "
-        "clearly want to broadcast a need. "
+        "essentials in 1-2 quick questions (what exactly, when, roughly where, how many offers to compare, and whether "
+        "they have a fixed budget or flexible price), then call create_demand FIRST without confirmed to get the "
+        "summary, read it back and ask them to confirm, and only then call it again with confirmed=true. Use "
+        "offers_wanted (default 1) when they want multiple quotes; request_price when they state a budget; otherwise "
+        "leave price flexible. Reference photos must be added in the app after posting. Tell them the request is live, "
+        "hosts can now respond, and they'll be notified — they can ask you anytime how many offers came in "
+        "(get_my_demands), or to see the actual offers with each responder's price, quantity, and rating "
+        "(get_demand_offers) so they can compare before choosing in the app. Prefer booking an existing listing when "
+        "one fits (find_offerings); use create_demand when nothing matches or they clearly want to broadcast a need. "
         "REQUEST MARKETPLACE (responder side): when the user wants to HELP others / earn / find requests to fulfil "
         "('what can I help with', 'any requests near me', 'who needs X'), call find_open_requests (pass area/query) "
-        "and read back a couple. To offer on one, use offer_on_request with its demand_id — two-phase: call without "
-        "confirmed to summarize the request + their price, confirm out loud, then call with confirmed=true; tell them "
-        "the deal chat is open (or their offer is queued). "
+        "and read back a couple including budget/price flexibility. To offer on one, use offer_on_request with its "
+        "demand_id — two-phase: call without confirmed to summarize the request + price + quantity, confirm out loud, "
+        "then call with confirmed=true; if flexible_price you must include price; pass quantity for group/bundle offers. "
+        "Tell them the deal chat is open (or their offer is queued). "
+        "DEAL CHAT: when negotiating an active deal, call get_my_deals to list deal_id, then send_deal_message for "
+        "text messages. Images in deal chat must be sent from the Deal space screen in the app. "
+        "PROVIDER SIDE (their own business): when the user asks about their OWN listings/services ('what do I "
+        "offer?', 'is my studio active?'), call get_my_offerings — NOT find_offerings, which is a public keyword "
+        "search and can miss their items. When they ask about incoming bookings, reservation requests, or who "
+        "booked them, call get_booking_requests: read pending_requests first (these need their approval in the "
+        "app), then received_bookings; my_bookings_as_customer is what they booked elsewhere. It scans 60 days "
+        "ahead — pass days for further out. For their schedule on specific dates beyond this month, remember "
+        "get_calendar takes date/start_date/end_date. "
         "GUIDED VOICE BOOKING — when the user wants to book or rent something, carry it all the way to a confirmed "
         "booking, gathering details ONE step at a time (never ask for everything at once, and never re-ask what they "
         "already told you): (1) if you don't already have a specific listing, call find_offerings and read back the "
@@ -9049,9 +9227,11 @@ def evo_realtime_session(req: https_fn.Request) -> https_fn.Response:
         # Optional screen context (e.g. the task/plan the user is currently viewing).
         context_hint = str(data.get('context') or data.get('contextHint') or '').strip()
         if context_hint:
+            # 6000 (was 1800): the client hint now leads with the ~1600-char synthesized
+            # user memory; the old cap silently truncated persona/notes that followed it.
             instructions = (
                 f"{instructions} Context about the user (current screen, saved notes, recent daily notes): "
-                f"{context_hint[:1800]} Use it to ground your answers when relevant."
+                f"{context_hint[:6000]} Use it to ground your answers when relevant."
             )
 
         tools = _realtime_voice_tool_specs()
