@@ -27,7 +27,92 @@ from firebase_functions.params import SecretParam
 # Injected at deploy when bound on functions that need them (see decorators).
 _EVO_FIREBASE_SA_SECRET = SecretParam("EVO_FIREBASE_SERVICE_ACCOUNT_JSON")
 _OPENAI_API_KEY_SECRET = SecretParam("OPENAI_API_KEY")
-_LLM_SECRETS = [_EVO_FIREBASE_SA_SECRET, _OPENAI_API_KEY_SECRET]
+_XAI_API_KEY_SECRET = SecretParam("XAI_API_KEY")
+_LLM_SECRETS = [_EVO_FIREBASE_SA_SECRET, _OPENAI_API_KEY_SECRET, _XAI_API_KEY_SECRET]
+
+# xAI Grok Voice Agent — built-in voices; anything else is treated as a custom voice_id.
+# All 71 built-in voices from the xAI console voice library.
+_XAI_BUILTIN_VOICES = frozenset({
+    "ara", "eve", "leo", "rex", "sal", "jian", "hao", "xia", "pavel", "andrei", "dmitri",
+    "irina", "enzo", "matteo", "luca", "alessandro", "karan", "ananya", "remi", "hugo",
+    "camille", "manuel", "javier", "diego", "andres", "kasper", "lars", "ida", "duc",
+    "grace", "axel", "valtteri", "aylin", "sakura", "helmi", "jun-seo", "min-jun", "ren",
+    "mateus", "thijs", "seo-yeon", "katarzyna", "daniel", "krit", "eero", "minh", "claire",
+    "james", "khalid", "beatriz", "emre", "femke", "aroon", "saga", "clara", "moritz",
+    "niklas", "rafael", "lena", "mateusz", "layla", "elina", "jakub", "noor", "ruben",
+    "ji-yeon", "tariq", "erik", "aleksandra", "kaan", "mai",
+})
+_XAI_DEFAULT_VOICE = "eve"
+_XAI_DEFAULT_MODEL = "grok-voice-latest"
+_OPENAI_DEFAULT_VOICE = "alloy"
+_OPENAI_DEFAULT_MODEL = "gpt-realtime"
+_OPENAI_BUILTIN_VOICES = frozenset({
+    "alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer", "verse", "marin", "cedar",
+})
+_REALTIME_PROVIDERS = frozenset({"openai", "xai"})
+_REALTIME_DEFAULT_PROVIDER = "openai"
+# Max user-context chars appended to realtime/coach instructions (keeps prompt cache stable).
+_REALTIME_CONTEXT_MAX_CHARS = 2000
+# Legacy OpenAI realtime voice ids → closest xAI built-in.
+_OPENAI_TO_XAI_VOICE = {
+    "alloy": "eve",
+    "ash": "rex",
+    "ballad": "ara",
+    "coral": "ara",
+    "echo": "rex",
+    "fable": "sal",
+    "nova": "eve",
+    "onyx": "leo",
+    "sage": "sal",
+    "shimmer": "ara",
+    "verse": "rex",
+    "marin": "sal",
+    "cedar": "leo",
+}
+# xAI built-in → closest OpenAI realtime voice (for provider switches).
+_XAI_TO_OPENAI_VOICE = {
+    "eve": "alloy",
+    "ara": "shimmer",
+    "rex": "echo",
+    "sal": "sage",
+    "leo": "onyx",
+}
+
+
+def _normalize_realtime_provider(raw: str) -> str:
+    provider = str(raw or "").strip().lower()
+    if provider in _REALTIME_PROVIDERS:
+        return provider
+    return _REALTIME_DEFAULT_PROVIDER
+
+
+def _normalize_openai_voice(raw: str) -> str:
+    voice = str(raw or "").strip()
+    if not voice:
+        return _OPENAI_DEFAULT_VOICE
+    lower = voice.lower()
+    if lower in _OPENAI_BUILTIN_VOICES:
+        return lower
+    mapped = _XAI_TO_OPENAI_VOICE.get(lower)
+    if mapped:
+        return mapped
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", voice):
+        return lower
+    return _OPENAI_DEFAULT_VOICE
+
+
+def _normalize_xai_voice(raw: str) -> str:
+    """Accept a built-in xAI voice or a custom voice_id from the client."""
+    voice = str(raw or "").strip()
+    if not voice:
+        return _XAI_DEFAULT_VOICE
+    mapped = _OPENAI_TO_XAI_VOICE.get(voice.lower())
+    if mapped:
+        return mapped
+    # Built-ins are lowercase names; custom voice_ids are also lowercase alnum (docs).
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", voice):
+        return voice.lower()
+    return _XAI_DEFAULT_VOICE
 from firebase_admin import initialize_app, storage, firestore
 from fastapi import HTTPException
 from pydantic import BaseModel, Field, ValidationError
@@ -5730,12 +5815,17 @@ def suggest_personalized_content(req: https_fn.Request) -> https_fn.Response:
             except Exception as e:
                 logger.warning("RAG retrieval failed in suggest_personalized_content: %s", e)
 
+        outcome_history = data.get('outcome_history')
+        if outcome_history is not None and not isinstance(outcome_history, dict):
+            outcome_history = None
+
         pu = get_planner_utils()
         suggestions = pu.suggest_personalized_content(
             user_context=user_context,
             booking_candidates=booking_candidates if isinstance(booking_candidates, list) else [],
             planner_candidates=planner_candidates if isinstance(planner_candidates, list) else [],
             language=data.get('language', 'english'),
+            outcome_history=outcome_history,
         )
         if suggestions is None:
             return create_response(
@@ -8436,7 +8526,8 @@ def _realtime_voice_tool_specs() -> list:
                     "title": {"type": "string", "description": "Short task title."},
                     "date": {"type": "string", "description": "Date as YYYY-MM-DD. Default today if unsaid."},
                     "time": {"type": "string", "description": "Start time as 24h HH:MM. Omit if no specific time."},
-                    "detail": {"type": "string", "description": "Concrete how-to steps for the task (exercises/sets/reps, or sub-steps) when guidance helps; else short notes."},
+                    "detail": {"type": "string", "description": "Concrete how-to steps for the task when guidance helps; else short notes. FORMAT: one step per line, each line starting with '- ' (or '1. ' numbering), specs inline — e.g. '- Bench press 3x12\\n- Incline dumbbell press 3x10\\n- Cable fly 3x15'. Never write steps as a prose paragraph — the app renders these lines as a step checklist."},
+                    "brief": {"type": "string", "description": "Required when detail has steps: 1-2 sentence overview of what this is and why (shown above the checklist in the app). Example: 'Clean high-protein stir-fry — quick lunch under 30 minutes.'"},
                     "location": {"type": "string", "description": "Optional location label (legacy). Prefer address + lat/lng from find_places."},
                     "address": {"type": "string", "description": "Full venue address from find_places (shows map preview on the task)."},
                     "lat": {"type": "number", "description": "Latitude from find_places."},
@@ -8461,7 +8552,8 @@ def _realtime_voice_tool_specs() -> list:
                     "todo_id": {"type": "string", "description": "todoID from a prior get_calendar result."},
                     "title": {"type": "string", "description": "Task title, as a fallback if todo_id is unknown."},
                     "date": {"type": "string", "description": "Date YYYY-MM-DD, to disambiguate which instance."},
-                    "detail": {"type": "string", "description": "The concrete how-to steps to save on the task."},
+                    "detail": {"type": "string", "description": "The concrete how-to steps to save on the task. FORMAT: one step per line, each line starting with '- ' (or '1. ' numbering), specs inline — e.g. '- Bench press 3x12\\n- Incline dumbbell press 3x10'. Never a prose paragraph — the app renders these lines as a step checklist."},
+                    "brief": {"type": "string", "description": "Required when detail has steps: 1-2 sentence overview of what this is and why (shown above the checklist in the app)."},
                     "append": {"type": "boolean", "description": "Default behavior ADDS to existing notes (preserves the user's own writing). Pass append=false only if the user explicitly wants to replace existing detail."},
                 },
                 "required": ["detail"],
@@ -8893,6 +8985,21 @@ def _realtime_voice_tool_specs() -> list:
         },
         {
             "type": "function",
+            "name": "get_reentry_state",
+            "description": (
+                "Read whether the user is currently in a lapse re-entry period (days away from practice) and "
+                "their top focus task for a smallest-next-rep restart. Call when they ask how they're doing "
+                "getting back on track, or when coaching a return after time away. Recovery framing only — "
+                "never guilt or streak language."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+        {
+            "type": "function",
             "name": "get_booking_suggestions",
             "description": (
                 "Get bookable experiences worth SUGGESTING to the user — ranked against their life goal and "
@@ -9080,7 +9187,8 @@ def _realtime_instructions(is_thai: bool, today_str: str = "", tz_label: str = "
         "mention title and channel only, and save the link on the task for tap-to-open. "
         "When the guidance belongs on a task they'll do later, SAVE it onto the task: put the steps (and a "
         "chosen video link on its own line) in create_task's `detail` for a new task, or call set_task_detail "
-        "(find the existing task's todo_id via get_calendar first). set_task_detail ADDS to any existing notes "
+        "(find the existing task's todo_id via get_calendar first). Always pass `brief` too — 1-2 sentences "
+        "summarizing what the saved steps are for (the app shows this above the checklist). set_task_detail ADDS to any existing notes "
         "by default, so you never erase the user's own writing — only pass append=false if they explicitly ask "
         "to replace. After saving, tell them briefly that you added the detail to the task (they can open it "
         "in the app) — do NOT read back any of the saved text, steps, or links. Keep saved detail concrete "
@@ -9172,11 +9280,13 @@ def _realtime_instructions(is_thai: bool, today_str: str = "", tz_label: str = "
 # (time-to-talk is the make-or-break first impression for a voice feature).
 @https_fn.on_request(memory=256, min_instances=1, max_instances=5, timeout_sec=30, cpu=1, secrets=_LLM_SECRETS)
 def evo_realtime_session(req: https_fn.Request) -> https_fn.Response:
-    """Mint a short-lived OpenAI Realtime ephemeral token for client-side WebRTC voice.
+    """Mint a short-lived Realtime ephemeral token for client-side voice (OpenAI or xAI).
 
     The real API key never leaves the server. The client uses the returned token to open a
-    WebRTC peer connection straight to OpenAI, then applies the returned `session` config
-    (instructions, voice, turn detection, tools) via a session.update over the data channel.
+    WebSocket (or WebRTC) connection to the chosen provider, then applies the returned
+    `session` config (instructions, voice, turn detection, tools) via session.update.
+
+    Request body may include `provider`: "openai" (default) or "xai".
     """
     if req.method == 'OPTIONS':
         return handle_preflight_request()
@@ -9191,22 +9301,50 @@ def evo_realtime_session(req: https_fn.Request) -> https_fn.Response:
 
     try:
         import requests
-        from openai_api_key import resolve_openai_api_key
-
-        api_key = resolve_openai_api_key()
-        if not api_key:
-            return create_response(
-                success=False,
-                message='Realtime unavailable',
-                error='OpenAI API key is not configured',
-                status_code=503
-            )
 
         data = req.get_json(silent=True) or {}
-        model = str(data.get('model') or 'gpt-realtime').strip() or 'gpt-realtime'
-        voice = str(data.get('voice') or 'alloy').strip() or 'alloy'
+        provider = _normalize_realtime_provider(
+            data.get('provider') or data.get('voiceProvider') or data.get('voice_provider')
+        )
         language = str(data.get('language') or data.get('languageSelected') or 'english').strip().lower()
         is_thai = language in {'thai', 'th', 'ไทย'}
+
+        if provider == 'xai':
+            from xai_api_key import resolve_xai_api_key
+
+            api_key = resolve_xai_api_key()
+            if not api_key:
+                return create_response(
+                    success=False,
+                    message='Realtime unavailable',
+                    error='xAI API key is not configured',
+                    status_code=503
+                )
+            model = str(data.get('model') or _XAI_DEFAULT_MODEL).strip() or _XAI_DEFAULT_MODEL
+            voice = _normalize_xai_voice(
+                data.get('voice') or data.get('voice_id') or data.get('voiceId') or _XAI_DEFAULT_VOICE
+            )
+            client_secrets_url = 'https://api.x.ai/v1/realtime/client_secrets'
+            sessions_url = 'https://api.x.ai/v1/realtime/sessions'
+            provider_label = 'xAI'
+        else:
+            from openai_api_key import resolve_openai_api_key
+
+            api_key = resolve_openai_api_key()
+            if not api_key:
+                return create_response(
+                    success=False,
+                    message='Realtime unavailable',
+                    error='OpenAI API key is not configured',
+                    status_code=503
+                )
+            model = str(data.get('model') or _OPENAI_DEFAULT_MODEL).strip() or _OPENAI_DEFAULT_MODEL
+            voice = _normalize_openai_voice(
+                data.get('voice') or data.get('voice_id') or data.get('voiceId') or _OPENAI_DEFAULT_VOICE
+            )
+            client_secrets_url = 'https://api.openai.com/v1/realtime/client_secrets'
+            sessions_url = 'https://api.openai.com/v1/realtime/sessions'
+            provider_label = 'OpenAI'
 
         # Prefer the client's local date (device truth); fall back to a tz-aware server date.
         today_str = str(data.get('today') or data.get('todayYmd') or '').strip()[:10]
@@ -9224,17 +9362,15 @@ def evo_realtime_session(req: https_fn.Request) -> https_fn.Response:
         now_time = str(data.get('now_time') or data.get('nowTime') or '').strip()[:5]
         instructions = _realtime_instructions(is_thai, today_str, tz_label, now_time)
 
-        # Optional screen context (e.g. the task/plan the user is currently viewing).
         context_hint = str(data.get('context') or data.get('contextHint') or '').strip()
         if context_hint:
-            # 6000 (was 1800): the client hint now leads with the ~1600-char synthesized
-            # user memory; the old cap silently truncated persona/notes that followed it.
             instructions = (
                 f"{instructions} Context about the user (current screen, saved notes, recent daily notes): "
-                f"{context_hint[:6000]} Use it to ground your answers when relevant."
+                f"{context_hint[:_REALTIME_CONTEXT_MAX_CHARS]} Use it to ground your answers when relevant."
             )
 
         tools = _realtime_voice_tool_specs()
+        language_hint = 'th' if is_thai else 'en'
 
         headers = {
             'Authorization': f'Bearer {api_key}',
@@ -9243,30 +9379,37 @@ def evo_realtime_session(req: https_fn.Request) -> https_fn.Response:
 
         token = ""
         expires_at = None
-        # Preferred: GA client_secrets endpoint.
         try:
             resp = requests.post(
-                'https://api.openai.com/v1/realtime/client_secrets',
+                client_secrets_url,
                 headers=headers,
                 json={'session': {'type': 'realtime', 'model': model}},
-                # 8s (was 15): if GA is slow we still have room to fall through to the legacy
-                # mint AND answer within the client's 25s connect watchdog, instead of the
-                # client timing out while two 15s mints ran back to back.
                 timeout=8,
             )
             if resp.status_code < 300:
                 body = resp.json() or {}
                 token = str(body.get('value') or '')
                 expires_at = body.get('expires_at')
+                if not token:
+                    secret = body.get('client_secret')
+                    if isinstance(secret, dict):
+                        token = str(secret.get('value') or '')
+                        expires_at = secret.get('expires_at') or expires_at
+                    elif isinstance(secret, str):
+                        token = secret.strip()
             else:
-                logger.warning("client_secrets mint failed (%s): %s", resp.status_code, resp.text[:300])
+                logger.warning(
+                    "%s client_secrets mint failed (%s): %s",
+                    provider_label,
+                    resp.status_code,
+                    resp.text[:300],
+                )
         except Exception as primary_error:
-            logger.warning("client_secrets mint error: %s", primary_error)
+            logger.warning("%s client_secrets mint error: %s", provider_label, primary_error)
 
-        # Fallback: legacy sessions endpoint (gpt-4o-realtime-preview era).
         if not token:
             resp = requests.post(
-                'https://api.openai.com/v1/realtime/sessions',
+                sessions_url,
                 headers=headers,
                 json={'model': model, 'voice': voice},
                 timeout=15,
@@ -9280,38 +9423,65 @@ def evo_realtime_session(req: https_fn.Request) -> https_fn.Response:
                 )
             body = resp.json() or {}
             secret = body.get('client_secret') or {}
-            token = str(secret.get('value') or '')
-            expires_at = secret.get('expires_at')
+            if isinstance(secret, dict):
+                token = str(secret.get('value') or '')
+                expires_at = secret.get('expires_at')
+            else:
+                token = str(body.get('value') or secret or '')
+                expires_at = body.get('expires_at')
 
         if not token:
             return create_response(
                 success=False,
                 message='Realtime session mint failed',
-                error='No ephemeral token returned by OpenAI',
+                error=f'No ephemeral token returned by {provider_label}',
                 status_code=502
             )
+
+        turn_detection = {
+            'type': 'server_vad',
+            'silence_duration_ms': 800,
+            'prefix_padding_ms': 300,
+            'threshold': 0.35 if provider == 'xai' else 0.5,
+        }
+
+        if provider == 'xai':
+            session_payload = {
+                'instructions': instructions,
+                'voice': voice,
+                'turn_detection': turn_detection,
+                'audio': {
+                    'input': {
+                        'format': {'type': 'audio/pcm', 'rate': 24000},
+                        'transcription': {
+                            'model': 'grok-transcribe',
+                            'language_hint': language_hint,
+                        },
+                    },
+                    'output': {
+                        'format': {'type': 'audio/pcm', 'rate': 24000},
+                    },
+                },
+                'tools': tools,
+                'tool_choice': 'auto',
+            }
+        else:
+            session_payload = {
+                'instructions': instructions,
+                'voice': voice,
+                'modalities': ['audio', 'text'],
+                'turn_detection': turn_detection,
+                'tools': tools,
+                'tool_choice': 'auto',
+            }
 
         return create_response(
             data={
                 'token': token,
                 'expires_at': expires_at,
                 'model': model,
-                # Client applies this via session.update after the WebRTC connection opens.
-                'session': {
-                    'instructions': instructions,
-                    'voice': voice,
-                    'modalities': ['audio', 'text'],
-                    'turn_detection': {
-                        'type': 'server_vad',
-                        # 800ms (was 500): a half-second pause mid-thought was grabbing the turn and
-                        # cutting users off — especially slower / Thai speakers who pause naturally.
-                        'silence_duration_ms': 800,
-                        'prefix_padding_ms': 300,
-                        'threshold': 0.5,
-                    },
-                    'tools': tools,
-                    'tool_choice': 'auto',
-                },
+                'provider': provider,
+                'session': session_payload,
             },
             message='Realtime session ready'
         )
@@ -9349,6 +9519,13 @@ _COACH_CHAT_TEXT_MODE = (
     "Keep replies short (2-4 sentences); a short list or a little **bold** is fine when it genuinely helps. "
     "Don't paste long raw URLs into the reply — mention the title and save links onto tasks via set_task_detail. "
     "Tools work exactly like in voice: call them to read real data or act — never guess calendar/plan contents."
+)
+
+_PROACTIVE_CHECKIN_INSTRUCTION = (
+    " PROACTIVE CHECK-IN: if the first user message starts with [proactive-checkin], this conversation "
+    "was initiated BY YOU (EVO) via a proactive outreach push. The bracketed message is internal context, "
+    "not the user speaking. Open warmly and concretely; offer exactly one small action; never mention "
+    "streaks or guilt. Do not quote the bracketed prefix back to the user."
 )
 
 _COACH_CHAT_ALLOWED_ROLES = {"user", "assistant", "tool"}
@@ -9470,12 +9647,17 @@ def evo_coach_chat(req: https_fn.Request) -> https_fn.Response:
         if context_hint:
             instructions = (
                 f"{instructions} Context about the user (profile, goals, saved notes, recent moods, "
-                f"today's plan): {context_hint[:6000]} Use it to ground your answers when relevant."
+                f"today's plan): {context_hint[:_REALTIME_CONTEXT_MAX_CHARS]} Use it to ground your answers when relevant."
             )
+
+        first_user = next((m for m in messages if m.get('role') == 'user'), None)
+        first_user_text = str((first_user or {}).get('content') or '')
+        if first_user_text.startswith('[proactive-checkin]'):
+            instructions = instructions + _PROACTIVE_CHECKIN_INSTRUCTION
 
         model = str(data.get('model') or '').strip()
         if model not in _COACH_CHAT_MODELS:
-            model = 'gpt-4o'
+            model = 'gpt-4o-mini'
         # `final=true` forces a plain-text answer (client's last round after the tool budget is spent).
         final_round = bool(data.get('final'))
 

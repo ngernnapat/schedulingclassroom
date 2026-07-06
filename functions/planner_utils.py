@@ -367,7 +367,9 @@ class PromptBuilder:
             "You are EVO — a lifestyle planner coach. Given a user's goals, plans, recent todos, "
             "and pre-scored candidate bookings/plans, pick the best matches and write short, "
             "specific reasons (one sentence each). Prefer items that advance their stated goals "
-            "and complement what they already do. Include one exploratory pick when scores are low. "
+            "and complement what they already do. Prefer candidates similar to what the user has "
+            "actually acted on (outcome_history); explain reasons using their demonstrated "
+            "preferences, not only stated goals. Include one exploratory pick when scores are low. "
             "Output ONLY valid JSON with this exact shape:\n"
             '{"bookings":[{"booking_item_id":"...","reason":"..."}],'
             '"planners":[{"plan_id":"...","reason":"..."}]}\n'
@@ -735,6 +737,7 @@ class PlannerUtils:
         booking_candidates: Optional[List[Dict[str, Any]]] = None,
         planner_candidates: Optional[List[Dict[str, Any]]] = None,
         language: str = "english",
+        outcome_history: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Rank booking + planner candidates; return structured suggestions for the backend cache."""
         bookings_in = [b for b in (booking_candidates or []) if isinstance(b, dict)]
@@ -769,6 +772,19 @@ class PlannerUtils:
                 ]
                 if todo_titles:
                     ctx_lines.append("Recent todos: " + "; ".join(todo_titles))
+
+            outcomes = outcome_history if isinstance(outcome_history, dict) else {}
+            affinity = outcomes.get("affinity") if isinstance(outcomes.get("affinity"), dict) else {}
+            if affinity:
+                parts = []
+                for key, counts in list(affinity.items())[:12]:
+                    if not isinstance(counts, dict):
+                        continue
+                    parts.append(
+                        f"{key}: actedOn={counts.get('actedOn', 0)}, clicked={counts.get('clicked', 0)}"
+                    )
+                if parts:
+                    ctx_lines.append("Demonstrated preferences (outcome_history): " + "; ".join(parts))
 
             if ctx_lines:
                 user_prompt += "\n\nUser context:\n" + "\n".join(ctx_lines)
@@ -911,12 +927,26 @@ class PlannerUtils:
                 "synthesis and drop stale ones; prefer patterns over one-off events; note "
                 "capacity/energy rhythms (which days or contexts work); keep the user's own "
                 "words for goals and struggles when possible.\n"
+                "For the preferences facet: incorporate which suggested experiences/plans the "
+                "user actually acted on vs ignored — this is 'what works for this user' "
+                "(demonstrated preferences, not only stated ones).\n"
                 "Return STRICT JSON only:\n"
                 '{"summary": "<=180 words, second person (\'they\'), the assistant-facing digest", '
                 '"facets": {"life_season": "...", "energy_pattern": "...", "working_well": "...", '
                 '"struggles": "...", "recent_wins": "...", "preferences": "..."}}\n'
                 "Each facet <=30 words; empty string when unknown. No markdown, no extra keys."
             )
+
+            outcomes = s.get("suggestionOutcomes") if isinstance(s.get("suggestionOutcomes"), dict) else {}
+            affinity = outcomes.get("affinity") if isinstance(outcomes.get("affinity"), dict) else {}
+            outcome_lines = []
+            for key, counts in list(affinity.items())[:12]:
+                if not isinstance(counts, dict):
+                    continue
+                outcome_lines.append(
+                    f"- {key}: actedOn={counts.get('actedOn', 0)}, clicked={counts.get('clicked', 0)}"
+                )
+            outcomes_block = "\n".join(outcome_lines)
 
             user_prompt = (
                 f"PREVIOUS SYNTHESIS (may be empty):\n{prior_summary or '(none)'}\n\n"
@@ -927,6 +957,7 @@ class PlannerUtils:
                 f"WEEKDAY COMPLETION: {weekday_block or '(none)'}\n\n"
                 f"EXPERIENCE REFLECTIONS:\n{reflections_block or '(none)'}\n\n"
                 f"THINGS THE USER ASKED THE ASSISTANT TO REMEMBER:\n{coach_notes_block or '(none)'}\n\n"
+                f"SUGGESTION OUTCOMES (acted on vs ignored):\n{outcomes_block or '(none)'}\n\n"
                 f"Write the summary and facets in {normalized_language}."
             )
 
@@ -2281,6 +2312,7 @@ def suggest_personalized_content(
     booking_candidates: Optional[List[Dict[str, Any]]] = None,
     planner_candidates: Optional[List[Dict[str, Any]]] = None,
     language: str = "english",
+    outcome_history: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Backward compatibility wrapper for personalized booking/planner suggestions."""
     planner = get_default_planner()
@@ -2289,6 +2321,7 @@ def suggest_personalized_content(
         booking_candidates=booking_candidates,
         planner_candidates=planner_candidates,
         language=language,
+        outcome_history=outcome_history,
     )
 
 def message_in_the_morning(
