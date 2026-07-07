@@ -256,6 +256,24 @@ class TimeStamp(BaseModel):
     seconds: int = Field(..., description="Unix seconds")
     nanoseconds: int = Field(..., ge=0, lt=1_000_000_000, description="0..999,999,999")
 
+class TaskVideo(BaseModel):
+    """Real YouTube video attached post-generation (planner_enrichment.py). Not part of the LLM schema."""
+    videoId: str
+    title: str
+    channel: Optional[str] = None
+    url: str
+    thumbnail: Optional[str] = None
+
+class TaskPlace(BaseModel):
+    """Real Google Places venue attached post-generation. Never store key-bearing URLs (e.g. staticMapUrl)."""
+    name: str
+    address: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    rating: Optional[float] = None
+    placeId: Optional[str] = None
+    mapsUrl: Optional[str] = None
+
 class Task(BaseModel):
     id: constr(strip_whitespace=True, min_length=1) = Field(default_factory=lambda: uuid.uuid4().hex[:8])
     text: constr(strip_whitespace=True, min_length=1)
@@ -263,6 +281,9 @@ class Task(BaseModel):
     duration_min: Optional[conint(ge=0, le=600)] = None   # optional per-task duration
     note: Optional[str] = None
     link: Optional[constr(strip_whitespace=True, min_length=1)] = Field(None, description="Optional helpful link or resource for this task")
+    # Post-generation enrichment (real API data) — never produced by the LLM itself.
+    video: Optional[TaskVideo] = None
+    place: Optional[TaskPlace] = None
 
 class DayPlan(BaseModel):
     id: constr(strip_whitespace=True, min_length=1) = Field(default_factory=lambda: uuid.uuid4().hex[:8])
@@ -400,6 +421,11 @@ class GeneratePlannerRequest(BaseModel):
     skipContextExtraction: bool = Field(
         default=False,
         description="Skip the context extraction step for faster generation (less personalized)"
+    )
+
+    enrich: Optional[bool] = Field(
+        default=True,
+        description="Attach real YouTube videos / Google Places to tasks after generation (post-generation enrichment)"
     )
 
     userId: Optional[str] = Field(
@@ -2382,6 +2408,14 @@ TASK EXAMPLES:
                 is_refinement=True,
             )
             result.createdAt = created_at
+            # Full refine rebuilds from scratch — keep the existing cover
+            # (mirrors the partial branch, which carries it via PlannerContent()).
+            result.coverImage = existing.coverImage
+            result.coverImageUrl = existing.coverImageUrl
+
+        # Enrich only tasks the refinement touched (existing video/place survive
+        # PlannerContent.model_validate above because the fields live on Task).
+        result = self._maybe_enrich(result, gen_req, progress_callback, skip_existing=True)
 
         self._emit_progress(
             progress_callback,
@@ -2406,8 +2440,29 @@ TASK EXAMPLES:
             stages_completed=0,
         )
         if req.totalDays > 7:
-            return self.generate_chunked(req, progress_callback=progress_callback)
-        return self.generate_single(req, progress_callback=progress_callback)
+            content = self.generate_chunked(req, progress_callback=progress_callback)
+        else:
+            content = self.generate_single(req, progress_callback=progress_callback)
+        return self._maybe_enrich(content, req, progress_callback)
+
+    def _maybe_enrich(
+        self,
+        content: PlannerContent,
+        req: GeneratePlannerRequest,
+        progress_callback: Optional[ProgressCallback] = None,
+        skip_existing: bool = False,
+    ) -> PlannerContent:
+        """Attach real YouTube videos / Google Places (soft-fail, post-generation)."""
+        if not getattr(req, "enrich", True) or os.getenv("PLANNER_ENRICHMENT_DISABLED"):
+            return content
+        try:
+            from planner_enrichment import enrich_planner_content  # lazy import, no cycle
+            content = enrich_planner_content(
+                content, req, progress_callback, skip_existing=skip_existing
+            )
+        except Exception as e:
+            print(f"Enrichment skipped: {e}")
+        return content
 
     def generate_single(
         self,

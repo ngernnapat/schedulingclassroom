@@ -28,7 +28,16 @@ from firebase_functions.params import SecretParam
 _EVO_FIREBASE_SA_SECRET = SecretParam("EVO_FIREBASE_SERVICE_ACCOUNT_JSON")
 _OPENAI_API_KEY_SECRET = SecretParam("OPENAI_API_KEY")
 _XAI_API_KEY_SECRET = SecretParam("XAI_API_KEY")
-_LLM_SECRETS = [_EVO_FIREBASE_SA_SECRET, _OPENAI_API_KEY_SECRET, _XAI_API_KEY_SECRET]
+# GOOGLE_API_KEY: server-side key for YouTube Data v3 + Places (planner enrichment).
+# Must exist in Secret Manager before deploy (firebase functions:secrets:set GOOGLE_API_KEY);
+# google_api_key.py also falls back to Firestore ai_api_key/google-api-key.
+_GOOGLE_API_KEY_SECRET = SecretParam("GOOGLE_API_KEY")
+_LLM_SECRETS = [
+    _EVO_FIREBASE_SA_SECRET,
+    _OPENAI_API_KEY_SECRET,
+    _XAI_API_KEY_SECRET,
+    _GOOGLE_API_KEY_SECRET,
+]
 
 # xAI Grok Voice Agent — built-in voices; anything else is treated as a custom voice_id.
 # All 71 built-in voices from the xAI console voice library.
@@ -7595,7 +7604,9 @@ def get_user_intent_profile(req: https_fn.Request) -> https_fn.Response:
         )
 
 
-def _upload_ai_coach_image_b64(image_b64: str, *, user_id: str = "anonymous") -> str:
+def _upload_ai_coach_image_b64(
+    image_b64: str, *, user_id: str = "anonymous", folder: str = "ai-coach-images"
+) -> str:
     """Persist generated image bytes to Firebase Storage and return a download URL."""
     if not image_b64:
         raise ValueError("empty image payload")
@@ -7603,7 +7614,7 @@ def _upload_ai_coach_image_b64(image_b64: str, *, user_id: str = "anonymous") ->
     raw = base64.b64decode(image_b64)
     bucket = storage.bucket()
     token = str(uuid.uuid4())
-    object_path = f"ai-coach-images/{user_id}/{uuid.uuid4()}.png"
+    object_path = f"{folder}/{user_id}/{uuid.uuid4()}.png"
     blob = bucket.blob(object_path)
     blob.upload_from_string(raw, content_type="image/png")
     blob.metadata = {"firebaseStorageDownloadTokens": token}
@@ -7689,6 +7700,94 @@ def evo_image_generation(req: https_fn.Request) -> https_fn.Response:
         return create_response(
             success=False,
             message='Image generation failed',
+            error=str(e),
+            status_code=500
+        )
+
+
+@https_fn.on_request(memory=1024, max_instances=3, timeout_sec=540, cpu=1, secrets=_LLM_SECRETS)
+def generate_planner_images(req: https_fn.Request) -> https_fn.Response:
+    """Generate AI cover + weekly theme images for a planner (background phase).
+
+    Called by backend's V2_processPlannerImageJob AFTER the plan is completed
+    and usable. Returns URLs only — Node patches the plan doc (aiImages field).
+    """
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+
+    if req.method != 'POST':
+        return create_response(
+            success=False,
+            message='Method not allowed',
+            error='Only POST method is allowed',
+            status_code=405
+        )
+
+    try:
+        data = req.get_json() or {}
+        plan_name = str(data.get('planName') or '').strip()
+        if not plan_name:
+            return create_response(
+                success=False,
+                message='Missing required field',
+                error='planName is required',
+                status_code=400
+            )
+        try:
+            total_days = max(1, min(int(data.get('totalDays') or 0), 90))
+        except (TypeError, ValueError):
+            total_days = 0
+        if not total_days:
+            return create_response(
+                success=False,
+                message='Missing required field',
+                error='totalDays is required',
+                status_code=400
+            )
+
+        user_id = str(data.get('userId') or data.get('user_id') or 'anonymous').strip() or 'anonymous'
+        category = str(data.get('category') or 'other').strip() or 'other'
+        language = str(data.get('language') or 'en').strip() or 'en'
+        overview = str(data.get('overview') or '')
+        weekly_focus = data.get('weeklyFocus')
+        if not isinstance(weekly_focus, list):
+            weekly_focus = []
+        weekly_focus = [str(f) for f in weekly_focus if isinstance(f, (str, int, float))]
+
+        from planner_images import generate_plan_images
+
+        result = generate_plan_images(
+            user_id=user_id,
+            plan_name=plan_name,
+            category=category,
+            language=language,
+            total_days=total_days,
+            overview=overview,
+            weekly_focus=weekly_focus,
+            upload_fn=lambda b64: _upload_ai_coach_image_b64(
+                b64, user_id=user_id, folder="planner-plan-images"
+            ),
+        )
+
+        if result.get("disabled"):
+            return create_response(data=result, message='Planner images disabled')
+
+        if not result.get("coverImageUrl") and not result.get("weekly"):
+            # Nothing produced at all — let the caller mark the job failed so a
+            # retry is possible; an empty aiImages must never be written.
+            return create_response(
+                success=False,
+                message='Image generation produced no images',
+                error='all planner images failed',
+                status_code=500
+            )
+
+        return create_response(data=result, message='Planner images generated')
+    except Exception as e:
+        logger.error("Error in generate_planner_images: %s", str(e))
+        return create_response(
+            success=False,
+            message='Planner image generation failed',
             error=str(e),
             status_code=500
         )
