@@ -785,24 +785,91 @@ def _todos_for_date(user_id: str, date_str: str, data: Optional[Dict[str, Any]])
     return _pick_todos(server, client)
 
 
+def _tool_user_synthesis(user_id: str) -> str:
+    """The distilled 'who this user is' + life arc + threads. Injected EVERY turn (not
+    keyword-gated) so the voice secretary is grounded in the SAME synthesized memory as
+    the realtime coach and the text chat — parity, mirroring the client
+    aiMemorySynthesis.formatSynthesisForPrompt / formatArcLine / formatThreadsLine."""
+    db = _evo_db()
+    uid = str(user_id or "").strip()
+    if not db or not uid:
+        return ""
+    try:
+        snap = (
+            db.collection("users").document(uid)
+            .collection("aiMemory").document("synthesis").get()
+        )
+    except Exception as exc:
+        logger.warning("voice_tools synthesis fetch failed for %s: %s", uid, exc)
+        return ""
+    if not snap or not getattr(snap, "exists", False):
+        return ""
+
+    d = snap.to_dict() or {}
+    summary = _truncate(d.get("summary"), 900)
+    if not summary:
+        return ""
+
+    parts: List[str] = [
+        "WHO THIS USER IS (distilled from their real notes, task history and reflections — "
+        "your working knowledge of them; verify if something seems to have changed): " + summary
+    ]
+
+    facets = d.get("facets") if isinstance(d.get("facets"), dict) else {}
+    facet_bits: List[str] = []
+    if facets.get("energy_pattern"):
+        facet_bits.append("Energy/capacity: " + _truncate(facets["energy_pattern"], 200))
+    if facets.get("struggles"):
+        facet_bits.append("Current struggles: " + _truncate(facets["struggles"], 200))
+    if facets.get("preferences"):
+        facet_bits.append("Preferences: " + _truncate(facets["preferences"], 200))
+    if facet_bits:
+        parts.append(". ".join(facet_bits) + ".")
+
+    # Life arc — current chapter + the one before it (years of trajectory in one line).
+    chapters = d.get("chapters") if isinstance(d.get("chapters"), list) else []
+    valid = [c for c in chapters if isinstance(c, dict) and str(c.get("title") or "").strip()]
+    if valid:
+        openc = valid[-1]
+        prev = valid[-2] if len(valid) > 1 else None
+        since = f" (since {openc.get('from')})" if openc.get("from") else ""
+        arc = f'Life arc — now in "{_truncate(openc.get("title"), 80)}"{since}'
+        arc += f'; before that "{_truncate(prev.get("title"), 80)}".' if prev else "."
+        parts.append(arc)
+
+    # Life threads — the notably strong/stalled lanes (the actionable ones).
+    threads = d.get("threads") if isinstance(d.get("threads"), dict) else {}
+    notable = {"strong", "stalled", "dormant", "building"}
+    lanes = [
+        (a, v) for a, v in threads.items()
+        if isinstance(v, dict) and str(v.get("note") or "").strip()
+    ]
+    lanes.sort(key=lambda kv: 0 if kv[1].get("state") in notable else 1)
+    lane_bits = [f"{a}: {_truncate(v.get('note'), 100)}" for a, v in lanes[:4]]
+    if lane_bits:
+        parts.append("Life threads — " + "; ".join(lane_bits) + ".")
+
+    return " ".join(parts)
+
+
 def build_voice_tool_context(
     user_id: str,
     user_text: str,
     chat_history: Optional[List[Dict[str, Any]]],
     data: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Run only the tools implied by the user's question; return a compact text block."""
+    """Always inject the synthesized user memory; additionally run the on-demand tools
+    implied by the user's question. Returns a compact text block (or '')."""
     if not user_id or not str(user_id).strip():
         return ""
 
     data = data or {}
     is_thai = str(data.get("language") or "").lower() in {"thai", "th", "ไทย"}
+    uid = str(user_id).strip()
+    synthesis_block = _tool_user_synthesis(uid)  # always-on baseline, not keyword-gated
     tool_ids = detect_voice_tool_requests(user_text, chat_history)
-    if not tool_ids:
-        return ""
 
     blocks: List[str] = []
-    uid = str(user_id).strip()
 
     if "calendar_today" in tool_ids:
         label = "วันนี้" if is_thai else "Today"
@@ -872,6 +939,5 @@ def build_voice_tool_context(
         if ranked:
             blocks.append(ranked)
 
-    if not blocks:
-        return ""
-    return "Fetched for this question:\n" + "\n\n".join(blocks)
+    fetched = ("Fetched for this question:\n" + "\n\n".join(blocks)) if blocks else ""
+    return "\n\n".join(p for p in [synthesis_block, fetched] if p)

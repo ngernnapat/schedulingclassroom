@@ -930,11 +930,26 @@ class PlannerUtils:
                 "For the preferences facet: incorporate which suggested experiences/plans the "
                 "user actually acted on vs ignored — this is 'what works for this user' "
                 "(demonstrated preferences, not only stated ones).\n"
+                "You ALSO maintain the life's timeline as parallel THREADS (one per life-"
+                "aspect: health, focus, learning, relationships, finance, leisure) and an "
+                "append-only ARC of chapters (life seasons).\n"
+                "- threads: for each aspect with real signal in ASPECT ACTIVITY, give a "
+                "one-line state. 'state' is one word (strong/steady/building/stalled/dormant); "
+                "'note' is <=20 words, honest, e.g. 'consistent 3x/wk since spring'. Omit "
+                "aspects with no signal — do NOT invent lanes.\n"
+                "- chapter_update: compare the current life-season to the PREVIOUS one. Set "
+                "changed=true ONLY when it has meaningfully shifted (a new season began — not "
+                "a normal week); then give a short 'title' (<=6 words, e.g. 'Rebuilding after "
+                "burnout'), the 1-3 'aspects' it centers on, and any 'milestones' (first-times, "
+                "returns after a lapse, plan completions). Otherwise changed=false. Chapters are "
+                "APPEND-ONLY — you never edit past ones; the system dates and closes them.\n"
                 "Return STRICT JSON only:\n"
                 '{"summary": "<=180 words, second person (\'they\'), the assistant-facing digest", '
                 '"facets": {"life_season": "...", "energy_pattern": "...", "working_well": "...", '
-                '"struggles": "...", "recent_wins": "...", "preferences": "..."}}\n'
-                "Each facet <=30 words; empty string when unknown. No markdown, no extra keys."
+                '"struggles": "...", "recent_wins": "...", "preferences": "..."}, '
+                '"threads": {"health": {"state": "...", "note": "..."}}, '
+                '"chapter_update": {"changed": false, "title": "", "aspects": [], "milestones": []}}\n'
+                "Each facet <=30 words; empty string/object when unknown. No markdown, no extra keys."
             )
 
             outcomes = s.get("suggestionOutcomes") if isinstance(s.get("suggestionOutcomes"), dict) else {}
@@ -948,17 +963,41 @@ class PlannerUtils:
                 )
             outcomes_block = "\n".join(outcome_lines)
 
+            aspect_counts = s.get("aspect_counts") if isinstance(s.get("aspect_counts"), dict) else {}
+            aspect_lines = []
+            for aspect, counts in aspect_counts.items():
+                if not isinstance(counts, dict):
+                    continue
+                aspect_lines.append(
+                    f"- {aspect}: done {counts.get('done', 0)}/{counts.get('past', 0)} past, "
+                    f"{counts.get('upcoming', 0)} upcoming"
+                )
+            aspect_block = "\n".join(aspect_lines)
+
+            prior_chapters = s.get("prior_chapters") if isinstance(s.get("prior_chapters"), list) else []
+            chapter_lines = []
+            for ch in prior_chapters[-6:]:
+                if not isinstance(ch, dict):
+                    continue
+                span = f"{ch.get('from') or '?'}→{ch.get('to') or 'now'}"
+                chapter_lines.append(f"- [{span}] {ch.get('title') or ''}")
+            chapters_block = "\n".join(chapter_lines)
+            prior_life_season = str(s.get("prior_life_season") or "").strip()
+
             user_prompt = (
                 f"PREVIOUS SYNTHESIS (may be empty):\n{prior_summary or '(none)'}\n\n"
+                f"PREVIOUS LIFE-SEASON: {prior_life_season or '(none)'}\n"
+                f"EXISTING CHAPTERS (append-only history — never edit):\n{chapters_block or '(none)'}\n\n"
                 f"PROFILE:\n{profile_lines or '(none)'}\n\n"
                 f"DAILY NOTES (newest first):\n{notes_block or '(none)'}\n\n"
                 f"COMPLETED RECENTLY: {completed_block or '(none)'}\n"
                 f"MISSED RECENTLY: {missed_block or '(none)'}\n"
-                f"WEEKDAY COMPLETION: {weekday_block or '(none)'}\n\n"
+                f"WEEKDAY COMPLETION: {weekday_block or '(none)'}\n"
+                f"ASPECT ACTIVITY (life-aspect lanes):\n{aspect_block or '(none)'}\n\n"
                 f"EXPERIENCE REFLECTIONS:\n{reflections_block or '(none)'}\n\n"
                 f"THINGS THE USER ASKED THE ASSISTANT TO REMEMBER:\n{coach_notes_block or '(none)'}\n\n"
                 f"SUGGESTION OUTCOMES (acted on vs ignored):\n{outcomes_block or '(none)'}\n\n"
-                f"Write the summary and facets in {normalized_language}."
+                f"Write the summary, facets, threads, and any chapter title in {normalized_language}."
             )
 
             response = self._safe_chat_call(
@@ -966,7 +1005,7 @@ class PlannerUtils:
                 user_prompt,
                 language=normalized_language,
                 model="gpt-5.4-mini",
-                max_completion_tokens=700,
+                max_completion_tokens=900,
                 temperature=0.4,
             )
             text = (response or "").strip()
@@ -989,9 +1028,31 @@ class PlannerUtils:
                 "life_season", "energy_pattern", "working_well",
                 "struggles", "recent_wins", "preferences",
             ]
+
+            aspect_keys = ["health", "focus", "learning", "relationships", "finance", "leisure"]
+            threads_in = parsed.get("threads") if isinstance(parsed.get("threads"), dict) else {}
+            threads_out = {}
+            for aspect in aspect_keys:
+                lane = threads_in.get(aspect)
+                if isinstance(lane, dict) and str(lane.get("note") or "").strip():
+                    threads_out[aspect] = {
+                        "state": str(lane.get("state") or "").strip()[:24],
+                        "note": str(lane.get("note") or "").strip()[:160],
+                    }
+
+            cu_in = parsed.get("chapter_update") if isinstance(parsed.get("chapter_update"), dict) else {}
+            chapter_update = {
+                "changed": cu_in.get("changed") is True,
+                "title": str(cu_in.get("title") or "").strip()[:80],
+                "aspects": [a for a in (cu_in.get("aspects") or []) if a in aspect_keys][:3],
+                "milestones": [str(m).strip()[:80] for m in (cu_in.get("milestones") or [])][:6],
+            }
+
             return {
                 "summary": str(parsed["summary"]).strip()[:1600],
                 "facets": {k: str(facets_in.get(k) or "").strip()[:240] for k in facet_keys},
+                "threads": threads_out,
+                "chapter_update": chapter_update,
             }
         except Exception as e:
             logger.error("Failed to synthesize user memory: %s", e)

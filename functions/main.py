@@ -28,16 +28,14 @@ from firebase_functions.params import SecretParam
 _EVO_FIREBASE_SA_SECRET = SecretParam("EVO_FIREBASE_SERVICE_ACCOUNT_JSON")
 _OPENAI_API_KEY_SECRET = SecretParam("OPENAI_API_KEY")
 _XAI_API_KEY_SECRET = SecretParam("XAI_API_KEY")
-# GOOGLE_API_KEY: server-side key for YouTube Data v3 + Places (planner enrichment).
-# Must exist in Secret Manager before deploy (firebase functions:secrets:set GOOGLE_API_KEY);
-# google_api_key.py also falls back to Firestore ai_api_key/google-api-key.
-_GOOGLE_API_KEY_SECRET = SecretParam("GOOGLE_API_KEY")
-_LLM_SECRETS = [
-    _EVO_FIREBASE_SA_SECRET,
-    _OPENAI_API_KEY_SECRET,
-    _XAI_API_KEY_SECRET,
-    _GOOGLE_API_KEY_SECRET,
-]
+_LLM_SECRETS = [_EVO_FIREBASE_SA_SECRET, _OPENAI_API_KEY_SECRET, _XAI_API_KEY_SECRET]
+# GOOGLE_API_KEY (YouTube Data v3 + Places for planner enrichment) is NOT bound
+# as a SecretParam on purpose: binding a secret that doesn't exist yet in Secret
+# Manager makes EVERY deploy of these functions fail. The key is read via
+# google_api_key.py from Firestore ai_api_key/google-api-key (same pattern as
+# the OpenAI key fallback). To switch to Secret Manager later: run
+#   firebase functions:secrets:set GOOGLE_API_KEY
+# first, then add SecretParam("GOOGLE_API_KEY") to _LLM_SECRETS.
 
 # xAI Grok Voice Agent — built-in voices; anything else is treated as a custom voice_id.
 # All 71 built-in voices from the xAI console voice library.
@@ -8354,6 +8352,70 @@ def _realtime_voice_tool_specs() -> list:
         },
         {
             "type": "function",
+            "name": "get_life_timeline",
+            "description": (
+                "Read the user's LIFE TIMELINE — their life seen as evolving THREADS (one lane per "
+                "life-aspect: health, focus, learning, relationships, finance, leisure) plus the CHAPTER "
+                "arc (dated life seasons, e.g. 'Rebuilding after burnout'). Call this when the talk is "
+                "about the bigger picture — how they've grown over months, whether a part of life is being "
+                "neglected, or 'how has my <running/studying/…> actually gone?'. Pass an 'aspect' to drill "
+                "into that lane's real task history (done/total + recent items). Returns threads, chapters, "
+                "and optional aspect_detail. Use it to coach the EVOLUTION, not just today's tasks."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "aspect": {
+                        "type": "string",
+                        "enum": ["health", "focus", "learning", "relationships", "finance", "leisure"],
+                        "description": "Optional life-aspect to drill into for its real task history.",
+                    },
+                    "from": {"type": "string", "description": "Optional start date YYYY-MM-DD for the drill-down (default ~90 days back)."},
+                    "to": {"type": "string", "description": "Optional end date YYYY-MM-DD for the drill-down (default today)."},
+                },
+                "required": [],
+            },
+        },
+        {
+            "type": "function",
+            "name": "remember_life_story",
+            "description": (
+                "Seed the user's PAST life chapters into their timeline — so their life record has a "
+                "real history ('from childhood until now'), not just what happens after they installed "
+                "EVO. Call this AFTER the user shares their life story / journey / the seasons that shaped "
+                "them (childhood, school, a big move, a career turn, a hard year, becoming a parent, …). "
+                "YOU distill what they told you into a few coarse chapters (a chapter is a life SEASON of "
+                "months-to-years, not an event) and pass them here with rough dates. Don't invent details "
+                "they didn't share. It's idempotent — safe to call once per story. After saving, briefly "
+                "reflect back the arc you now see in their journey."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chapters": {
+                        "type": "array",
+                        "description": "The life seasons they described, oldest first.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string", "description": "Short chapter name, e.g. 'Growing up in Chiang Mai', 'University years', 'Rebuilding after burnout'."},
+                                "from": {"type": "string", "description": "Rough start — year 'YYYY' or 'YYYY-MM' or 'YYYY-MM-DD'."},
+                                "to": {"type": "string", "description": "Rough end (omit for the current/most-recent chapter)."},
+                                "aspects": {
+                                    "type": "array",
+                                    "items": {"type": "string", "enum": ["health", "focus", "learning", "relationships", "finance", "leisure"]},
+                                    "description": "The 1-3 life-aspects this chapter centered on.",
+                                },
+                            },
+                            "required": ["title"],
+                        },
+                    },
+                },
+                "required": ["chapters"],
+            },
+        },
+        {
+            "type": "function",
             "name": "add_daily_note",
             "description": (
                 "Log a DAILY NOTE for the user — a short journal entry capturing how they feel or what "
@@ -9242,6 +9304,18 @@ def _realtime_instructions(is_thai: bool, today_str: str = "", tz_label: str = "
         "optional one-word mood), then briefly tell them the note was saved; use create_task only for actual "
         "to-dos, not feelings. "
         "Connect patterns you notice in their notes back to their goal and to recoverable next steps, gently. "
+        "Their life is more than a to-do list — it's a timeline that evolves. A short 'Life arc' (the chapter "
+        "they're in now) and 'Life threads' (how each life-aspect is going) may already appear in your context. "
+        "When the talk turns to the bigger picture — growth over months, feeling stuck, whether some part of life "
+        "is being neglected, or 'how has my <X> actually gone' — call get_life_timeline (pass an aspect to drill "
+        "into that lane's real history). Coach the EVOLUTION: name how far they've come across chapters, and if a "
+        "thread has gone quiet while another surges, gently offer to rebalance. Returning after a lapse is the win, "
+        "not an unbroken streak. "
+        "Their timeline should reach back before they joined EVO. When they open up about their past — where they "
+        "grew up, big turns, hard seasons, who they've become — or when the arc looks empty and it fits naturally, "
+        "warmly invite them to share the chapters that shaped them, then call remember_life_story with the few "
+        "coarse seasons you distilled (rough years, 1-3 aspects each) so their life record starts from childhood, "
+        "not install day. Afterwards, reflect the arc back to them. Never pry — only when they're sharing. "
         "A 'Who this user is' summary (their goal/identity, personality, work, saved preferences, and recent "
         "mood pattern) may appear in your context. Use ALL of it to build a real sense of WHO this person is, "
         "and tailor every suggestion to their character and rhythm — never generic advice. The more they talk "
