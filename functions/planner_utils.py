@@ -1194,6 +1194,13 @@ class PlannerUtils:
                 ])
 
             user_prompt = user_task
+            if today_date:
+                user_prompt += (
+                    f"\n\nToday is {today_date}. Only the tasks listed under "
+                    "\"Today's tasks\" are today's. Tasks dated before "
+                    f"{today_date} (in week context or user memory) already "
+                    "happened — never present them as today's tasks."
+                )
             if total_tasks > 0:
                 user_prompt += f"\n\nToday's tasks ({total_tasks}):\n{tasks_info}"
             else:
@@ -1379,7 +1386,15 @@ class PlannerUtils:
                 if start
                 else f"Target: {title} ({task_date})".strip()
             )
+            today_line = (
+                f"Today is {today_date}. Week-context tasks dated before "
+                f"{today_date} already happened — never present them as "
+                "today's or upcoming tasks.\n"
+                if today_date
+                else ""
+            )
             user_prompt = (
+                f"{today_line}"
                 f"{target_line}\n"
                 f"Starts in: {timing}\n\n"
                 f"Calendar week ({len(week_list)} tasks):\n{week_block}\n\n"
@@ -1431,6 +1446,7 @@ class PlannerUtils:
         language: str = 'thai',
         user_context: Optional[List[str]] = None,
         month_context: Optional[Dict[str, Any]] = None,
+        behavior_signals: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """
         Generate rest and recharge suggestions based on week summary.
@@ -1475,6 +1491,29 @@ class PlannerUtils:
                 f"Include specific rest activities, preparation tips for next week, and work-life balance reminders. "
                 f"Keep it encouraging with positive emojis. Keep it within 120 words. No filler words."
             )
+
+            # Practice-consolidation reflection (neuroplasticity framing):
+            # celebrate RETURNING after a miss, treat missed days as pacing
+            # information (never guilt), and use their best time of day.
+            if isinstance(behavior_signals, dict) and behavior_signals:
+                bs = behavior_signals
+                signal_lines = [
+                    f"completed {bs.get('completed_tasks', 0)}/{bs.get('total_tasks', 0)} tasks ({bs.get('completion_rate', 0)}%)",
+                    f"practiced on {bs.get('practiced_days', 0)} day(s), missed {bs.get('missed_days', 0)} day(s)",
+                ]
+                if bs.get('returned_after_miss'):
+                    signal_lines.append("RETURNED to practice after a missed day (this is what compounds — celebrate it explicitly)")
+                if bs.get('best_time_of_day'):
+                    signal_lines.append(f"most completions happen in the {bs['best_time_of_day']}")
+                if bs.get('current_streak'):
+                    signal_lines.append(f"current return streak: {bs['current_streak']} (longest {bs.get('longest_streak', 0)})")
+                user_prompt += (
+                    "\n\nThis week's practice signals: " + "; ".join(signal_lines) + ". "
+                    "Reflect on HOW the practice consolidated, not just what happened: if they returned after "
+                    "a miss, celebrate the return itself; if several days were missed, frame it as pacing "
+                    "information and suggest ONE small load adjustment (never guilt); if they have a best "
+                    "time of day, suggest anchoring next week's practice there."
+                )
             if user_context:
                 context_block = "\n".join(f"• {c}" for c in user_context[:10])
                 user_prompt = (
@@ -2447,13 +2486,20 @@ def summarize_end_of_the_week_at_friday(
     language: str = "thai",
     user_context: Optional[List[str]] = None,
     month_context: Optional[Dict[str, Any]] = None,
+    behavior_signals: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """Backward compatibility function for summarize end of the week"""
     planner = get_default_planner()
     print(" == summarize_end_of_the_week_at_friday == ")
     print(week_data)
     print(language)
-    return planner.summarize_end_of_the_week_message(week_data, language, user_context=user_context, month_context=month_context)
+    return planner.summarize_end_of_the_week_message(
+        week_data,
+        language,
+        user_context=user_context,
+        month_context=month_context,
+        behavior_signals=behavior_signals,
+    )
 
 def summarize_next_week_at_sunday(
     week_data: List[Dict[str, Any]],

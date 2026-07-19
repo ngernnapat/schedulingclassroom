@@ -6074,9 +6074,9 @@ def summarize_end_of_the_week(req: https_fn.Request) -> https_fn.Response:
                 status_code=400
             )
         
-        language = data.get('language', 'thai')
+        language = data.get('language') or data.get('languageSelected') or 'thai'
         logger.info(f"Summarizing end of week data in language: {language}")
-        
+
         user_context = None
         month_context = None
         user_id = data.get('user_id')
@@ -6088,12 +6088,14 @@ def summarize_end_of_the_week(req: https_fn.Request) -> https_fn.Response:
             except Exception as e:
                 logger.warning("RAG retrieval failed in summarize_end_of_the_week: %s", e)
             month_context = _month_context_for_user(user_id, data)
+        behavior_signals = data.get('behavior_signals') if isinstance(data.get('behavior_signals'), dict) else None
         pu = get_planner_utils()
         rest_suggestions = pu.summarize_end_of_the_week_at_friday(
             week_data=data['week_data'],
             language=language,
             user_context=user_context,
-            month_context=month_context
+            month_context=month_context,
+            behavior_signals=behavior_signals,
         )
         
         return create_response(
@@ -8253,6 +8255,17 @@ def evo_voice_chat(req: https_fn.Request) -> https_fn.Response:
         )
 
 
+# Tools only meaningful for users who HOST listings — trimmed from sessions
+# when the client flags is_host=false (see evo_realtime_session).
+_HOST_ONLY_TOOL_NAMES = frozenset({
+    "get_my_offerings",
+    "get_booking_requests",
+    "offer_on_request",
+    "find_open_requests",
+    "mark_booking_no_show",
+})
+
+
 def _realtime_voice_tool_specs() -> list:
     """Function tools the Realtime model can call mid-conversation (on-demand fetch)."""
     return [
@@ -8301,15 +8314,18 @@ def _realtime_voice_tool_specs() -> list:
             "description": (
                 "Fetch the full detail/notes of ONE specific task for your context when the user asks about it "
                 "(e.g. 'what's in my workout?', 'remind me the steps'). get_calendar items include has_detail — "
-                "if true, pull the text here. Use todo_id from get_calendar (or title). Summarize aloud in 1-2 "
-                "short sentences — do NOT read the entire saved text unless the user explicitly asks for full "
-                "details ('read it all', 'every step', 'the whole thing'). To CHANGE the detail, call set_task_detail."
+                "if true, pull the text here. Use todo_id from get_calendar (preferred); `title` also works and "
+                "is FUZZY-matched, so pass the user's spoken words as-is — no need for the exact stored title. "
+                "If the result has `candidates` instead of a task, ask the user which one they mean, then call "
+                "again with that candidate's todo_id. Summarize aloud in 1-2 short sentences — do NOT read the "
+                "entire saved text unless the user explicitly asks for full details ('read it all', 'every "
+                "step', 'the whole thing'). To CHANGE the detail, call set_task_detail."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "todo_id": {"type": "string", "description": "todoID from a get_calendar item (preferred)."},
-                    "title": {"type": "string", "description": "Task title, if todo_id is unknown."},
+                    "title": {"type": "string", "description": "Task title as the user said it — fuzzy-matched against their tasks."},
                     "date": {"type": "string", "description": "Date YYYY-MM-DD, to disambiguate."},
                 },
                 "required": [],
@@ -8552,9 +8568,11 @@ def _realtime_voice_tool_specs() -> list:
             "type": "function",
             "name": "find_videos",
             "description": (
-                "Find real YouTube tutorial videos. COST: metered API — call ONLY when the user EXPLICITLY asks "
-                "for a video, tutorial, or something to watch (e.g. 'find me a video', 'show me a tutorial'). "
-                "Do NOT offer or call this proactively — never suggest videos just because a topic is hands-on. "
+                "Find real YouTube tutorial videos. COST: metered API — call ONLY with the user's consent: "
+                "either they asked ('find me a video', 'show me a tutorial') or they said YES to your one "
+                "brief offer. DO offer once for visual/physical skills (cooking technique, exercise form, "
+                "dance, repairs) when saving the task — users don't know this exists unless you offer — but "
+                "never call it unprompted, and a declined offer stays declined for the conversation. "
                 "Build a specific query (e.g. 'tom yum goong recipe', 'beginner squat form'). Returns title, "
                 "channel, and watch URL. Recommend 1-2 by title and channel ONLY — NEVER read URLs aloud; save "
                 "links onto the task with create_task/set_task_detail for tap-to-open."
@@ -8687,6 +8705,48 @@ def _realtime_voice_tool_specs() -> list:
                     "title": {"type": "string", "description": "Short task title."},
                     "date": {"type": "string", "description": "Date as YYYY-MM-DD. Default today if unsaid."},
                     "time": {"type": "string", "description": "Start time as 24h HH:MM. Omit if no specific time."},
+                    "module": {
+                        "type": "string",
+                        "enum": ["workout", "recipe", "study", "itinerary", "budget", "mindfulness"],
+                        "description": (
+                            "FIRST CHOICE for how-to content that fits a category: a curated display module "
+                            "the app renders with a themed layout. Pass its fields in module_data. Overrides "
+                            "`blocks`; use raw `blocks` only when no module fits."
+                        ),
+                    },
+                    "module_data": {
+                        "type": "object",
+                        "description": (
+                            "Fields for the chosen module. workout: {warmup?, rest_seconds? (rest between sets, default 90), exercises:[{name, sets?, reps?, "
+                            "weight?, minutes?}], holds?:[{name, minutes}] (rendered as live timers), cooldown?, "
+                            "tip?}. recipe: {servings?, total_minutes?, ingredients:[{text, amount?}], steps:"
+                            "[{text, minutes?}], tip?}. study: {focus_minutes?, steps?:[{text, minutes?}], "
+                            "flashcards?:[{front, back}], recall_prompt?}. itinerary: {stops:[{time?, text, "
+                            "place?}], budget?:[{label, value}], unit?, packing?:[..], tip?}. budget: {items:"
+                            "[{label, value}], unit?, warning?}. mindfulness: {minutes, guidance?:[..], "
+                            "affirmation?}. Fill only what you know — every field is optional except each "
+                            "module's core list."
+                        ),
+                    },
+                    "blocks": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": (
+                            "PREFERRED over `detail` for how-to content: typed blocks the app renders as "
+                            "interactive cards on the task page. Types: {type:'checklist', title?, items:"
+                            "[{text, spec? (e.g. '3\u00d712'), minutes?, link?}]} = tappable step list; "
+                            "{type:'timer_step', text, minutes, note?} = timed practice with a live countdown; "
+                            "{type:'table', title?, columns:[...], rows:[[...]]} = structured data (sets/reps, "
+                            "schedule, budget); {type:'callout', style:'tip'|'warning'|'motivation', text} = one "
+                            "key note; {type:'timeline', title?, items:[{time?, text, place?}]} = itinerary/day "
+                            "schedule on a visual rail (trips, routines); {type:'chart', title?, unit?, items:"
+                            "[{label, value}]} = horizontal bars (budgets, progress, comparisons); "
+                            "{type:'flashcards', title?, cards:[{front, back}]} = tap-to-flip study cards "
+                            "(vocabulary, facts); {type:'heading', text}; {type:'text', text}. Keep it tight: 2-6 blocks, "
+                            "at most one callout. When you send blocks, the plain `detail` text is derived "
+                            "automatically \u2014 do not send both."
+                        ),
+                    },
                     "detail": {"type": "string", "description": "Concrete how-to steps for the task when guidance helps; else short notes. FORMAT: one step per line, each line starting with '- ' (or '1. ' numbering), specs inline — e.g. '- Bench press 3x12\\n- Incline dumbbell press 3x10\\n- Cable fly 3x15'. Never write steps as a prose paragraph — the app renders these lines as a step checklist."},
                     "brief": {"type": "string", "description": "Required when detail has steps: 1-2 sentence overview of what this is and why (shown above the checklist in the app). Example: 'Clean high-protein stir-fry — quick lunch under 30 minutes.'"},
                     "location": {"type": "string", "description": "Optional location label (legacy). Prefer address + lat/lng from find_places."},
@@ -8702,36 +8762,87 @@ def _realtime_voice_tool_specs() -> list:
             "name": "set_task_detail",
             "description": (
                 "Write a concrete how-to plan onto an EXISTING task's detail — e.g. a shoulder-workout "
-                "breakdown (exercises, sets/reps), a study outline, or step-by-step instructions. First "
-                "find the task via get_calendar for its todo_id, then call this with the detail you generated. "
-                "Set append=true to add to existing notes instead of replacing. Confirm that detail was saved "
+                "breakdown (exercises, sets/reps), a study outline, or step-by-step instructions. `title` is "
+                "fuzzy-matched, so the user's spoken words are fine; if the result returns `candidates`, ask "
+                "which task they mean and call again with its todo_id. TWO INTENTS: (1) ADD notes — default "
+                "(append) merges your lines into existing detail, deduped, numbering continued. (2) MODIFY "
+                "existing detail (change a step, update sets/reps, reword) — first call get_task_detail to "
+                "read what's there, produce the FULL revised detail keeping every line the user didn't ask to "
+                "change, then call with append=false and based_on_existing=true. If you call with append=false "
+                "without having read it, the tool returns the current text as `current_detail` with "
+                "needs_existing_detail — revise from that and call again. Confirm that detail was saved "
                 "to the task — do NOT read the saved text, steps, or links aloud."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "todo_id": {"type": "string", "description": "todoID from a prior get_calendar result."},
-                    "title": {"type": "string", "description": "Task title, as a fallback if todo_id is unknown."},
+                    "todo_id": {"type": "string", "description": "todoID from a prior get_calendar/get_task_detail result (preferred)."},
+                    "title": {"type": "string", "description": "Task title as the user said it — fuzzy-matched if todo_id is unknown."},
                     "date": {"type": "string", "description": "Date YYYY-MM-DD, to disambiguate which instance."},
-                    "detail": {"type": "string", "description": "The concrete how-to steps to save on the task. FORMAT: one step per line, each line starting with '- ' (or '1. ' numbering), specs inline — e.g. '- Bench press 3x12\\n- Incline dumbbell press 3x10'. Never a prose paragraph — the app renders these lines as a step checklist."},
+                    "module": {
+                        "type": "string",
+                        "enum": ["workout", "recipe", "study", "itinerary", "budget", "mindfulness"],
+                        "description": (
+                            "FIRST CHOICE for how-to content that fits a category: a curated display module "
+                            "the app renders with a themed layout. Pass its fields in module_data. Overrides "
+                            "`blocks`; use raw `blocks` only when no module fits."
+                        ),
+                    },
+                    "module_data": {
+                        "type": "object",
+                        "description": (
+                            "Fields for the chosen module. workout: {warmup?, rest_seconds? (rest between sets, default 90), exercises:[{name, sets?, reps?, "
+                            "weight?, minutes?}], holds?:[{name, minutes}] (rendered as live timers), cooldown?, "
+                            "tip?}. recipe: {servings?, total_minutes?, ingredients:[{text, amount?}], steps:"
+                            "[{text, minutes?}], tip?}. study: {focus_minutes?, steps?:[{text, minutes?}], "
+                            "flashcards?:[{front, back}], recall_prompt?}. itinerary: {stops:[{time?, text, "
+                            "place?}], budget?:[{label, value}], unit?, packing?:[..], tip?}. budget: {items:"
+                            "[{label, value}], unit?, warning?}. mindfulness: {minutes, guidance?:[..], "
+                            "affirmation?}. Fill only what you know — every field is optional except each "
+                            "module's core list."
+                        ),
+                    },
+                    "blocks": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": (
+                            "PREFERRED over `detail` for how-to content: typed blocks the app renders as "
+                            "interactive cards on the task page. Types: {type:'checklist', title?, items:"
+                            "[{text, spec? (e.g. '3\u00d712'), minutes?, link?}]} = tappable step list; "
+                            "{type:'timer_step', text, minutes, note?} = timed practice with a live countdown; "
+                            "{type:'table', title?, columns:[...], rows:[[...]]} = structured data (sets/reps, "
+                            "schedule, budget); {type:'callout', style:'tip'|'warning'|'motivation', text} = one "
+                            "key note; {type:'timeline', title?, items:[{time?, text, place?}]} = itinerary/day "
+                            "schedule on a visual rail (trips, routines); {type:'chart', title?, unit?, items:"
+                            "[{label, value}]} = horizontal bars (budgets, progress, comparisons); "
+                            "{type:'flashcards', title?, cards:[{front, back}]} = tap-to-flip study cards "
+                            "(vocabulary, facts); {type:'heading', text}; {type:'text', text}. Keep it tight: 2-6 blocks, "
+                            "at most one callout. When you send blocks, the plain `detail` text is derived "
+                            "automatically \u2014 do not send both."
+                        ),
+                    },
+                    "detail": {"type": "string", "description": "The concrete how-to steps to save on the task. FORMAT: one step per line, each line starting with '- ' (or '1. ' numbering), specs inline — e.g. '- Bench press 3x12\\n- Incline dumbbell press 3x10'. Never a prose paragraph — the app renders these lines as a step checklist. When modifying (append=false), this must be the COMPLETE revised detail, not just the changed lines."},
                     "brief": {"type": "string", "description": "Required when detail has steps: 1-2 sentence overview of what this is and why (shown above the checklist in the app)."},
-                    "append": {"type": "boolean", "description": "Default behavior ADDS to existing notes (preserves the user's own writing). Pass append=false only if the user explicitly wants to replace existing detail."},
+                    "append": {"type": "boolean", "description": "Default true: ADDS to existing notes (deduped, numbering continued). Pass append=false only when modifying/replacing existing detail — and include based_on_existing=true once you've read the current text."},
+                    "based_on_existing": {"type": "boolean", "description": "Set true with append=false to confirm the detail you're sending was revised from the task's current detail (via get_task_detail or the needs_existing_detail response)."},
                 },
-                "required": ["detail"],
+                "required": [],
             },
         },
         {
             "type": "function",
             "name": "move_task",
             "description": (
-                "Reschedule an existing task to a new date and/or time. First identify the task via "
-                "get_calendar to obtain its todo_id, then call this. Confirm the change out loud."
+                "Reschedule an existing task to a new date and/or time. Use todo_id from get_calendar when "
+                "you have it; `title` is fuzzy-matched as a fallback, and near-ties come back as "
+                "`candidates` — ask which one the user means. Confirm the change out loud (the result's "
+                "matched_title tells you which task was actually moved)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "todo_id": {"type": "string", "description": "todoID from a prior get_calendar result."},
-                    "title": {"type": "string", "description": "Task title, as a fallback if todo_id is unknown."},
+                    "title": {"type": "string", "description": "Task title as the user said it — fuzzy-matched if todo_id is unknown."},
                     "current_date": {"type": "string", "description": "Current date YYYY-MM-DD, to disambiguate."},
                     "new_date": {"type": "string", "description": "New date YYYY-MM-DD. Omit to keep the date."},
                     "new_time": {"type": "string", "description": "New start time HH:MM. Omit to keep the time."},
@@ -8743,17 +8854,21 @@ def _realtime_voice_tool_specs() -> list:
             "type": "function",
             "name": "delete_task",
             "description": (
-                "Delete/cancel an existing task. First identify it via get_calendar to obtain its todo_id. "
-                "SAFETY: call once WITHOUT confirmed to get a confirmation prompt, ask the user out loud, "
-                "and only call again with confirmed=true after they clearly agree."
+                "Delete/cancel an existing task. First identify it via get_calendar to obtain its todo_id; "
+                "`title` is fuzzy-matched as a fallback, and near-ties come back as `candidates` — ask which "
+                "one the user means. SAFETY: call once WITHOUT confirmed to get a confirmation prompt, ask "
+                "the user out loud, and only call again with confirmed=true after they clearly agree. If the "
+                "result asks to re-confirm a matched_title (the fuzzy match differs from what was said), "
+                "confirm THAT exact title aloud and resend with confirmed_matched_title=true."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "todo_id": {"type": "string", "description": "todoID from a prior get_calendar result."},
-                    "title": {"type": "string", "description": "Task title, as a fallback if todo_id is unknown."},
+                    "title": {"type": "string", "description": "Task title as the user said it — fuzzy-matched if todo_id is unknown."},
                     "date": {"type": "string", "description": "Date YYYY-MM-DD, to disambiguate which instance."},
                     "confirmed": {"type": "boolean", "description": "Set true ONLY after the user confirmed the deletion."},
+                    "confirmed_matched_title": {"type": "boolean", "description": "Set true only after the user confirmed the fuzzy-matched title returned by a prior call."},
                 },
                 "required": [],
             },
@@ -8773,35 +8888,43 @@ def _realtime_voice_tool_specs() -> list:
             "description": (
                 "Kick off a full multi-day lifestyle PLAN (a structured day-by-day program), NOT a single "
                 "task — e.g. a travel itinerary, a learning/skill program, a workout plan, a budgeting or "
-                "habit plan. Call this ONLY after the user agrees to create the plan and you have gathered "
-                "enough detail to make it fit their life (what they want, their level, constraints, and how "
-                "long/how much time per day). Generation runs in the BACKGROUND — this returns immediately; "
-                "tell the user it's being built and they'll be notified to review the draft. Do NOT use "
-                "create_task for multi-day programs. First call get_goals (and recall_user_notes) so the plan "
-                "connects to their north star and preferences."
+                "habit plan. The purpose is to help this person EVOLVE toward who THEY want to become — free "
+                "them to grow, don't impose a generic template. Before calling, have a short natural "
+                "conversation to gather the four things that make a plan truly fit a life: (1) WHO they want "
+                "to become / why this matters to them now; (2) their current starting level; (3) their real "
+                "BOUNDARIES — how much time per day, energy/capacity, schedule and life-season (a plan that "
+                "ignores their limits will fail them); (4) hard constraints (equipment, injuries, budget, "
+                "deadlines, destinations). Ask only for what you DON'T already know — EVO's understanding of "
+                "who they are and how their life has been evolving (goals, identity, life arc, per-aspect "
+                "threads, capacity) is AUTOMATICALLY attached to the generation, so don't re-ask what's in "
+                "memory; build on it. Call this ONLY after the user agrees to create the plan. Generation "
+                "runs in the BACKGROUND — this returns immediately; tell the user it's being built and that "
+                "you'll let them know the moment it's ready. STAY IN THE LOOP: when a system update announces "
+                "the plan finished, proactively tell the user and offer next steps — revise it (call "
+                "refine_plan with what to change; same draft) or start it (apply_plan_to_calendar). If they ask "
+                "'is it done yet?', call get_plan_generation_status. Do NOT use create_task for multi-day "
+                "programs. If their goal or preferences aren't already in your context, call get_goals / "
+                "recall_user_notes first so the plan connects to their north star."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "category": {
                         "type": "string",
-                        "enum": [
-                            "learning",
-                            "exercise",
-                            "travel",
-                            "finance",
-                            "health",
-                            "personal_development",
-                            "other",
-                        ],
-                        "description": "Plan type. Infer it if obvious; pick the closest match.",
+                        "description": (
+                            "Life domain for the plan — FREE-FORM, any domain the user's life needs "
+                            "(e.g. cooking, parenting, music, sleep, social confidence, meal_prep), not a "
+                            "fixed list. Use a short lowercase phrase in the plan's language; infer it "
+                            "from the goal if obvious."
+                        ),
                     },
                     "goal": {
                         "type": "string",
                         "description": (
                             "Rich, specific summary of what the plan is for, in the user's words — their "
-                            "objective, current level, constraints, equipment/destinations, and anything "
-                            "personal that should shape it. The more concrete, the better the plan."
+                            "objective and why, current level, real-life boundaries (time per day, energy, "
+                            "schedule), constraints, equipment/destinations, and anything personal that "
+                            "should shape it. The more concrete, the better the plan."
                         ),
                     },
                     "plan_name": {"type": "string", "description": "Optional short name for the plan."},
@@ -8820,6 +8943,101 @@ def _realtime_voice_tool_specs() -> list:
                     },
                 },
                 "required": ["goal"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "get_plan_generation_status",
+            "description": (
+                "Check whether a background plan generation is done. Call when the user asks 'is my plan "
+                "ready?' or before applying a plan. No plan_id → the most recently completed plan. Returns "
+                "status/progress, ready flag, a short summary, and whether it's already on the calendar."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "plan_id": {"type": "string", "description": "planId from generate_plan's result (preferred)."},
+                    "plan_name": {"type": "string", "description": "Plan name as the user said it — fuzzy-matched."},
+                },
+                "required": [],
+            },
+        },
+        {
+            "type": "function",
+            "name": "apply_plan_to_calendar",
+            "description": (
+                "START a generated plan: schedule every day of the plan onto the user's calendar as tasks "
+                "with a daily start time and a reminder. Call AFTER the user confirms they want to start "
+                "and has answered: start date (default tomorrow), time each day (HH:MM), and reminder lead "
+                "time in minutes. Use plan_id from generate_plan / get_plan_generation_status; plan_name is "
+                "fuzzy-matched as a fallback (result may return `candidates` — ask which). If it returns "
+                "already_applied, warn that re-applying duplicates tasks and only resend with "
+                "confirmed_reapply=true if the user insists. Afterwards confirm out loud: how many days were "
+                "scheduled, from which date, at what time, and the reminder."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "plan_id": {"type": "string", "description": "planId of the plan to apply (preferred)."},
+                    "plan_name": {"type": "string", "description": "Plan name as the user said it — fuzzy-matched fallback."},
+                    "start_date": {"type": "string", "description": "First day YYYY-MM-DD. Default: tomorrow."},
+                    "time": {"type": "string", "description": "Daily start time HH:MM (24h). Default 08:00."},
+                    "reminder_minutes": {"type": "integer", "description": "Reminder lead time in minutes before each day's start (0-1440). Default 15."},
+                    "confirmed_reapply": {"type": "boolean", "description": "Set true ONLY if the plan is already on the calendar and the user explicitly wants it added again."},
+                },
+                "required": [],
+            },
+        },
+        {
+            "type": "function",
+            "name": "refine_plan",
+            "description": (
+                "Revise a generated plan's CONTENT in the background — same draft, no new plan. Call when "
+                "the user wants changes to what the plan says (harder/easier, different exercises or topics, "
+                "shorter sessions, swap a week's focus). Pass their request as `changes`; optionally limit "
+                "to a day range. Returns immediately — tell the user you're refining it and you'll say when "
+                "it's ready (a system update will announce completion, same as generate_plan). For "
+                "SCHEDULE changes (dates, times, reminders, spacing) use adjust_plan instead; for a "
+                "completely different plan use generate_plan."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "plan_id": {"type": "string", "description": "planId of the plan to refine (preferred)."},
+                    "plan_name": {"type": "string", "description": "Plan name as the user said it — fuzzy-matched fallback."},
+                    "changes": {"type": "string", "description": "What to change, in the user's words — specific and concrete."},
+                    "refine_day_start": {"type": "integer", "description": "Optional: only revise from this day number."},
+                    "refine_day_end": {"type": "integer", "description": "Optional: only revise up to this day number."},
+                },
+                "required": ["changes"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "adjust_plan",
+            "description": (
+                "Reshape the REMAINING days of a plan already on the calendar — call when the user fell "
+                "behind, feels overloaded, or wants a different rhythm. Missed days are information, not "
+                "failure: adapt the plan so they can keep returning, never guilt them. Actions: 'shift' "
+                "pushes every upcoming task back by `days` (recover after missed days; days=1 from a given "
+                "from_date = insert a rest day); 'spread' respaces upcoming tasks every `every_n_days` days "
+                "(lighten sustained load, keep all the practice); 'change_time' updates the daily start time "
+                "and/or reminder. Completed tasks and past days are never touched. Confirm the change out "
+                "loud before calling, and afterwards state what moved (how many tasks, new date range)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "plan_id": {"type": "string", "description": "planId of the plan to adjust (preferred)."},
+                    "plan_name": {"type": "string", "description": "Plan name as the user said it — fuzzy-matched fallback."},
+                    "action": {"type": "string", "enum": ["shift", "spread", "change_time"], "description": "How to reshape the remaining days."},
+                    "days": {"type": "integer", "description": "For shift: how many days to push back (1-60). Default 1."},
+                    "every_n_days": {"type": "integer", "description": "For spread: practice every N days (2-7). Default 2 (every other day)."},
+                    "from_date": {"type": "string", "description": "First date YYYY-MM-DD to adjust from. Default today."},
+                    "time": {"type": "string", "description": "For change_time: new daily start time HH:MM."},
+                    "reminder_minutes": {"type": "integer", "description": "For change_time: new reminder lead time in minutes."},
+                },
+                "required": ["action"],
             },
         },
         {
@@ -8897,7 +9115,12 @@ def _realtime_voice_tool_specs() -> list:
                 "Lab offer?'), pass that name as `host` — with `query` empty it returns that provider's FULL "
                 "inventory; putting the provider name in `query` instead misses items. Returns each offering's "
                 "host name, title, price, type, capacity, location, and the booking_item_id + owner_uid needed "
-                "to check availability or book. Omit query to list what's available."
+                "to check availability or book. Results may also carry SERVER-VERIFIED trust signals — "
+                "`rating` (+ rating_count), `times_booked`, `completion_rate_pct`, `cancel_policy` — cite them "
+                "when recommending ('4.8 stars from 12 reviews, booked 24 times') and prefer higher-trust "
+                "options when several fit; a listing without them is simply new, not bad — say so honestly. "
+                "Mention the cancellation policy before the user commits when one is set. "
+                "Omit query to list what's available."
             ),
             "parameters": {
                 "type": "object",
@@ -8989,6 +9212,68 @@ def _realtime_voice_tool_specs() -> list:
                     "confirmed": {"type": "boolean", "description": "Pass true ONLY after the user confirms out loud."},
                 },
                 "required": ["booking_item_id", "owner_uid", "date"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "join_booking_waitlist",
+            "description": (
+                "Put the user on a listing's waitlist so they get a push the moment a cancellation frees a "
+                "slot. Offer this whenever booking fails because a date is fully booked (book_offering "
+                "returns fully_booked, or every date they want is taken). Pass the booking_item_id and, if "
+                "they want one specific day, that date — omit date to be told about ANY opening. "
+                "remove=true takes them off the waitlist."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "booking_item_id": {"type": "string", "description": "Listing id from find_offerings / book_offering."},
+                    "date": {"type": "string", "description": "Optional specific date YYYY-MM-DD they're waiting for."},
+                    "remove": {"type": "boolean", "description": "true = leave the waitlist instead of joining."},
+                },
+                "required": ["booking_item_id"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "record_handover",
+            "description": (
+                "RENTALS: record a handover confirmation when a rented item changes hands — stage 'pickup' "
+                "when the renter receives it, 'return' when it comes back. Either party (host or renter) "
+                "confirms their own side; encourage a short condition note ('small scratch on the left side', "
+                "'returned clean, all parts'). This builds the mutual evidence trail that protects both "
+                "people if condition is disputed later — photos can be added on the booking task in the app. "
+                "Call it when the user says they picked up / handed over / got back a rented item. If the "
+                "result says the other party hasn't confirmed, mention that so they ask the other side to "
+                "confirm too."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todo_id": {"type": "string", "description": "todoID of the booking (from get_booking_requests / get_calendar)."},
+                    "stage": {"type": "string", "enum": ["pickup", "return"], "description": "Which handover this is."},
+                    "note": {"type": "string", "description": "Optional condition note in the user's words."},
+                },
+                "required": ["todo_id", "stage"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "mark_booking_no_show",
+            "description": (
+                "HOST SIDE: mark a booking as a no-show when the guest never came — allowed from the booking's "
+                "start until 48h after. Corrects the listing's completion stats and blocks a review from the "
+                "absent guest. SAFETY: call once WITHOUT confirmed to get a prompt, confirm out loud with the "
+                "host, then call again with confirmed=true. Never suggest it punitively — only when the host "
+                "says the guest didn't show."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todo_id": {"type": "string", "description": "todoID of the booking (from get_booking_requests)."},
+                    "confirmed": {"type": "boolean", "description": "Set true only after the host confirmed out loud."},
+                },
+                "required": ["todo_id"],
             },
         },
         {
@@ -9343,21 +9628,39 @@ def _realtime_instructions(is_thai: bool, today_str: str = "", tz_label: str = "
         "lead with the #1 focus and WHY it matters for their goal; if there's a load note, gently suggest "
         "deferring or resting the optional ones — never guilt. "
         "To add a task, call create_task. To reschedule, call move_task; to cancel, call delete_task — "
-        "for move/delete, first call get_calendar to find the task's todo_id, then pass that todo_id. "
+        "prefer todo_id from get_calendar, but titles are FUZZY-matched, so when the user names a task just "
+        "pass their words as `title` and call directly; if a tool returns `candidates`, ask which one they "
+        "mean and retry with that todo_id — never just say the task wasn't found. "
         "When the user asks about an existing task's details — what's in it, the steps, 'remind me what I "
-        "planned' — call get_task_detail for context (use todo_id from get_calendar; items show has_detail), "
+        "planned' — call get_task_detail for context (todo_id or their spoken title; items show has_detail), "
         "but answer with a brief 1-2 sentence summary — do NOT read the full saved text aloud. Only recite the "
         "full/long detail if they explicitly ask ('read it all', 'every step', 'the whole thing'). "
-        "If they want to change/replace those details, call set_task_detail "
-        "(append=false to replace, true to add). "
+        "CHANGING details: to ADD notes/steps, call set_task_detail (default append merges without erasing). "
+        "To MODIFY what's already there (change a step, update sets/reps, reword), first read it with "
+        "get_task_detail, apply the user's change to the FULL text keeping everything else as-is, then call "
+        "set_task_detail with append=false and based_on_existing=true; if it returns needs_existing_detail "
+        "with current_detail, revise from that text and call again the same way. "
         "When the user wants to know HOW to do something (cook a dish, do an exercise, study a topic, fix "
         "something), give a brief spoken answer first — one or two sentences or a tiny hint — then offer "
         "to go deeper if they want. Only walk through full steps aloud when they ask you to expand; "
         "otherwise save the concrete how-to (ingredients, sets/reps, sub-steps, links) onto the task via "
-        "create_task/set_task_detail so they can read it in the app. Answer with your own words first — do NOT "
-        "offer videos or call find_videos by default; only call find_videos when the user explicitly asks for "
-        "a video, tutorial, or something to watch (it's a metered API). Never read YouTube URLs aloud — "
-        "mention title and channel only, and save the link on the task for tap-to-open. "
+        "create_task/set_task_detail so they can read it in the app. Answer with your own words first. "
+        "VIDEO OFFERS: for VISUAL/PHYSICAL skills (cooking technique, exercise form, dance, yoga, repairs, "
+        "crafts), OFFER a video once, briefly, while saving the task — 'want me to attach a video tutorial "
+        "too?' — because users don't know EVO can do this unless you offer. Call find_videos ONLY after they "
+        "say yes (or ask themselves) — it's a metered API, never call it unprompted, and if they decline "
+        "don't offer again this conversation. Never read YouTube URLs aloud — mention title and channel "
+        "only, and save the link on the task for tap-to-open. "
+        "CAPABILITY DISCOVERY: users only learn what EVO can do when you show them, so after completing the "
+        "main request you MAY offer exactly ONE relevant capability as a short question — never a menu, never "
+        "mid-task, and a declined offer stays dropped for the whole conversation. Match the offer to the "
+        "moment: visual/physical how-to → video tutorial (above); a task at a venue type ('dinner out', "
+        "'tennis') → 'want me to find places nearby?' (find_places) or a bookable option (find_offerings); a "
+        "someday-wish ('I've always wanted to…') → offer a multi-day plan (generate_plan); vocabulary or "
+        "facts practice → 'want flashcards on the task?' (blocks); an overloaded week → offer to reshape a "
+        "plan (adjust_plan) or prioritize (prioritize_tasks). And when you SAVE rich content, SAY what "
+        "appeared so they open it: 'I put a timeline with the places on the task' / 'the workout has set "
+        "buttons and a rest timer — tick them as you go'. "
         "When the guidance belongs on a task they'll do later, SAVE it onto the task: put the steps (and a "
         "chosen video link on its own line) in create_task's `detail` for a new task, or call set_task_detail "
         "(find the existing task's todo_id via get_calendar first). Always pass `brief` too — 1-2 sentences "
@@ -9366,18 +9669,49 @@ def _realtime_instructions(is_thai: bool, today_str: str = "", tz_label: str = "
         "to replace. After saving, tell them briefly that you added the detail to the task (they can open it "
         "in the app) — do NOT read back any of the saved text, steps, or links. Keep saved detail concrete "
         "and usable, not vague. "
+        "CANVAS MODULES & BLOCKS: when saving how-to content (create_task or set_task_detail), pick in this "
+        "order — (1) a display MODULE when the content fits a category (workout, recipe, study, itinerary, "
+        "budget, mindfulness): pass `module` + `module_data` and the app renders a themed, consistent layout; "
+        "(2) raw `blocks` when no module fits; (3) plain detail text last. "
+        "Blocks render as interactive cards the user can tap through: "
+        "checklist steps get tick-off circles, timer_step gets a live countdown, table shows sets/reps or "
+        "schedules cleanly, callout highlights one key tip, timeline draws an itinerary rail, chart draws "
+        "bars, flashcards flip on tap. Match the block to the content: workout → table or checklist with "
+        "spec ('3×12') + a timer_step for timed holds; recipe → checklist with minutes; study session → "
+        "timer_step + checklist; trip day or morning routine → timeline; budget or progress comparison → "
+        "chart; vocabulary/facts practice → flashcards. get_task_detail returns steps_done/steps_total — "
+        "use it to coach from real progress ('you're 4 of 7 through — want to pick up at the dice drill?'). "
         "For delete_task: never delete without confirming — call it first without confirmed to get a prompt, "
         "ask the user out loud, and only resend with confirmed=true once they agree. After a delete, tell them "
         "they can say 'undo' (which calls restore_task). "
-        "When the user wants to PLAN something bigger than a single task — a trip/itinerary, learning a skill, "
-        "a workout program, budgeting or a new habit — offer to build a full multi-day plan with generate_plan "
-        "(not create_task). First understand the goal: ask 1-2 quick questions for the details that make it fit "
-        "their life (what exactly they want, their level/constraints, how many days, and how much time per day), "
-        "and pull their north star with get_goals plus any saved preferences. Briefly confirm the shape out loud "
-        "('a 7-day Tokyo food-and-temples trip, ~4 hours a day — want me to build it?'). Only after they agree, "
-        "call generate_plan with a rich `goal` describing all of that. It generates in the BACKGROUND and returns "
-        "right away — so tell them it's being built and they'll be notified to review the draft; do NOT wait, "
-        "recite the day-by-day, or claim it's finished. If it asks for more detail, ask one more question and retry. "
+        "When the user wants to PLAN something bigger than a single task — ANY life domain: a trip/itinerary, "
+        "learning a skill, a workout program, budgeting, a new habit, cooking, parenting, sleep, social "
+        "confidence, anything — offer to build a full multi-day plan with generate_plan (not create_task). "
+        "Category is FREE-FORM: never refuse or bend the topic to fit a preset list; you are an intelligent "
+        "lifestyle assistant and the plan should fit THEIR life. First understand the goal: ask 1-2 quick "
+        "questions for the details that make it personal (what exactly they want and why it matters now, their "
+        "level/constraints, how many days, how much time per day) — ask only what you don't already know from "
+        "memory, and pull their north star with get_goals plus any saved preferences. Briefly confirm the shape "
+        "out loud ('a 7-day Tokyo food-and-temples trip, ~4 hours a day — want me to build it?'). Only after "
+        "they agree, call generate_plan with a rich `goal` describing all of that. It generates in the "
+        "BACKGROUND and returns right away — tell them it's being built and that you'll tell them the moment "
+        "it's ready; do NOT wait, recite the day-by-day, or claim it's finished. If it asks for more detail, ask "
+        "one more question and retry. CLOSE THE LOOP: when a SYSTEM UPDATE announces the plan finished, tell the "
+        "user right away and ask what they'd like next — hear a quick overview / revise something (summarize via "
+        "get_plan_generation_status; to revise the content, call refine_plan with what to change — it keeps "
+        "the same draft and announces completion the same way), or START it: "
+        "ask for the start date, the time each day, and how many minutes before they want the reminder, then "
+        "call apply_plan_to_calendar and confirm what was scheduled. If they ask 'is it done yet?', call "
+        "get_plan_generation_status instead of guessing. When get_plan_generation_status returns "
+        "experience_suggestions (real bookable offerings matched to the plan), you MAY offer exactly ONE "
+        "that genuinely complements it — cite its trust signals if present ('4.8 stars, booked 24 times') "
+        "and offer to check availability or book it; drop the idea gracefully if they're not interested. "
+        "KEEP PLANS ALIVE with adjust_plan: when the user says they fell behind, missed days, feel "
+        "overloaded, or the schedule doesn't fit anymore, NEVER guilt them — missed days are information. "
+        "Offer to adapt the plan: shift the remaining days back, insert a rest day, spread practice out "
+        "(every other day), or change the daily time/reminder. Confirm the reshape out loud, call "
+        "adjust_plan, then tell them what moved. Returning and doing the next rep is what compounds — "
+        "an adapted plan beats an abandoned one. "
         "FATE / ดูดวง: when the user asks for fortune, horoscope, or a Thai-style path reading, call get_fate_context "
         "first. If birth_date is missing, ask for it (and optionally birth time) before read_fate. Pick topic from "
         "what they said (love, career, money, health, or general). Call read_fate with birth_date + topic, then speak "
@@ -9432,7 +9766,13 @@ def _realtime_instructions(is_thai: bool, today_str: str = "", tz_label: str = "
         "you: needs_input='date' comes with available_dates and needs_input='time' with available_slots — offer "
         "those and ask which; if a date is unavailable or it comes back fully booked, DON'T stop — suggest the next "
         "open date or slot and keep going until it's booked or the user calls it off. After it books, confirm exactly "
-        "what was booked and say if it's pending the host's approval. "
+        "what was booked, say if it's pending the host's approval, and mention the cancellation policy if the result "
+        "carries one. If everything is full and no alternative works, offer join_booking_waitlist so they're pinged "
+        "the moment a slot opens. "
+        "RENTALS: when a rented item changes hands, record it — the user saying they picked up / handed over / got "
+        "back an item is the cue to call record_handover (pickup or return) with any condition note they mention; "
+        "if the other side hasn't confirmed, say so. HOSTS: if a guest never showed, mark_booking_no_show (confirm "
+        "first) keeps their stats honest. "
         "SUGGESTING IS REACTIVE — never at the start of a session, never unprompted: only when the user ASKS what "
         "to do / for an idea / something to book, call get_booking_suggestions and offer ONE that fits, tied to "
         "their goal (e.g. 'this pottery class fits your make-more-scroll-less goal'), then offer to check "
@@ -9543,6 +9883,13 @@ def evo_realtime_session(req: https_fn.Request) -> https_fn.Response:
             )
 
         tools = _realtime_voice_tool_specs()
+        # Tool-surface trimming: 55+ specs inflate every session and dilute
+        # tool selection. When the client EXPLICITLY says the user isn't a
+        # host (context_flags.is_host === false), drop the host-only tools.
+        # Absent/other values keep the full surface (backward compatible).
+        context_flags = data.get('context_flags') if isinstance(data.get('context_flags'), dict) else {}
+        if context_flags.get('is_host') is False:
+            tools = [t for t in tools if t.get('name') not in _HOST_ONLY_TOOL_NAMES]
         language_hint = 'th' if is_thai else 'en'
 
         headers = {

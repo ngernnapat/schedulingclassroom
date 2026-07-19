@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 import uuid
@@ -17,7 +18,7 @@ except ImportError:
     https_fn = None
     print("Note: Firebase modules not available - running in local mode")
 
-from pydantic import BaseModel, Field, ValidationError, conint, constr, model_validator
+from pydantic import BaseModel, Field, ValidationError, conint, constr, field_validator, model_validator
 
 # ---- Initialize Firebase Admin (safe if called multiple times) ----
 if FIREBASE_AVAILABLE:
@@ -52,7 +53,28 @@ def get_openai_client():
 # Data Models (Schemas)
 # =========================
 
-PlanCategory = Literal["learning", "exercise", "travel", "finance", "health", "personal_development", "other"]
+# Known categories keep tuned defaults (length/minutes/prompts), but category is
+# FREE-FORM: EVO is an intelligent lifestyle assistant, and a plan can be about
+# any life domain (cooking, parenting, music, sleep, social confidence, …).
+# Unknown categories flow through to the LLM as-is and fall back to "other" for
+# defaults lookups. Do NOT reintroduce a strict Literal here — it made pydantic
+# reject any plan outside the original seven domains.
+KNOWN_PLAN_CATEGORIES = ("learning", "exercise", "travel", "finance", "health", "personal_development", "other")
+
+
+def sanitize_plan_category(value: object) -> str:
+    """Free-form category → safe slug (lowercase, underscores, ≤40 chars)."""
+    slug = re.sub(r"[^a-z0-9฀-๿]+", "_", str(value or "").strip().lower()).strip("_")[:40]
+    return slug or "other"
+
+
+class FreeFormCategoryMixin:
+    """Shared pydantic validator: accept any category string, sanitize to a slug."""
+
+    @field_validator("category", mode="before", check_fields=False)
+    @classmethod
+    def _sanitize_category(cls, v):
+        return sanitize_plan_category(v)
 
 _GENERIC_PLAN_NAMES = frozenset({"30-day practice", "30-Day Practice", ""})
 
@@ -274,11 +296,18 @@ class TaskPlace(BaseModel):
     placeId: Optional[str] = None
     mapsUrl: Optional[str] = None
 
+class Flashcard(BaseModel):
+    """Study card for learning plans — front (prompt/term) and back (answer/meaning)."""
+    front: constr(strip_whitespace=True, min_length=1, max_length=120)
+    back: constr(strip_whitespace=True, min_length=1, max_length=200)
+
+
 class Task(BaseModel):
     id: constr(strip_whitespace=True, min_length=1) = Field(default_factory=lambda: uuid.uuid4().hex[:8])
     text: constr(strip_whitespace=True, min_length=1)
     done: bool = False
     duration_min: Optional[conint(ge=0, le=600)] = None   # optional per-task duration
+    time: Optional[str] = Field(None, description="HH:MM local start time — travel itineraries / scheduled days")
     note: Optional[str] = None
     link: Optional[constr(strip_whitespace=True, min_length=1)] = Field(None, description="Optional helpful link or resource for this task")
     # Post-generation enrichment (real API data) — never produced by the LLM itself.
@@ -292,6 +321,8 @@ class DayPlan(BaseModel):
     summary: constr(strip_whitespace=True, min_length=1)
     tasks: List[Task] = Field(default_factory=list)
     tips: Optional[Union[str, List[str]]] = None
+    # Learning plans: 3-6 study cards per day (renders as tap-to-flip flashcards).
+    flashcards: Optional[List[Flashcard]] = None
     
     @model_validator(mode='before')
     @classmethod
@@ -337,9 +368,9 @@ class PlannerSummary(BaseModel):
     tipsForSuccess: Optional[List[str]] = Field(None, description="Key tips to maximize success with this plan")
     weeklyFocus: Optional[List[str]] = Field(None, description="Brief focus area for each week")
 
-class PlannerContent(BaseModel):
+class PlannerContent(FreeFormCategoryMixin, BaseModel):
     planName: constr(strip_whitespace=True, min_length=1)
-    category: PlanCategory
+    category: str
     totalDays: conint(ge=1, le=90) = 30
     minutesPerDay: Optional[conint(ge=10, le=480)] = None
     coverImage: Optional[str] = None
@@ -355,17 +386,17 @@ class PlannerContent(BaseModel):
     estimatedCompletionRate: Optional[str] = Field(None, description="Expected completion rate with consistent effort")
 
 # -------- Request --------
-class GeneratePlannerRequest(BaseModel):
+class GeneratePlannerRequest(FreeFormCategoryMixin, BaseModel):
     """Request model for generating planner content with comprehensive validation."""
-    
+
     planName: constr(strip_whitespace=True, min_length=1, max_length=100) = Field(
         default="30-Day Practice",
         description="Name of the plan to generate (1-100 characters)"
     )
-    
-    category: PlanCategory = Field(
+
+    category: str = Field(
         default="learning",
-        description="Type of planner content to generate"
+        description="Life domain for the plan — free-form (any domain), sanitized to a slug",
     )
     
     totalDays: Optional[conint(ge=1, le=90)] = Field(
@@ -383,6 +414,16 @@ class GeneratePlannerRequest(BaseModel):
         default=None,
         max_length=120000,
         description="Internal draft plan JSON for refinement requests",
+    )
+
+    # Server/client-attached: WHO this user is — their synthesized memory (summary +
+    # life arc + per-aspect threads), goal/identity, capacity/energy and real-life
+    # boundaries — so the plan is personalized to their EVOLUTION and fits their life,
+    # not a generic template. Assembled from Firestore, not the mobile detailPrompt.
+    userContext: Optional[str] = Field(
+        default=None,
+        max_length=6000,
+        description="Snapshot of who the user is + their evolution + life boundaries.",
     )
     
     # Optional configuration knobs:
@@ -508,7 +549,7 @@ class GeneratePlannerRequest(BaseModel):
         return self
 
 
-class RefinePlannerRequest(BaseModel):
+class RefinePlannerRequest(FreeFormCategoryMixin, BaseModel):
     """Refine an existing draft plan based on user feedback."""
 
     refinementPrompt: constr(strip_whitespace=True, min_length=1, max_length=800) = Field(
@@ -518,7 +559,7 @@ class RefinePlannerRequest(BaseModel):
         description="Current PlannerContent object to refine"
     )
     planName: constr(strip_whitespace=True, min_length=1, max_length=100)
-    category: PlanCategory
+    category: str
     totalDays: conint(ge=1, le=90)
     minutesPerDay: Optional[conint(ge=10, le=480)] = None
     intensity: Optional[Literal["easy", "moderate", "hard", "periodized"]] = None
@@ -906,6 +947,13 @@ class ChatWrapper:
             context_bits.append(f"Primary goal: {extracted_context.goals.primary_goal}")
         if req.detailPrompt:
             context_bits.append(f"User description: {req.detailPrompt[:600]}")
+        if req.userContext:
+            context_bits.append(
+                "WHO THIS USER IS — shape the plan to evolve THEM toward who they want to "
+                "become, and fit it to their real life (their capacity/energy, life season, "
+                "and what is already working vs stalled). This is a person with their own "
+                "path, not a template:\n" + req.userContext[:3500]
+            )
 
         schema = {
             "name": "plan_outline",
@@ -1549,7 +1597,16 @@ class ChatWrapper:
         # Special considerations from analysis
         if req.detailPrompt:
             instructions.append(f"Consider these specific requirements: {req.detailPrompt}")
-        
+
+        # Personalize to who the user is + their life so far (evolve them toward their
+        # goal, within their real capacity and boundaries).
+        if req.userContext:
+            instructions.append(
+                "Tailor these days to this specific person and their life so far "
+                "(evolve them toward their goal; respect their capacity, energy and "
+                "boundaries): " + req.userContext[:1500]
+            )
+
         return " ".join(instructions)
 
     def _handle_generation_failure(self, req: GeneratePlannerRequest, error_context: str) -> None:
@@ -2608,13 +2665,28 @@ TASK EXAMPLES:
                                             "text": {"type": "string"},
                                             "done": {"type": "boolean"},
                                             "duration_min": {"type": ["integer", "null"], "minimum": 0, "maximum": 600},
+                                            "time": {"type": ["string", "null"], "description": "HH:MM start time — REQUIRED for travel itinerary days, chronological"},
                                             "note": {"type": ["string", "null"]},
                                             "link": {"type": "string"},
                                         },
                                         "required": ["id", "text", "done", "link"]
                                     }
                                 },
-                                "tips": {"type": ["string", "array", "null"], "items": {"type": "string"}}
+                                "tips": {"type": ["string", "array", "null"], "items": {"type": "string"}},
+                                "flashcards": {
+                                    "type": ["array", "null"],
+                                    "maxItems": 6,
+                                    "description": "Learning plans only: 3-6 study cards for the day's key facts/vocab",
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": False,
+                                        "properties": {
+                                            "front": {"type": "string", "description": "Prompt/term (short)"},
+                                            "back": {"type": "string", "description": "Answer/meaning"}
+                                        },
+                                        "required": ["front", "back"]
+                                    }
+                                }
                             },
                             "required": ["id", "dayNumber", "title", "summary", "tasks"]
                         }
@@ -2630,7 +2702,11 @@ TASK EXAMPLES:
                 "User goal: skill acquisition and knowledge development. Include variety: active practice, "
                 "review/repetition, application exercises, and reflection. Build progressively from basics "
                 "to advanced concepts. Include weekly review days with lighter cognitive load. "
-                "Adapt to user's specified learning domain (language, coding, music, etc.)."
+                "Adapt to user's specified learning domain (language, coding, music, etc.). "
+                "EVERY day MUST include 3-6 `flashcards` capturing that day's key facts, vocabulary, or "
+                "concepts (front = term/prompt, back = answer/meaning, in the plan's language) — the app "
+                "renders them as tap-to-flip study cards, and review days should reuse earlier cards' topics "
+                "with new phrasing for spaced repetition."
             ),
             "exercise": (
                 "User goal: physical fitness and health. Rotate training focus (strength, cardio, flexibility, mobility), "
@@ -2642,7 +2718,10 @@ TASK EXAMPLES:
                 "User goal: trip planning and itinerary. Group activities by geographic proximity and themes. "
                 "Include practical logistics (transport modes, time estimates, booking tips). "
                 "Provide budget estimates per activity. Alternate high-intensity sightseeing days with relaxed exploration. "
-                "Include contingency plans and local cultural tips."
+                "Include contingency plans and local cultural tips. "
+                "EVERY task MUST carry a realistic `time` (HH:MM, chronological through the day) and NAME the "
+                "specific venue/area in its text (e.g. 'Wat Mahathat, Ayutthaya old town') — the app renders "
+                "each day as a visual timeline and attaches real map data to named places."
             ),
             "finance": (
                 "User goal: financial management and literacy. Cover budgeting, tracking expenses, saving strategies, "
