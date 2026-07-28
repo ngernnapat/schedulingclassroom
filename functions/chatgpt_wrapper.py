@@ -592,6 +592,72 @@ class ChatGPTWrapper:
             logger.error(f"Chat completion failed after {duration:.2f}s: {str(e)}")
             raise RuntimeError(f"Failed to communicate with OpenAI API: {str(e)}") from e
 
+    def chat_with_images(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        image_urls: List[str],
+        model: Optional[str] = None,
+        max_completion_tokens: Optional[int] = None,
+        reply_language: Optional[str] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        Vision variant of chat_with_gpt: the user message carries text plus
+        one or more image URLs (multimodal content-part array). Used by
+        coach_review to analyze food / body / workout progress photos.
+
+        The caller is responsible for validating the URLs (count, scheme,
+        host); this method only assembles the request. Retries, circuit
+        breaker, and error handling are shared with the text path via
+        _make_api_call.
+        """
+        start_time = time.time()
+        try:
+            self._validate_inputs(system_prompt, user_prompt)
+            if not image_urls or not isinstance(image_urls, list):
+                raise ValueError("image_urls must be a non-empty list")
+
+            language_name = None
+            if reply_language:
+                language_name = self.language_detector.get_language_name(reply_language)
+            if language_name:
+                system_prompt = f"{system_prompt}\nPlease reply in {language_name}."
+
+            content = [{"type": "text", "text": user_prompt}]
+            for url in image_urls:
+                content.append({
+                    "type": "image_url",
+                    # "low" detail keeps token cost bounded; food/body photos
+                    # don't need tile-level resolution to be reviewed well.
+                    "image_url": {"url": url, "detail": "low"},
+                })
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": content},
+            ]
+
+            current_config = ChatConfig(
+                model=model or self.config.model,
+                temperature=self.config.temperature,
+                top_p=self.config.top_p,
+                max_completion_tokens=max_completion_tokens or self.config.max_completion_tokens,
+                timeout=self.config.timeout,
+                max_retries=self.config.max_retries,
+                retry_delay=self.config.retry_delay,
+                response_format=response_format,
+            )
+
+            response = self._make_api_call(messages, current_config)
+            logger.info(
+                "Vision chat completion completed in %.2fs (%d images)",
+                time.time() - start_time, len(image_urls)
+            )
+            return response
+        except Exception as e:
+            logger.error(f"Vision chat completion failed after {time.time() - start_time:.2f}s: {str(e)}")
+            raise RuntimeError(f"Failed to communicate with OpenAI API: {str(e)}") from e
+
     def generate_image(
         self,
         prompt: str,
@@ -868,5 +934,27 @@ def chat_with_gpt(
         auto_detect_language=auto_detect_language,
         reply_language=reply_language,
         language=language,
+        response_format=response_format,
+    )
+
+
+def chat_with_images(
+    system_prompt: str,
+    user_prompt: str,
+    image_urls: List[str],
+    model: str = "gpt-5.4-mini",
+    max_completion_tokens: int = 1024,
+    reply_language: Optional[str] = None,
+    response_format: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Module-level convenience for the vision path (progress-photo review)."""
+    wrapper = get_default_wrapper()
+    return wrapper.chat_with_images(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        image_urls=image_urls,
+        model=model,
+        max_completion_tokens=max_completion_tokens,
+        reply_language=reply_language,
         response_format=response_format,
     )

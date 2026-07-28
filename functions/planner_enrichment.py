@@ -46,7 +46,7 @@ from google_api_key import resolve_google_api_key
 class EnrichmentConfig:
     directive_model: str = "gpt-5.4-mini"   # = ChatWrapperConfig.extraction_model
     max_video_queries: int = 8              # unique YouTube searches per plan
-    max_place_queries: int = 10             # unique Places searches per plan
+    max_place_queries: int = 24             # enough for named stops across a typical 7-day trip
     max_video_attachments: int = 60         # tasks that may carry a video
     max_place_attachments: int = 40
     http_timeout_s: float = 6.0
@@ -133,8 +133,13 @@ def _directive_system_prompt(config: EnrichmentConfig) -> str:
         "- For place directives, 'area' MUST be the city/region the task happens in — for travel plans "
         "infer the destination from the plan name, description and task texts. If you cannot infer any "
         "location, do not emit a place directive.\n"
-        "- Never invent venue names as queries; query by what the user needs "
+        "- If a task names a specific venue/landmark, use that exact proper name as the query so Maps "
+        "resolves the intended place. If no venue is named, never invent one; query by what the user needs "
         '(e.g. "specialty coffee cafe", "muay thai gym") plus the area.\n'
+        "- For travel itineraries, emit a place directive ONLY when the task text already names a specific "
+        "venue, landmark, station, hotel, or restaurant. Use that exact name. Never turn generic wording "
+        "such as 'lunch near Dihua Street', 'find a cafe', or 'dinner in the center' into an arbitrary venue; "
+        "enrichment must not silently change the itinerary. Skip pure transit, rest, and buffer tasks.\n"
         "- Write queries in the plan's language.\n"
         "- Video queries should be specific enough to land a good tutorial "
         '(e.g. "beginner bodyweight squat form" not "exercise").'

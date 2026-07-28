@@ -2,6 +2,7 @@
 # This function provides HTTP endpoints for generating and managing school schedules
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -12,6 +13,7 @@ import signal
 import uuid
 import io
 import requests
+from urllib.parse import parse_qs, unquote, urlparse
 from typing import Dict, Any, Optional, Tuple, List
 from functools import wraps
 
@@ -23,6 +25,10 @@ if current_dir not in sys.path:
 from firebase_functions import https_fn
 from firebase_functions.options import set_global_options
 from firebase_functions.params import SecretParam
+
+# Pure, dependency-free (re only) — safe at module level, unlike the lazily
+# loaded generator that also uses it.
+from plan_time import normalize_clock_time
 
 # Injected at deploy when bound on functions that need them (see decorators).
 _EVO_FIREBASE_SA_SECRET = SecretParam("EVO_FIREBASE_SERVICE_ACCOUNT_JSON")
@@ -52,7 +58,7 @@ _XAI_BUILTIN_VOICES = frozenset({
 _XAI_DEFAULT_VOICE = "eve"
 _XAI_DEFAULT_MODEL = "grok-voice-latest"
 _OPENAI_DEFAULT_VOICE = "alloy"
-_OPENAI_DEFAULT_MODEL = "gpt-realtime"
+_OPENAI_DEFAULT_MODEL = "gpt-realtime-2.1"
 _OPENAI_BUILTIN_VOICES = frozenset({
     "alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer", "verse", "marin", "cedar",
 })
@@ -60,6 +66,18 @@ _REALTIME_PROVIDERS = frozenset({"openai", "xai"})
 _REALTIME_DEFAULT_PROVIDER = "openai"
 # Max user-context chars appended to realtime/coach instructions (keeps prompt cache stable).
 _REALTIME_CONTEXT_MAX_CHARS = 2000
+# Cost control for realtime voice. Every response re-sends the whole conversation as
+# input tokens, and spoken audio output is billed per 50ms, so both ends are capped.
+# 600 tokens is roughly 30 seconds of speech — far past the 1-2 sentences the persona
+# asks for, but short of the near-3.5-minute monologue the 4096 ceiling would allow.
+_REALTIME_MAX_OUTPUT_TOKENS = 600
+# Once the conversation passes the post-instruction limit, drop back to this fraction
+# in one cut instead of trimming a little every turn (fewer prompt-cache busts).
+_REALTIME_TRUNCATION = {
+    "type": "retention_ratio",
+    "retention_ratio": 0.6,
+    "token_limits": {"post_instructions": 6000},
+}
 # Legacy OpenAI realtime voice ids → closest xAI built-in.
 _OPENAI_TO_XAI_VOICE = {
     "alloy": "eve",
@@ -1097,26 +1115,64 @@ def coach_review(req: https_fn.Request) -> https_fn.Response:
             model = COACH_MODEL_FREE
             max_tokens = 900
 
+        # Optional progress photos (food plate, body progress, workout form).
+        # Only Firebase Storage download URLs are accepted — the model must
+        # never be pointed at arbitrary external content.
+        raw_image_urls = payload.get("image_urls")
+        image_urls = []
+        if isinstance(raw_image_urls, list):
+            for url in raw_image_urls[:3]:
+                if (
+                    isinstance(url, str)
+                    and url.startswith("https://firebasestorage.googleapis.com/")
+                    and len(url) < 2048
+                ):
+                    image_urls.append(url)
+
         # Compose the user prompt: domain context + the structured ask.
         user_prompt = f"{summary}\n\n---\n\n{user_input}"
+        if image_urls:
+            user_prompt += (
+                "\n\n---\n\nPROGRESS PHOTO(S) ATTACHED — review them as this domain's expert:\n"
+                "- Food photo: identify the foods and rough portions; estimate calories and "
+                "protein as a RANGE (state it's an estimate); judge how well this meal fits "
+                "the user's stated plan/goal; give ONE concrete improvement for the next meal "
+                "(specific food + amount). Never label foods 'good'/'bad'.\n"
+                "- Body progress photo: comment respectfully on visible trend only; anchor to "
+                "consistency and behavior, never appearance judgment; no medical claims.\n"
+                "- Workout/form photo: note what looks right and ONE specific form or setup cue.\n"
+                "If a photo is unclear, say what you can see and ask for one better angle. "
+                "Weave the photo review INTO the structured review sections — do not append a "
+                "separate report."
+            )
         reply_language = "Thai" if language_selected == "thai" else "English"
 
         logger.info(
-            "coach_review: uid=%s tier=%s model=%s lang=%s summary_chars=%d",
-            uid or "anon", tier, model, language_selected, len(summary)
+            "coach_review: uid=%s tier=%s model=%s lang=%s summary_chars=%d images=%d",
+            uid or "anon", tier, model, language_selected, len(summary), len(image_urls)
         )
 
         # Use the shared ChatGPT wrapper. The wrapper already handles
         # retries, circuit breakers, and rate limiting.
-        from chatgpt_wrapper import chat_with_gpt
-        response_text = chat_with_gpt(
-            system_prompt=_COACH_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            model=model,
-            max_completion_tokens=max_tokens,
-            auto_detect_language=False,
-            reply_language=reply_language,
-        )
+        from chatgpt_wrapper import chat_with_gpt, chat_with_images
+        if image_urls:
+            response_text = chat_with_images(
+                system_prompt=_COACH_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                image_urls=image_urls,
+                model=model,
+                max_completion_tokens=max_tokens,
+                reply_language=reply_language,
+            )
+        else:
+            response_text = chat_with_gpt(
+                system_prompt=_COACH_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                model=model,
+                max_completion_tokens=max_tokens,
+                auto_detect_language=False,
+                reply_language=reply_language,
+            )
 
         if not response_text or not response_text.strip():
             return create_response(
@@ -1144,6 +1200,111 @@ def coach_review(req: https_fn.Request) -> https_fn.Response:
             message='Coach review failed',
             error="We couldn't reach your coach right now. Please try again in a moment.",
             status_code=500,
+        )
+
+
+_WEEKLY_REPORT_SYSTEM_PROMPT = (
+    "You are EVO Coach writing your client's WEEKLY CHECK-IN — the message a "
+    "paid human coach sends every Sunday evening. You receive a stats block "
+    "(completions, weight log, meal photo list) and possibly meal photos.\n\n"
+    "Rules:\n"
+    "- Anchor every claim to the data provided. Never invent numbers.\n"
+    "- Judge trends, never single days. Missed days are information, not failure.\n"
+    "- If weight data exists: comment on the trend and what the behavior data "
+    "says about it. Ranges and honesty over false precision. No medical claims.\n"
+    "- If meal photos are attached: weave ONE concrete observation about them "
+    "into the review (portion, protein, pattern) — never 'good'/'bad' labels.\n"
+    "- Structure (plain text, no markdown headers): 1-2 sentences on the week "
+    "overall → one specific WIN worth keeping → ONE focus for next week with a "
+    "concrete first action for tomorrow. End with one short encouraging line.\n"
+    "- Max 170 words. Warm, direct, like a coach who knows this person. "
+    "Speak as 'you', sign nothing."
+)
+
+
+@https_fn.on_request(memory=1024, max_instances=3, timeout_sec=120, cpu=1, secrets=_LLM_SECRETS)
+def weekly_coach_report(req: https_fn.Request) -> https_fn.Response:
+    """Server-to-server: compose the Sunday weekly check-in for one user.
+
+    Called by the backend scheduler (V2_sendWeeklyCoachReport), not the app —
+    so tier arrives as a payload field the backend already verified against
+    coachSubscription/current. Same image-host allowlist as coach_review.
+    """
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+    if req.method != 'POST':
+        return create_response(
+            success=False, message='Method not allowed',
+            error='Only POST method is allowed', status_code=405,
+        )
+
+    try:
+        payload = req.get_json(silent=True) or {}
+        user_context = (payload.get("user_context") or "").strip()
+        if not user_context or len(user_context) > 8000:
+            return create_response(
+                success=False, message='Invalid user_context',
+                error='`user_context` is required (max 8000 chars)', status_code=400,
+            )
+
+        language_selected = (payload.get("language") or "english").lower()
+        tier = (payload.get("tier") or "free").lower()
+
+        image_urls = []
+        raw_urls = payload.get("image_urls")
+        if isinstance(raw_urls, list):
+            for url in raw_urls[:3]:
+                if (
+                    isinstance(url, str)
+                    and url.startswith("https://firebasestorage.googleapis.com/")
+                    and len(url) < 2048
+                ):
+                    image_urls.append(url)
+
+        model = COACH_MODEL_PREMIUM if tier == "premium" else COACH_MODEL_FREE
+        max_tokens = 900 if tier == "premium" else 650
+        reply_language = "Thai" if language_selected == "thai" else "English"
+
+        user_prompt = (
+            f"CLIENT WEEK DATA:\n{user_context}\n\n"
+            "Write this week's check-in now."
+        )
+
+        from chatgpt_wrapper import chat_with_gpt, chat_with_images
+        if image_urls:
+            report = chat_with_images(
+                system_prompt=_WEEKLY_REPORT_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                image_urls=image_urls,
+                model=model,
+                max_completion_tokens=max_tokens,
+                reply_language=reply_language,
+            )
+        else:
+            report = chat_with_gpt(
+                system_prompt=_WEEKLY_REPORT_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                model=model,
+                max_completion_tokens=max_tokens,
+                auto_detect_language=False,
+                reply_language=reply_language,
+            )
+
+        if not report or not report.strip():
+            return create_response(
+                success=False, message='Empty model response',
+                error='Report generation returned nothing.', status_code=502,
+            )
+
+        return create_response(
+            data={'report': report.strip(), 'model_used': model},
+            message='Weekly report generated',
+        )
+    except Exception as e:
+        logger.error("weekly_coach_report error: %s", e)
+        return create_response(
+            success=False, message='Weekly report failed',
+            error=str(e), status_code=500,
         )
 
 
@@ -5754,6 +5915,8 @@ def encourage_in_the_morning(req: https_fn.Request) -> https_fn.Response:
             morning_mode=morning_mode,
             week_tasks=data.get('week_tasks') if isinstance(data.get('week_tasks'), list) else [],
             today_date=data.get('today_date'),
+            coach_continuity=data.get('coach_continuity'),
+            weather_context=data.get('weather_context'),
         )
         return create_response(
             data={'response': response},
@@ -7705,6 +7868,76 @@ def evo_image_generation(req: https_fn.Request) -> https_fn.Response:
         )
 
 
+@https_fn.on_request(memory=256, max_instances=20, timeout_sec=20, cpu=1)
+def evo_place_photo(req: https_fn.Request) -> https_fn.Response:
+    """Redirect proxy for Google Place photos.
+
+    Keeps the Google Maps key OUT of stored task docs: the client stores a
+    keyless proxy URL (…/evo_place_photo?name=places/X/photos/Y) as a task's
+    image, and this function calls Google with the SERVER key, resolves the
+    keyless googleusercontent photo URL, and 302-redirects the image loader
+    there. It also survives photo-URL expiry — the photo resource name is
+    stable, so each load re-resolves a fresh URL. Soft-fails to 404 so a dead
+    photo never leaves a broken image.
+    """
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+    if req.method != 'GET':
+        return https_fn.Response('Method not allowed', status=405)
+    try:
+        from google_api_key import resolve_google_api_key
+        key = resolve_google_api_key()
+        if not key:
+            return https_fn.Response('Photo unavailable', status=404)
+
+        max_w = req.args.get('w') or '800'
+        try:
+            max_w = str(min(1600, max(80, int(max_w))))
+        except (TypeError, ValueError):
+            max_w = '800'
+
+        name = (req.args.get('name') or '').strip()
+        ref = (req.args.get('ref') or '').strip()
+        target = None
+
+        if name:
+            # Places API (New) photo resource name: places/<id>/photos/<id>.
+            if not re.match(r'^places/[^/]+/photos/[^/]+$', name):
+                return https_fn.Response('Bad name', status=400)
+            url = (
+                f"https://places.googleapis.com/v1/{name}/media"
+                f"?maxWidthPx={max_w}&skipHttpRedirect=true&key={key}"
+            )
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                target = (r.json() or {}).get('photoUri')
+        elif ref:
+            # Legacy Place Photo endpoint 302-redirects to a keyless URL.
+            if not re.match(r'^[A-Za-z0-9_\-]{10,600}$', ref):
+                return https_fn.Response('Bad ref', status=400)
+            url = (
+                f"https://maps.googleapis.com/maps/api/place/photo"
+                f"?maxwidth={max_w}&photo_reference={ref}&key={key}"
+            )
+            r = requests.get(url, timeout=10, allow_redirects=False)
+            if r.status_code in (301, 302, 303, 307, 308):
+                target = r.headers.get('Location')
+        else:
+            return https_fn.Response('Missing name/ref', status=400)
+
+        if not target:
+            return https_fn.Response('Photo unavailable', status=404)
+
+        return https_fn.Response(
+            '',
+            status=302,
+            headers={'Location': target, 'Cache-Control': 'public, max-age=86400'},
+        )
+    except Exception as e:
+        logger.error("evo_place_photo error: %s", e)
+        return https_fn.Response('Photo error', status=500)
+
+
 @https_fn.on_request(memory=1024, max_instances=3, timeout_sec=540, cpu=1, secrets=_LLM_SECRETS)
 def generate_planner_images(req: https_fn.Request) -> https_fn.Response:
     """Generate AI cover + weekly theme images for a planner (background phase).
@@ -8255,17 +8488,6 @@ def evo_voice_chat(req: https_fn.Request) -> https_fn.Response:
         )
 
 
-# Tools only meaningful for users who HOST listings — trimmed from sessions
-# when the client flags is_host=false (see evo_realtime_session).
-_HOST_ONLY_TOOL_NAMES = frozenset({
-    "get_my_offerings",
-    "get_booking_requests",
-    "offer_on_request",
-    "find_open_requests",
-    "mark_booking_no_show",
-})
-
-
 def _realtime_voice_tool_specs() -> list:
     """Function tools the Realtime model can call mid-conversation (on-demand fetch)."""
     return [
@@ -8511,9 +8733,12 @@ def _realtime_voice_tool_specs() -> list:
             "type": "function",
             "name": "find_places",
             "description": (
-                "Find real places (bars, cafes, restaurants, gyms, etc.) via Google Places. Use the user's "
-                "saved tastes to shape the query (e.g. they like IPA → query 'craft beer bar'). Returns real "
-                "venues with rating, open-now, and a maps link. Recommend 1-3 and mention rating/open status."
+                "Find real places (bars, cafes, restaurants, gyms, attractions, etc.) via Google Places. Use "
+                "the user's saved tastes to shape the query (e.g. they like IPA → query 'craft beer bar'). "
+                "Each result has rating, open-now, a maps link, address+lat/lng, and often a `photo_url` (a "
+                "real Google photo). Recommend 1-3 and mention rating/open status. When you SAVE a place onto "
+                "a task (create_task), pass its address+lat+lng (for the map preview) AND its photo_url as "
+                "image_url (for a hero image) — this is how trip stops get a rich, attractive task card."
             ),
             "parameters": {
                 "type": "object",
@@ -8707,7 +8932,7 @@ def _realtime_voice_tool_specs() -> list:
                     "time": {"type": "string", "description": "Start time as 24h HH:MM. Omit if no specific time."},
                     "module": {
                         "type": "string",
-                        "enum": ["workout", "recipe", "study", "itinerary", "budget", "mindfulness"],
+                        "enum": ["workout", "recipe", "study", "itinerary", "budget", "mindfulness", "event"],
                         "description": (
                             "FIRST CHOICE for how-to content that fits a category: a curated display module "
                             "the app renders with a themed layout. Pass its fields in module_data. Overrides "
@@ -8724,8 +8949,22 @@ def _realtime_voice_tool_specs() -> list:
                             "flashcards?:[{front, back}], recall_prompt?}. itinerary: {stops:[{time?, text, "
                             "place?}], budget?:[{label, value}], unit?, packing?:[..], tip?}. budget: {items:"
                             "[{label, value}], unit?, warning?}. mindfulness: {minutes, guidance?:[..], "
-                            "affirmation?}. Fill only what you know — every field is optional except each "
+                            "affirmation?}. event (a real-world activity/outing — concert, class, meetup, "
+                            "dinner, appointment): {when?, place?, address?, with_who?:[..], agenda?:"
+                            "[{time?, text, place?}], prep?:[..] (things to bring/do beforehand), link?, "
+                            "note?}. Fill only what you know — every field is optional except each "
                             "module's core list."
+                        ),
+                    },
+                    "modules": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": (
+                            "SEVERAL modules on one task \u2014 [{module, module_data}, \u2026], max 4, rendered as "
+                            "stacked sections each with its own header. Reach for this whenever the task is "
+                            "genuinely more than one thing: a training day with the workout AND the meal that "
+                            "fuels it, a trip day with the itinerary AND its budget, a study block with the "
+                            "session AND its flashcards. Overrides `module`/`module_data`."
                         ),
                     },
                     "blocks": {
@@ -8738,8 +8977,10 @@ def _realtime_voice_tool_specs() -> list:
                             "{type:'timer_step', text, minutes, note?} = timed practice with a live countdown; "
                             "{type:'table', title?, columns:[...], rows:[[...]]} = structured data (sets/reps, "
                             "schedule, budget); {type:'callout', style:'tip'|'warning'|'motivation', text} = one "
-                            "key note; {type:'timeline', title?, items:[{time?, text, place?}]} = itinerary/day "
-                            "schedule on a visual rail (trips, routines); {type:'chart', title?, unit?, items:"
+                            "key note; {type:'timeline', title?, total?, items:[{time?, text, place?, "
+                            "cost?}]} = itinerary/day schedule on a visual rail (trips, routines); `cost` and "
+                            "`total` are already-formatted money strings ('THB 350'), for days that really cost "
+                            "something \u2014 send `total` only when more than one item is priced; {type:'chart', title?, unit?, items:"
                             "[{label, value}]} = horizontal bars (budgets, progress, comparisons); "
                             "{type:'flashcards', title?, cards:[{front, back}]} = tap-to-flip study cards "
                             "(vocabulary, facts); {type:'heading', text}; {type:'text', text}. Keep it tight: 2-6 blocks, "
@@ -8753,6 +8994,41 @@ def _realtime_voice_tool_specs() -> list:
                     "address": {"type": "string", "description": "Full venue address from find_places (shows map preview on the task)."},
                     "lat": {"type": "number", "description": "Latitude from find_places."},
                     "lng": {"type": "number", "description": "Longitude from find_places."},
+                    "image_url": {"type": "string", "description": "Optional related image shown as a hero image on the task — MUST be a REAL https URL, e.g. a find_places result's photo_url for a place/trip stop, or a URL the user gave. NEVER invent an image URL (it just 404s). Omit if you have no real one."},
+                },
+                "required": ["title"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "log_activity",
+            "description": (
+                "RECORD something the user ALREADY DID, as a COMPLETED calendar entry — e.g. 'I just "
+                "finished a 5k run', 'read a chapter of my book', 'did shoulder day at the gym', 'meditated "
+                "20 minutes'. This is the past-tense counterpart of create_task (which schedules FUTURE "
+                "to-dos): use log_activity when the user reports a done activity, NOT create_task. It marks "
+                "the entry completed so it counts toward their real practice history (reps done — the "
+                "neuroplasticity record EVO coaches from). Default `date` is today; pass an explicit "
+                "YYYY-MM-DD if they say when. You MAY attach a display `module` + `module_data` to capture "
+                "WHAT they did richly (e.g. module='workout' with the exercises/sets they actually did, or "
+                "module='study' with what they covered). After logging, briefly affirm it — celebrate the "
+                "rep, never guilt about anything missed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Short title of what they did (e.g. '5k run', 'Shoulder workout')."},
+                    "date": {"type": "string", "description": "Date as YYYY-MM-DD. Default today if unsaid."},
+                    "time": {"type": "string", "description": "Optional start time as 24h HH:MM if they mention when."},
+                    "module": {
+                        "type": "string",
+                        "enum": ["workout", "recipe", "study", "itinerary", "budget", "mindfulness", "event"],
+                        "description": "Optional display module to record WHAT they did richly. Same modules as create_task; pass fields in module_data.",
+                    },
+                    "module_data": {"type": "object", "description": "Fields for the chosen module (same shapes as create_task's module_data)."},
+                    "detail": {"type": "string", "description": "Optional freeform note about how it went (used when no module fits)."},
+                    "typeOfTodo": {"type": "string", "description": "Optional category tag (e.g. 'workout', 'study')."},
+                    "image_url": {"type": "string", "description": "Optional real https image URL (e.g. a find_places photo_url) shown as a hero image. Never invent one."},
                 },
                 "required": ["title"],
             },
@@ -8781,7 +9057,7 @@ def _realtime_voice_tool_specs() -> list:
                     "date": {"type": "string", "description": "Date YYYY-MM-DD, to disambiguate which instance."},
                     "module": {
                         "type": "string",
-                        "enum": ["workout", "recipe", "study", "itinerary", "budget", "mindfulness"],
+                        "enum": ["workout", "recipe", "study", "itinerary", "budget", "mindfulness", "event"],
                         "description": (
                             "FIRST CHOICE for how-to content that fits a category: a curated display module "
                             "the app renders with a themed layout. Pass its fields in module_data. Overrides "
@@ -8798,7 +9074,10 @@ def _realtime_voice_tool_specs() -> list:
                             "flashcards?:[{front, back}], recall_prompt?}. itinerary: {stops:[{time?, text, "
                             "place?}], budget?:[{label, value}], unit?, packing?:[..], tip?}. budget: {items:"
                             "[{label, value}], unit?, warning?}. mindfulness: {minutes, guidance?:[..], "
-                            "affirmation?}. Fill only what you know — every field is optional except each "
+                            "affirmation?}. event (a real-world activity/outing — concert, class, meetup, "
+                            "dinner, appointment): {when?, place?, address?, with_who?:[..], agenda?:"
+                            "[{time?, text, place?}], prep?:[..] (things to bring/do beforehand), link?, "
+                            "note?}. Fill only what you know — every field is optional except each "
                             "module's core list."
                         ),
                     },
@@ -8812,8 +9091,10 @@ def _realtime_voice_tool_specs() -> list:
                             "{type:'timer_step', text, minutes, note?} = timed practice with a live countdown; "
                             "{type:'table', title?, columns:[...], rows:[[...]]} = structured data (sets/reps, "
                             "schedule, budget); {type:'callout', style:'tip'|'warning'|'motivation', text} = one "
-                            "key note; {type:'timeline', title?, items:[{time?, text, place?}]} = itinerary/day "
-                            "schedule on a visual rail (trips, routines); {type:'chart', title?, unit?, items:"
+                            "key note; {type:'timeline', title?, total?, items:[{time?, text, place?, "
+                            "cost?}]} = itinerary/day schedule on a visual rail (trips, routines); `cost` and "
+                            "`total` are already-formatted money strings ('THB 350'), for days that really cost "
+                            "something \u2014 send `total` only when more than one item is priced; {type:'chart', title?, unit?, items:"
                             "[{label, value}]} = horizontal bars (budgets, progress, comparisons); "
                             "{type:'flashcards', title?, cards:[{front, back}]} = tap-to-flip study cards "
                             "(vocabulary, facts); {type:'heading', text}; {type:'text', text}. Keep it tight: 2-6 blocks, "
@@ -8821,9 +9102,20 @@ def _realtime_voice_tool_specs() -> list:
                             "automatically \u2014 do not send both."
                         ),
                     },
+                    "modules": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": (
+                            "SEVERAL modules on one task — [{module, module_data}, …], max 4, rendered as "
+                            "stacked sections with their own headers. Use this when a day is more than one "
+                            "thing: a workout AND the meal that fuels it, a study session AND its flashcards. "
+                            "On append (the default) the new modules stack UNDER what the task already has, "
+                            "so existing ticked steps stay put. Overrides `module`/`module_data`."
+                        ),
+                    },
                     "detail": {"type": "string", "description": "The concrete how-to steps to save on the task. FORMAT: one step per line, each line starting with '- ' (or '1. ' numbering), specs inline — e.g. '- Bench press 3x12\\n- Incline dumbbell press 3x10'. Never a prose paragraph — the app renders these lines as a step checklist. When modifying (append=false), this must be the COMPLETE revised detail, not just the changed lines."},
                     "brief": {"type": "string", "description": "Required when detail has steps: 1-2 sentence overview of what this is and why (shown above the checklist in the app)."},
-                    "append": {"type": "boolean", "description": "Default true: ADDS to existing notes (deduped, numbering continued). Pass append=false only when modifying/replacing existing detail — and include based_on_existing=true once you've read the current text."},
+                    "append": {"type": "boolean", "description": "Default true: ADDS to existing notes (deduped, numbering continued), and stacks a new module under the existing ones. Pass append=false only when modifying/replacing existing detail — and include based_on_existing=true once you've read the current text."},
                     "based_on_existing": {"type": "boolean", "description": "Set true with append=false to confirm the detail you're sending was revised from the task's current detail (via get_task_detail or the needs_existing_detail response)."},
                 },
                 "required": [],
@@ -8928,6 +9220,11 @@ def _realtime_voice_tool_specs() -> list:
                         ),
                     },
                     "plan_name": {"type": "string", "description": "Optional short name for the plan."},
+                    "source": {
+                        "type": "string",
+                        "enum": ["realtime", "image_import"],
+                        "description": "Use image_import only when the plan was extracted from the user's attached image(s).",
+                    },
                     "total_days": {"type": "integer", "description": "Length in days (1-90). Omit for a category-typical default."},
                     "minutes_per_day": {"type": "integer", "description": "Daily time budget in minutes (10-480). Omit for a default."},
                     "intensity": {
@@ -8992,13 +9289,15 @@ def _realtime_voice_tool_specs() -> list:
             "type": "function",
             "name": "refine_plan",
             "description": (
-                "Revise a generated plan's CONTENT in the background — same draft, no new plan. Call when "
+                "Revise a plan's CONTENT in the background — same plan, no new one. Call when "
                 "the user wants changes to what the plan says (harder/easier, different exercises or topics, "
                 "shorter sessions, swap a week's focus). Pass their request as `changes`; optionally limit "
                 "to a day range. Returns immediately — tell the user you're refining it and you'll say when "
-                "it's ready (a system update will announce completion, same as generate_plan). For "
-                "SCHEDULE changes (dates, times, reminders, spacing) use adjust_plan instead; for a "
-                "completely different plan use generate_plan."
+                "it's ready (a system update will announce completion, same as generate_plan). This works on "
+                "plans ALREADY on the calendar too: when the revision finishes their existing day tasks are "
+                "updated in place, so never call apply_plan_to_calendar afterwards (that would duplicate "
+                "every day). For SCHEDULE changes (dates, times, reminders, spacing) use adjust_plan instead; "
+                "for a completely different plan use generate_plan."
             ),
             "parameters": {
                 "type": "object",
@@ -9010,6 +9309,85 @@ def _realtime_voice_tool_specs() -> list:
                     "refine_day_end": {"type": "integer", "description": "Optional: only revise up to this day number."},
                 },
                 "required": ["changes"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "add_trip_companion",
+            "description": (
+                "Invite someone the user knows onto a plan that is ALREADY on their calendar — 'add Nok to "
+                "my Taipei trip', 'my sister is coming too'. One invite covers the whole trip: when they "
+                "accept, every scheduled day lands on their calendar and keeps updating as the plan is "
+                "revised. Names are matched against people the user follows or who follow them; if the "
+                "result comes back with `unresolved` or `candidates`, ASK which person they mean instead of "
+                "guessing — this puts days on a real person's calendar. If the plan is not on the calendar "
+                "yet, apply it first. For strangers doing the same plan separately, that is a circle, not a "
+                "companion; do not use this."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "plan_id": {"type": "string", "description": "planId of the trip (preferred)."},
+                    "plan_name": {"type": "string", "description": "Plan name as the user said it — fuzzy-matched fallback."},
+                    "people": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Names or @usernames exactly as the user said them.",
+                    },
+                },
+                "required": ["people"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "add_plan_content",
+            "description": (
+                "Add content to EVERY day of a plan (or to a whole series of tasks with the same title) in "
+                "ONE call — meals across a month of training, a warm-up on every session, a revision block "
+                "on every study day. This is the tool for 'for the whole plan', 'every day', 'all of them': "
+                "set_task_detail writes ONE task, so using it for a month gives the user a single example "
+                "day, which is exactly the failure this replaces. Give `same_for_all` when one template "
+                "fits every day, `days` when each date needs its own content (per-day wins where both are "
+                "given), or both together. Appends by default, so existing steps and the user's ticked "
+                "progress are preserved. Covers up to 31 days per call and tells you the next from_date "
+                "when there are more. Afterwards say how many days were updated — do not read them out."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "plan_name": {"type": "string", "description": "Plan name as the user says it — fuzzy-matched. Use this or plan_id for a real plan."},
+                    "plan_id": {"type": "string", "description": "Exact plan id when you have it from get_active_plans."},
+                    "title": {
+                        "type": "string",
+                        "description": (
+                            "Alternative to plan_name for tasks that are NOT part of a generated plan: match "
+                            "every task whose title contains this text (e.g. 'exercise'). Combine with "
+                            "from_date/to_date to bound the series."
+                        ),
+                    },
+                    "from_date": {"type": "string", "description": "First date to update, YYYY-MM-DD. Defaults to today — past days are left alone."},
+                    "to_date": {"type": "string", "description": "Last date to update, YYYY-MM-DD. Omit to run to the end of the plan."},
+                    "same_for_all": {
+                        "type": "object",
+                        "description": (
+                            "One content template applied to EVERY matched day: {detail?, brief?, module?, "
+                            "module_data?, modules?, blocks?} — the same fields as set_task_detail. Use it "
+                            "when the addition genuinely repeats (a standing warm-up, the same meal rules)."
+                        ),
+                    },
+                    "days": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": (
+                            "Per-date content: [{date:'YYYY-MM-DD', detail?, brief?, module?, module_data?, "
+                            "modules?, blocks?}, …]. Use this when each day differs — a different meal per "
+                            "training day. Send them in chunks of about a week if the plan is long."
+                        ),
+                    },
+                    "append": {"type": "boolean", "description": "Default true (adds to what each day already has). false replaces each day's detail — only on explicit request."},
+                    "include_completed": {"type": "boolean", "description": "Default false: already-completed days are left untouched."},
+                },
+                "required": [],
             },
         },
         {
@@ -9520,6 +9898,16 @@ def _realtime_voice_tool_specs() -> list:
 
 
 def _realtime_instructions(is_thai: bool, today_str: str = "", tz_label: str = "", now_time: str = "") -> str:
+    """NO LONGER SENT TO ANY MODEL — kept as the source text for the capability packs.
+
+    Both callers (evo_realtime_session and evo_coach_chat) now use
+    compact_realtime_instructions plus the per-pack instructions in
+    realtime_capabilities.py, because this prompt costs ~6.6k tokens on every request.
+    Editing the text below changes nothing at runtime: to change EVO's behaviour, edit
+    compact_realtime_instructions (always-on) or the matching PACK_INSTRUCTIONS entry.
+    It stays here because it is still the fullest written record of the tool workflows,
+    and not every paragraph has been migrated into a pack yet.
+    """
     date_line = ""
     if today_str:
         time_part = f" The current local time is {now_time}." if now_time else ""
@@ -9631,6 +10019,26 @@ def _realtime_instructions(is_thai: bool, today_str: str = "", tz_label: str = "
         "prefer todo_id from get_calendar, but titles are FUZZY-matched, so when the user names a task just "
         "pass their words as `title` and call directly; if a tool returns `candidates`, ask which one they "
         "mean and retry with that todo_id — never just say the task wasn't found. "
+        "LIFESTYLE ROUTING — pick the right shape for any life domain (exercise, learning, cooking, a "
+        "night out, finances, mindfulness, anything): (a) a MULTI-DAY effort or program (a training block, "
+        "a study/skill course, a trip, a habit to build over weeks) → generate_plan; (b) a SINGLE upcoming "
+        "thing to do → create_task, and attach the matching display MODULE so it renders richly: exercise→"
+        "workout, learning/revision→study, a meal→recipe, a trip day/routine→itinerary, money→budget, "
+        "calm/breathwork→mindfulness, and a real-world outing/appointment/social plan (concert, class, "
+        "dinner, meetup, doctor)→event; (c) something they ALREADY DID and are reporting → log_activity "
+        "(records it completed, counts as a real rep), optionally with the same module to capture what they "
+        "did; (d) they want to FIND a place, experience, or thing to book/rent → find_places / "
+        "find_offerings / get_booking_suggestions. Match the domain to (a)-(d); don't force a plan when a "
+        "single task fits, and don't schedule a future task when they're reporting the past. "
+        "TRIP PLANNING — pick by length: a MULTI-DAY trip (a real itinerary over 2+ days, a vacation) → "
+        "generate_plan, which builds it in the BACKGROUND (tell them you'll ping when it's ready). A SHORT "
+        "trip or day/weekend outing (a Saturday day-trip, an afternoon out, a few stops) → build it LIVE "
+        "right now: call find_places for each stop, then create SEVERAL create_task entries (one per stop) "
+        "in time order, each with its start time, the place's address+lat+lng (for the map), the place's "
+        "photo_url as image_url (for a hero image), and a short, USEFUL detail (what to do there, cost, a "
+        "tip, opening hours) — so every stop is a rich, attractive card, not a bare title. Keep a light "
+        "running word between the create_task calls so they hear progress. Only attach an image_url that is "
+        "a REAL photo_url (or a URL the user gave) — never invent one. "
         "When the user asks about an existing task's details — what's in it, the steps, 'remind me what I "
         "planned' — call get_task_detail for context (todo_id or their spoken title; items show has_detail), "
         "but answer with a brief 1-2 sentence summary — do NOT read the full saved text aloud. Only recite the "
@@ -9661,6 +10069,10 @@ def _realtime_instructions(is_thai: bool, today_str: str = "", tz_label: str = "
         "plan (adjust_plan) or prioritize (prioritize_tasks). And when you SAVE rich content, SAY what "
         "appeared so they open it: 'I put a timeline with the places on the task' / 'the workout has set "
         "buttons and a rest timer — tick them as you go'. "
+        "When ATTACHING a video link (or any note) to a task that already exists — especially one with a "
+        "workout or other rich content — call set_task_detail in APPEND mode (the default; never append=false "
+        "just to add something): it keeps the existing steps and adds the link. Then confirm it's on the task "
+        "(they can tap it open); do NOT re-check or re-save it. "
         "When the guidance belongs on a task they'll do later, SAVE it onto the task: put the steps (and a "
         "chosen video link on its own line) in create_task's `detail` for a new task, or call set_task_detail "
         "(find the existing task's todo_id via get_calendar first). Always pass `brief` too — 1-2 sentences "
@@ -9699,7 +10111,8 @@ def _realtime_instructions(is_thai: bool, today_str: str = "", tz_label: str = "
         "one more question and retry. CLOSE THE LOOP: when a SYSTEM UPDATE announces the plan finished, tell the "
         "user right away and ask what they'd like next — hear a quick overview / revise something (summarize via "
         "get_plan_generation_status; to revise the content, call refine_plan with what to change — it keeps "
-        "the same draft and announces completion the same way), or START it: "
+        "the same plan, announces completion the same way, and if the plan is already on their calendar it "
+        "updates those day tasks in place, so never re-apply it afterwards), or START it: "
         "ask for the start date, the time each day, and how many minutes before they want the reminder, then "
         "call apply_plan_to_calendar and confirm what was scheduled. If they ask 'is it done yet?', call "
         "get_plan_generation_status instead of guessing. When get_plan_generation_status returns "
@@ -9838,7 +10251,6 @@ def evo_realtime_session(req: https_fn.Request) -> https_fn.Response:
                 data.get('voice') or data.get('voice_id') or data.get('voiceId') or _XAI_DEFAULT_VOICE
             )
             client_secrets_url = 'https://api.x.ai/v1/realtime/client_secrets'
-            sessions_url = 'https://api.x.ai/v1/realtime/sessions'
             provider_label = 'xAI'
         else:
             from openai_api_key import resolve_openai_api_key
@@ -9873,7 +10285,16 @@ def evo_realtime_session(req: https_fn.Request) -> https_fn.Response:
                 today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
 
         now_time = str(data.get('now_time') or data.get('nowTime') or '').strip()[:5]
-        instructions = _realtime_instructions(is_thai, today_str, tz_label, now_time)
+        from realtime_capabilities import (
+            build_realtime_capability_payload,
+            compact_realtime_instructions,
+        )
+        instructions = compact_realtime_instructions(
+            is_thai,
+            today_str,
+            tz_label,
+            now_time,
+        )
 
         context_hint = str(data.get('context') or data.get('contextHint') or '').strip()
         if context_hint:
@@ -9882,14 +10303,12 @@ def evo_realtime_session(req: https_fn.Request) -> https_fn.Response:
                 f"{context_hint[:_REALTIME_CONTEXT_MAX_CHARS]} Use it to ground your answers when relevant."
             )
 
-        tools = _realtime_voice_tool_specs()
-        # Tool-surface trimming: 55+ specs inflate every session and dilute
-        # tool selection. When the client EXPLICITLY says the user isn't a
-        # host (context_flags.is_host === false), drop the host-only tools.
-        # Absent/other values keep the full surface (backward compatible).
+        full_tools = _realtime_voice_tool_specs()
         context_flags = data.get('context_flags') if isinstance(data.get('context_flags'), dict) else {}
-        if context_flags.get('is_host') is False:
-            tools = [t for t in tools if t.get('name') not in _HOST_ONLY_TOOL_NAMES]
+        tools, tool_packs = build_realtime_capability_payload(
+            full_tools,
+            is_host=context_flags.get('is_host') is not False,
+        )
         language_hint = 'th' if is_thai else 'en'
 
         headers = {
@@ -9900,10 +10319,15 @@ def evo_realtime_session(req: https_fn.Request) -> https_fn.Response:
         token = ""
         expires_at = None
         try:
+            client_secret_body = (
+                {'expires_after': {'seconds': 300}}
+                if provider == 'xai'
+                else {'session': {'type': 'realtime', 'model': model}}
+            )
             resp = requests.post(
                 client_secrets_url,
                 headers=headers,
-                json={'session': {'type': 'realtime', 'model': model}},
+                json=client_secret_body,
                 timeout=8,
             )
             if resp.status_code < 300:
@@ -9927,7 +10351,9 @@ def evo_realtime_session(req: https_fn.Request) -> https_fn.Response:
         except Exception as primary_error:
             logger.warning("%s client_secrets mint error: %s", provider_label, primary_error)
 
-        if not token:
+        # xAI supports /client_secrets only. /realtime/sessions is the legacy
+        # OpenAI fallback and sending xAI there masks the real minting error.
+        if not token and provider != 'xai':
             resp = requests.post(
                 sessions_url,
                 headers=headers,
@@ -9989,10 +10415,15 @@ def evo_realtime_session(req: https_fn.Request) -> https_fn.Response:
             session_payload = {
                 'instructions': instructions,
                 'voice': voice,
-                'modalities': ['audio', 'text'],
+                'output_modalities': ['audio'],
                 'turn_detection': turn_detection,
                 'tools': tools,
                 'tool_choice': 'auto',
+                # Cost guards (OpenAI Realtime GA schema): cap one spoken answer, and
+                # cut the conversation back to a fraction of the token limit in one
+                # step once it grows past it.
+                'max_output_tokens': _REALTIME_MAX_OUTPUT_TOKENS,
+                'truncation': dict(_REALTIME_TRUNCATION),
             }
 
         return create_response(
@@ -10002,6 +10433,9 @@ def evo_realtime_session(req: https_fn.Request) -> https_fn.Response:
                 'model': model,
                 'provider': provider,
                 'session': session_payload,
+                # Schemas stay client-side until load_capability_pack asks for
+                # one; they are not part of the model's initial context.
+                'tool_packs': tool_packs,
             },
             message='Realtime session ready'
         )
@@ -10015,10 +10449,15 @@ def evo_realtime_session(req: https_fn.Request) -> https_fn.Response:
         )
 
 
-def _coach_chat_tool_specs() -> list:
-    """Chat Completions variant of the realtime tool specs (nested `function` key)."""
+def _coach_chat_tool_specs(tools: list = None) -> list:
+    """Chat Completions variant of realtime tool specs (nested `function` key).
+
+    Pass the trimmed surface from coach_chat_capability_payload. Omitting `tools` sends
+    every schema EVO has, which is what the typed chat used to do — ~15k tokens on every
+    round of the tool loop.
+    """
     specs = []
-    for tool in _realtime_voice_tool_specs():
+    for tool in tools if tools is not None else _realtime_voice_tool_specs():
         name = tool.get("name")
         if not name:
             continue
@@ -10038,7 +10477,10 @@ _COACH_CHAT_TEXT_MODE = (
     "No spoken filler ('One sec…'); the app shows a progress indicator while your tools run. "
     "Keep replies short (2-4 sentences); a short list or a little **bold** is fine when it genuinely helps. "
     "Don't paste long raw URLs into the reply — mention the title and save links onto tasks via set_task_detail. "
-    "Tools work exactly like in voice: call them to read real data or act — never guess calendar/plan contents."
+    "Tools work exactly like in voice: call them to read real data or act — never guess calendar/plan contents. "
+    "When a request needs a specialist capability, call load_capability_pack right away and keep working in the "
+    "same turn — never ask the user for permission to load it, and never tell them a capability is unavailable "
+    "before you have tried its pack."
 )
 
 _PROACTIVE_CHECKIN_INSTRUCTION = (
@@ -10052,6 +10494,33 @@ _COACH_CHAT_ALLOWED_ROLES = {"user", "assistant", "tool"}
 _COACH_CHAT_MAX_MESSAGES = 60
 _COACH_CHAT_MAX_CONTENT_CHARS = 8000
 _COACH_CHAT_MODELS = {"gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini"}
+_COACH_CHAT_MAX_IMAGES = 4
+_COACH_CHAT_MAX_IMAGE_BASE64_CHARS = 3_200_000
+_COACH_CHAT_IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/webp"}
+_COACH_CHAT_RATE_WINDOW_SEC = 300
+_COACH_CHAT_RATE_FREE_MAX = 30
+_COACH_CHAT_RATE_PAID_MAX = 90
+_PLAN_IMAGE_IMPORT_RATE_MAX = 8
+_PLAN_IMPORT_TRAINING_RATE_MAX = 20
+_PLAN_IMAGE_IMPORT_BUCKETS = {
+    "evoforluanching.appspot.com",
+    "evoforluanching.firebasestorage.app",
+}
+_PLAN_IMAGE_IMPORT_MAX_BYTES = 2_500_000
+_coach_chat_rate_state = {}
+_plan_image_import_rate_state = {}
+_plan_import_training_rate_state = {}
+
+_COACH_CHAT_IMAGE_IMPORT_INSTRUCTION = (
+    " IMAGE IMPORT: the current user message includes one or more private images supplied for this request. "
+    "Treat them as the source of truth. When the user asks to import/convert an itinerary or plan, read every "
+    "legible day heading, date, time, transport leg, place, meal, and note. For a multi-day itinerary, call "
+    "generate_plan immediately with category='travel', source='image_import', and a detailed goal that preserves "
+    "the extracted schedule faithfully; do not invent missing details. The resulting draft is reviewable before "
+    "anything reaches the calendar, so never call apply_plan_to_calendar from an image import. If a detail is "
+    "uncertain, preserve it as a note in the draft rather than guessing. For a single-day plan, create a rich "
+    "itinerary task only after the user has asked to add it."
+)
 
 
 def _sanitize_coach_chat_messages(raw) -> list:
@@ -10102,6 +10571,598 @@ def _sanitize_coach_chat_messages(raw) -> list:
     return cleaned
 
 
+def _sanitize_coach_chat_images(raw) -> list:
+    """Validate inline mobile image payloads before passing them to the vision model."""
+    if not isinstance(raw, list):
+        return []
+    cleaned = []
+    for item in raw[:_COACH_CHAT_MAX_IMAGES]:
+        if not isinstance(item, dict):
+            continue
+        mime_type = str(item.get("mimeType") or item.get("mime_type") or "image/jpeg").lower()
+        image_b64 = str(item.get("base64") or "").replace("\n", "").replace("\r", "").strip()
+        if (
+            mime_type not in _COACH_CHAT_IMAGE_MIME_TYPES
+            or not image_b64
+            or len(image_b64) > _COACH_CHAT_MAX_IMAGE_BASE64_CHARS
+            or len(image_b64) % 4 != 0
+            or not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", image_b64)
+        ):
+            continue
+        cleaned.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime_type};base64,{image_b64}", "detail": "high"},
+        })
+    return cleaned
+
+
+def _sanitize_plan_image_import_urls(raw, uid: str) -> list:
+    """Accept only short-lived image URLs uploaded under this verified user.
+
+    Mobile uses Firebase Storage's resumable transport to avoid iOS/QUIC
+    EMSGSIZE failures caused by large inline base64 JSON requests. Restricting
+    the host, bucket, and object prefix prevents this endpoint from becoming
+    an arbitrary URL fetcher.
+    """
+    if not isinstance(raw, list) or not uid:
+        return []
+    cleaned = []
+    # Temp import objects now live under a fixed top-level prefix
+    # (ai-plan-import/<uid>/...) so ONE GCS lifecycle rule can sweep them —
+    # a per-user prefix (<uid>/ai-plan-import/...) can't be matched by lifecycle
+    # because the uid comes first. Older app builds still upload under the legacy
+    # per-user prefix, so accept BOTH during the rollout. Both embed the verified
+    # uid, so cross-user reads stay blocked either way.
+    allowed_prefixes = (f"ai-plan-import/{uid}/", f"{uid}/ai-plan-import/")
+    for raw_url in raw[:_COACH_CHAT_MAX_IMAGES]:
+        url = str(raw_url or "").strip()
+        if not url or len(url) > 2048:
+            continue
+        try:
+            parsed = urlparse(url)
+            path_match = re.fullmatch(r"/v0/b/([^/]+)/o/(.+)", parsed.path)
+            query = parse_qs(parsed.query)
+            if (
+                parsed.scheme != "https"
+                or parsed.hostname != "firebasestorage.googleapis.com"
+                or not path_match
+                or path_match.group(1) not in _PLAN_IMAGE_IMPORT_BUCKETS
+                or query.get("alt") != ["media"]
+                or not query.get("token")
+            ):
+                continue
+            object_path = unquote(path_match.group(2))
+            if not object_path.startswith(allowed_prefixes):
+                continue
+            cleaned.append({
+                "type": "image_url",
+                "image_url": {"url": url, "detail": "high"},
+                # Internal-only fields let the function read the object with
+                # EVO's cross-project Admin credential. The signed download
+                # URL remains for compatibility with older revisions.
+                "_firebase_bucket": path_match.group(1),
+                "_firebase_object_path": object_path,
+            })
+        except (TypeError, ValueError):
+            continue
+    return cleaned
+
+
+_RESIZED_VARIANT_RE = re.compile(r"_(\d+)x(\d+)\.[^./]+$")
+
+
+def _largest_resized_variant_blob(gcs_bucket, object_path: str):
+    """Return the biggest storage-resize-images output for a deleted original.
+
+    The `storage-resize-images` extension (DELETE_ORIGINAL_FILE=on_success) is
+    installed bucket-wide on evoforluanching.appspot.com: it replaces an uploaded
+    `<dir>/<name>.<ext>` with resized `<dir>/<name>_<W>x<H>.<outext>` siblings and
+    deletes the original. So a plan-import original is gone by read time, but the
+    variants are GUARANTEED present (on_success deletes only after resizing). Read
+    the largest variant for OCR instead of failing the import. Returns a listed
+    blob (size/content_type already populated) or None if no variant exists.
+    """
+    slash = object_path.rfind("/")
+    directory = object_path[: slash + 1]
+    filename = object_path[slash + 1:]
+    dot = filename.rfind(".")
+    stem = filename[:dot] if dot > 0 else filename
+    if not stem:
+        return None
+    best = None
+    best_area = -1
+    # The uuid stem is unique, so this prefix only matches this image's variants.
+    for blob in gcs_bucket.list_blobs(prefix=f"{directory}{stem}_", timeout=10):
+        match = _RESIZED_VARIANT_RE.search(blob.name or "")
+        if not match:
+            continue
+        area = int(match.group(1)) * int(match.group(2))
+        if area > best_area:
+            best_area = area
+            best = blob
+    return best
+
+
+def _download_plan_image_import_urls(url_parts: list, firebase_id_token: str = "") -> tuple:
+    """Download allowlisted temporary images and pass bounded bytes to OpenAI.
+
+    Fetching here gives deterministic size/type validation and avoids relying
+    on OpenAI to follow Firebase Storage token URLs.
+
+    The bucket-wide storage-resize-images extension deletes each uploaded
+    original and leaves `_<W>x<H>` variants, so the original is usually gone by
+    read time; the Admin path falls back to the largest variant (see
+    `_largest_resized_variant_blob`).
+
+    Returns ``(downloaded, skipped)``. A single-use temp object that is already
+    gone at read time (no readable original AND no resized variant) surfaces as a
+    404 and is SKIPPED, not fatal:
+    extraction is best-effort over 1-4 images, so one missing page must not kill
+    the whole import. Real input errors (too large / unsupported type) still
+    raise ValueError so the caller can tell the user to reselect that file.
+    """
+    downloaded = []
+    skipped = 0
+    for part in url_parts:
+        url = str(part.get("image_url", {}).get("url") or "")
+        bucket_name = str(part.get("_firebase_bucket") or "")
+        object_path = str(part.get("_firebase_object_path") or "")
+        image_bytes = b""
+        mime_type = ""
+        if bucket_name and object_path:
+            try:
+                from evo_firebase import get_evo_app
+
+                evo_app = get_evo_app()
+                if not evo_app:
+                    raise RuntimeError("EVO Firebase Admin is unavailable")
+                gcs_bucket = storage.bucket(bucket_name, app=evo_app)
+                blob = gcs_bucket.blob(object_path)
+                try:
+                    blob.reload(timeout=10)
+                except Exception as reload_exc:
+                    # The original was almost certainly deleted by the
+                    # storage-resize-images extension. Read its largest resized
+                    # variant (guaranteed to exist) instead of failing.
+                    variant = _largest_resized_variant_blob(gcs_bucket, object_path)
+                    if variant is None:
+                        raise reload_exc
+                    blob = variant
+                    logger.info(
+                        "EVO plan import: original gone, using resized variant %s",
+                        blob.name,
+                    )
+                if int(blob.size or 0) > _PLAN_IMAGE_IMPORT_MAX_BYTES:
+                    raise ValueError("One selected image is too large. Please select it again.")
+                mime_type = str(blob.content_type or "").split(";", 1)[0].lower()
+                if mime_type not in _COACH_CHAT_IMAGE_MIME_TYPES:
+                    raise ValueError("The selected file is not a supported image.")
+                image_bytes = blob.download_as_bytes(timeout=15)
+                if len(image_bytes) > _PLAN_IMAGE_IMPORT_MAX_BYTES:
+                    raise ValueError("One selected image is too large. Please select it again.")
+            except ValueError:
+                raise
+            except Exception as exc:
+                try:
+                    from evo_firebase import evo_credential_summary
+
+                    credential = evo_credential_summary()
+                except Exception:
+                    credential = "unknown"
+                # Log the credential/principal and bucket so a 403 is
+                # actionable: "application_default_fallback" means the EVO
+                # service-account secret never loaded (grant/attach it); a
+                # named service_account that still 403s is missing
+                # roles/storage.objectViewer on evoforluanching.
+                logger.warning(
+                    "EVO temporary Storage read failed via Admin SDK "
+                    "(error=%s, bucket=%s, credential=%s): %s",
+                    type(exc).__name__,
+                    bucket_name,
+                    credential,
+                    exc,
+                )
+                # Fall through to the HTTP path even without a Firebase ID token:
+                # the getDownloadURL carries its own ?token= query param, so the
+                # unauthenticated GET can still succeed. If that also 404s the
+                # image is skipped below rather than failing the whole import.
+        if not image_bytes:
+            # getDownloadURL includes a short-lived object download token, so
+            # try that URL as issued first. Some Firebase Storage deployments
+            # reject an otherwise valid token URL when an Authorization header
+            # from a different Cloud project is also present. If the download
+            # token is disabled, retry using the verified user's ID token in
+            # both header formats accepted by Firebase/GCS REST endpoints.
+            auth_attempts = [None]
+            if firebase_id_token:
+                auth_attempts.extend([
+                    {"Authorization": f"Firebase {firebase_id_token}"},
+                    {"Authorization": f"Bearer {firebase_id_token}"},
+                ])
+            last_download_error = None
+            for headers in auth_attempts:
+                try:
+                    with requests.get(
+                        url,
+                        stream=True,
+                        timeout=(5, 15),
+                        headers=headers,
+                    ) as response:
+                        response.raise_for_status()
+                        mime_type = str(response.headers.get("content-type") or "").split(";", 1)[0].lower()
+                        if mime_type not in _COACH_CHAT_IMAGE_MIME_TYPES:
+                            raise ValueError("The selected file is not a supported image.")
+                        chunks = []
+                        total = 0
+                        for chunk in response.iter_content(chunk_size=64 * 1024):
+                            if not chunk:
+                                continue
+                            total += len(chunk)
+                            if total > _PLAN_IMAGE_IMPORT_MAX_BYTES:
+                                raise ValueError("One selected image is too large. Please select it again.")
+                            chunks.append(chunk)
+                        image_bytes = b"".join(chunks)
+                    break
+                except ValueError:
+                    raise
+                except requests.RequestException as exc:
+                    last_download_error = exc
+                    status = getattr(getattr(exc, "response", None), "status_code", None)
+                    # 404 here means the object is genuinely absent at read time
+                    # (deleted early / wrong bucket / never uploaded), NOT a
+                    # permission problem — so log the bucket + object path (never
+                    # the token) to pinpoint which of those it is.
+                    logger.warning(
+                        "EVO temporary Storage HTTP read failed "
+                        "(status=%s, auth=%s, bucket=%s, object=%s)",
+                        status,
+                        "none" if headers is None else headers["Authorization"].split(" ", 1)[0],
+                        bucket_name or "n/a",
+                        object_path or "n/a",
+                    )
+            if not image_bytes:
+                # Every read path exhausted for this image (typically a 404 —
+                # the single-use temp object is gone). Skip it and keep going so
+                # the readable pages still produce a draft; the caller warns the
+                # user how many were dropped.
+                skipped += 1
+                continue
+        # The server owns the temp object's lifecycle: delete it the moment its
+        # bytes are in memory. The client no longer deletes these on its own,
+        # which used to race this read — a slow/dropped mobile request let the
+        # client's cleanup remove the object while this function was still
+        # running, surfacing as "No such object" 404s. Best-effort only; a
+        # leftover object is harmless and swept by the bucket lifecycle rule.
+        if bucket_name and object_path:
+            try:
+                from evo_firebase import get_evo_app
+
+                evo_app = get_evo_app()
+                if evo_app:
+                    storage.bucket(bucket_name, app=evo_app).blob(object_path).delete(timeout=10)
+            except Exception as exc:
+                logger.info(
+                    "EVO temporary Storage delete skipped (%s) for %s",
+                    type(exc).__name__,
+                    object_path,
+                )
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        downloaded.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:{mime_type};base64,{encoded}",
+                "detail": "high",
+            },
+        })
+    return downloaded, skipped
+
+
+def _rate_allow(state: dict, uid: str, cap: int, window_seconds: int = _COACH_CHAT_RATE_WINDOW_SEC) -> bool:
+    """Small in-memory burst guard; identity is always a verified EVO uid."""
+    now = time.time()
+    bucket = [t for t in state.get(uid, []) if now - t < window_seconds]
+    if len(bucket) >= cap:
+        state[uid] = bucket
+        return False
+    bucket.append(now)
+    state[uid] = bucket
+    return True
+
+
+def _safe_import_text(value: Any, limit: int) -> str:
+    return str(value or "").replace("\x00", "").strip()[:limit]
+
+
+def _sanitize_plan_image_import(raw: Any, language: str) -> Dict[str, Any]:
+    """Constrain model output to the small, reviewable itinerary contract used by mobile."""
+    data = raw if isinstance(raw, dict) else {}
+    is_thai = language in {"thai", "th", "ไทย"}
+    fallback_name = "แผนทริปที่นำเข้า" if is_thai else "Imported trip"
+    fallback_day = "วันที่" if is_thai else "Day"
+    raw_days = data.get("days") if isinstance(data.get("days"), list) else []
+    days = []
+    for index, raw_day in enumerate(raw_days[:31]):
+        if not isinstance(raw_day, dict):
+            continue
+        entries = []
+        raw_entries = raw_day.get("entries") if isinstance(raw_day.get("entries"), list) else []
+        for raw_entry in raw_entries[:20]:
+            if not isinstance(raw_entry, dict):
+                continue
+            text = _safe_import_text(raw_entry.get("text"), 180)
+            place = _safe_import_text(raw_entry.get("place"), 120)
+            note = _safe_import_text(raw_entry.get("note"), 240)
+            if not text and not place:
+                continue
+            # Photographed itineraries print times every way there is ("9.30",
+            # "9:30 AM", "09:30-11:00"). The mobile timeline only renders a
+            # strict HH:MM, so anything else read off the image would vanish
+            # from the day it was extracted for. `25:00` is rejected outright.
+            time_value = normalize_clock_time(_safe_import_text(raw_entry.get("time"), 16)) or ""
+            entries.append({
+                **({"time": time_value} if time_value else {}),
+                "text": text or place,
+                **({"place": place} if place else {}),
+                **({"note": note} if note else {}),
+            })
+        if not entries:
+            continue
+        day_number = len(days) + 1
+        title = _safe_import_text(raw_day.get("title"), 120) or f"{fallback_day} {day_number}"
+        summary = _safe_import_text(raw_day.get("summary"), 300) or title
+        date_label = _safe_import_text(raw_day.get("date_label"), 40)
+        notes = [
+            _safe_import_text(note, 180)
+            for note in (raw_day.get("notes") if isinstance(raw_day.get("notes"), list) else [])[:6]
+        ]
+        days.append({
+            "day_number": day_number,
+            "title": title,
+            "summary": summary,
+            **({"date_label": date_label} if date_label else {}),
+            "entries": entries,
+            **({"notes": [note for note in notes if note]} if any(notes) else {}),
+        })
+
+    start_date = _safe_import_text(data.get("trip_start_date"), 10)
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", start_date):
+        start_date = ""
+    uncertainties = [
+        _safe_import_text(item, 180)
+        for item in (data.get("uncertainties") if isinstance(data.get("uncertainties"), list) else [])[:8]
+    ]
+    try:
+        minutes_per_day = int(data.get("minutes_per_day") or 240)
+    except (TypeError, ValueError):
+        minutes_per_day = 240
+    return {
+        "plan_name": _safe_import_text(data.get("plan_name"), 100) or fallback_name,
+        "category": "travel",
+        "total_days": len(days),
+        "minutes_per_day": min(480, max(60, minutes_per_day)),
+        **({"trip_start_date": start_date} if start_date else {}),
+        "days": days,
+        "uncertainties": [item for item in uncertainties if item],
+    }
+
+
+def _redact_training_text(value: Any, limit: int) -> str:
+    """Remove common personal identifiers before an opted-in training sample is stored."""
+    text = _safe_import_text(value, limit)
+    text = re.sub(r'https?://\S+|www\.\S+', '[redacted-link]', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b', '[redacted-email]', text)
+    text = re.sub(r'(?<!\d)(?:\+?\d[\d\s().-]{7,}\d)(?!\d)', '[redacted-phone]', text)
+    text = re.sub(r'\b\d(?:[ -]?\d){11,}\b', '[redacted-number]', text)
+    return text
+
+
+def _redact_plan_import_for_training(plan_import: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep the reviewed itinerary structure while minimizing personal data."""
+    plan = _sanitize_plan_image_import(plan_import, 'english')
+    days = []
+    for day in plan['days']:
+        entries = []
+        for entry in day['entries']:
+            entries.append({
+                **({'time': entry['time']} if entry.get('time') else {}),
+                'text': _redact_training_text(entry.get('text'), 180),
+                **({'place': _redact_training_text(entry['place'], 120)} if entry.get('place') else {}),
+                **({'note': _redact_training_text(entry['note'], 240)} if entry.get('note') else {}),
+            })
+        days.append({
+            'day_number': day['day_number'],
+            'title': _redact_training_text(day.get('title'), 120),
+            'summary': _redact_training_text(day.get('summary'), 300),
+            **({'date_label': _redact_training_text(day['date_label'], 40)} if day.get('date_label') else {}),
+            'entries': entries,
+            **({'notes': [_redact_training_text(note, 180) for note in day['notes']]} if day.get('notes') else {}),
+        })
+    return {
+        'plan_name': _redact_training_text(plan.get('plan_name'), 100),
+        'category': 'travel',
+        'total_days': len(days),
+        'minutes_per_day': plan['minutes_per_day'],
+        **({'trip_start_date': plan['trip_start_date']} if plan.get('trip_start_date') else {}),
+        'days': days,
+        'uncertainties': [_redact_training_text(item, 180) for item in plan.get('uncertainties', [])],
+    }
+
+
+# Reading a dense multi-day itinerary sheet — mixed Thai/English, times in one
+# column, notes wrapped under rows — is hard OCR, and gpt-4o-mini was dropping a
+# row here and there and regrouping others (the same photos imported twice gave
+# a meal stop in one run and not the other, and moved a "walk to X" line between
+# being its own stop and being a note). Temperature is already 0; the variance is
+# the small model, not sampling. Imports are rate-limited to 8 per window, so the
+# stronger model costs little in absolute terms and buys the accuracy this
+# feature exists for.
+_PLAN_IMAGE_IMPORT_MODEL = 'gpt-4.1'
+
+_PLAN_IMAGE_IMPORT_PROMPT = """You extract a travel itinerary from user-supplied images for EVO.
+Return ONLY valid JSON with this shape:
+{
+  "plan_name": "string",
+  "category": "travel",
+  "trip_start_date": "YYYY-MM-DD or null",
+  "minutes_per_day": 240,
+  "days": [{
+    "day_number": 1,
+    "date_label": "source date text or null",
+    "title": "short day title",
+    "summary": "one sentence",
+    "entries": [{"time": "HH:MM or null", "text": "activity", "place": "place or null", "note": "source note or null"}],
+    "notes": ["other source notes"]
+  }],
+  "uncertainties": ["only details that are illegible, ambiguous, or missing a year"]
+}
+Read all images together. Preserve the source order, place names, transport legs, meals, and timing faithfully.
+Day coverage comes first: ONE image often holds SEVERAL days (headings like "DAY 1", "DAY 2 - SUN 26/07",
+weekday names, or date rows all start a new day). Scan every image to its bottom edge and emit one object in
+`days` for EVERY day heading you can see across all of them. Returning fewer days than the images show is the
+most damaging error you can make here — stopping after the first day loses the rest of the user's trip.
+Precision rules:
+- Treat repeated headers/footers as layout, not itinerary entries. Merge a day that continues onto the next image.
+- Produce one entry per source row or clearly distinct stop; never collapse several timed stops into a vague summary.
+- Normalize a time to 24-hour HH:MM only when the source is clear. Preserve ambiguous time text in note and add an uncertainty.
+- `text` states the concrete action or transport leg. `place` contains the exact, searchable venue/area proper name only.
+- Preserve FROM → TO transport, flight/train numbers, check-in/out, meals, reservation/ticket notes, and costs in `text` or `note`.
+- Keep day titles factual and destination-specific, not motivational.
+- Do not translate or respell proper nouns unless the image itself provides both forms.
+- Cross-check day count, chronological order, and entries against every image before replying.
+Never invent a year, booking, address, opening hour, cost, or missing activity. Use trip_start_date only when an explicit full year is visible. Keep original-language names and notes when useful."""
+
+
+@https_fn.on_request(memory=1024, max_instances=5, timeout_sec=60, cpu=1, secrets=_LLM_SECRETS)
+def evo_plan_image_import(req: https_fn.Request) -> https_fn.Response:
+    """One-pass, authenticated itinerary extraction for the mobile review step."""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+    if req.method != 'POST':
+        return create_response(success=False, message='Method not allowed', error='Only POST method is allowed', status_code=405)
+
+    try:
+        data = req.get_json(silent=True) or {}
+        uid, tier = _verify_coach_tier(req)
+        if not uid:
+            return create_response(success=False, message='Sign in required', error='A valid EVO session is required', status_code=401)
+        if not _rate_allow(_plan_image_import_rate_state, uid, _PLAN_IMAGE_IMPORT_RATE_MAX):
+            return create_response(success=False, message='Too many imports', error='Please wait a few minutes before importing more plans.', status_code=429)
+
+        image_url_parts = _sanitize_plan_image_import_urls(data.get('image_urls'), uid)
+        skipped_images = 0
+        if image_url_parts:
+            try:
+                auth_header = str(req.headers.get('Authorization') or '').strip()
+                firebase_id_token = (
+                    auth_header[7:].strip()
+                    if auth_header.lower().startswith('bearer ')
+                    else ''
+                )
+                image_parts, skipped_images = _download_plan_image_import_urls(
+                    image_url_parts,
+                    firebase_id_token=firebase_id_token,
+                )
+            except ValueError as exc:
+                return create_response(
+                    success=False,
+                    message='Invalid image',
+                    error=str(exc),
+                    status_code=413,
+                )
+        else:
+            # Backward compatibility for older mobile builds. New builds use
+            # temporary Storage URLs so large bytes never ride in this POST.
+            image_parts = _sanitize_coach_chat_images(data.get('images'))
+        if not image_parts:
+            # Every selected image was unreadable. If we skipped some, they were
+            # present-then-gone (expired/consumed), so tell the user to reselect
+            # rather than showing the generic "add valid images" hint.
+            if skipped_images:
+                return create_response(
+                    success=False,
+                    message='Images expired',
+                    error='Those images expired before EVO could read them. Please pick them again.',
+                    status_code=410,
+                )
+            return create_response(success=False, message='No valid images', error='Add one to four valid JPEG, PNG, or WebP images.', status_code=400)
+        language = str(data.get('language') or data.get('languageSelected') or 'english').strip().lower()
+        from openai import OpenAI
+        from openai_api_key import resolve_openai_api_key
+        api_key = resolve_openai_api_key()
+        if not api_key:
+            return create_response(success=False, message='Import unavailable', error='OpenAI API key is not configured', status_code=503)
+
+        client = OpenAI(api_key=api_key, timeout=45)
+        response = client.chat.completions.create(
+            model=_PLAN_IMAGE_IMPORT_MODEL,
+            temperature=0,
+            response_format={'type': 'json_object'},
+            messages=[
+                {'role': 'system', 'content': _PLAN_IMAGE_IMPORT_PROMPT},
+                {'role': 'user', 'content': [{'type': 'text', 'text': f'Extract this itinerary. Reply in {"Thai" if language in {"thai", "th", "ไทย"} else "English"}.'}] + image_parts},
+            ],
+        )
+        content = (response.choices[0].message.content if response.choices else '') or '{}'
+        parsed = json.loads(content)
+        plan_import = _sanitize_plan_image_import(parsed, language)
+        if not plan_import['days']:
+            return create_response(success=False, message='Nothing readable', error='EVO could not find itinerary entries in those images.', status_code=422)
+        return create_response(
+            data={'import': plan_import, 'skipped_images': skipped_images},
+            message='Itinerary extracted',
+        )
+    except json.JSONDecodeError:
+        return create_response(success=False, message='Import failed', error='EVO could not structure that itinerary. Please try clearer images.', status_code=502)
+    except Exception as e:
+        logger.error('evo_plan_image_import error: %s', e)
+        return create_response(success=False, message='Import failed', error='EVO could not import those images right now.', status_code=500)
+
+
+@https_fn.on_request(memory=512, max_instances=5, timeout_sec=30, cpu=1, secrets=[_EVO_FIREBASE_SA_SECRET])
+def evo_plan_import_training(req: https_fn.Request) -> https_fn.Response:
+    """Store a consented, reviewed, de-identified itinerary sample for future model work."""
+    if req.method == 'OPTIONS':
+        return handle_preflight_request()
+    if req.method != 'POST':
+        return create_response(success=False, message='Method not allowed', error='Only POST method is allowed', status_code=405)
+
+    try:
+        data = req.get_json(silent=True) or {}
+        uid, _tier = _verify_coach_tier(req)
+        if not uid:
+            return create_response(success=False, message='Sign in required', error='A valid EVO session is required', status_code=401)
+        if data.get('consent') is not True:
+            return create_response(success=False, message='Consent required', error='Explicit consent is required to share a training sample.', status_code=400)
+        if not _rate_allow(_plan_import_training_rate_state, uid, _PLAN_IMPORT_TRAINING_RATE_MAX):
+            return create_response(success=False, message='Too many requests', error='Please wait a few minutes before sharing another sample.', status_code=429)
+
+        language = str(data.get('language') or 'english').strip().lower()
+        plan_import = _sanitize_plan_image_import(data.get('plan_import'), language)
+        if not plan_import['days']:
+            return create_response(success=False, message='No itinerary', error='A reviewed itinerary with at least one entry is required.', status_code=400)
+        from evo_firebase import evo_firestore
+        firestore_db = evo_firestore()
+        if not firestore_db:
+            return create_response(success=False, message='Collection unavailable', error='EVO data collection is not configured.', status_code=503)
+
+        # Pseudonymous owner key enables future deletion without retaining the raw account id.
+        owner_hash = hashlib.sha256(f'evo-plan-import-v1:{uid}'.encode('utf-8')).hexdigest()
+        doc_ref = firestore_db.collection('model_training_plan_imports').document()
+        doc_ref.set({
+            'schemaVersion': 1,
+            'consentVersion': _safe_import_text(data.get('consent_version'), 20) or '2026-07',
+            'source': 'image_import',
+            'language': 'th' if language in {'thai', 'th', 'ไทย'} else 'en',
+            'ownerHash': owner_hash,
+            'createdAt': datetime.now(timezone.utc).isoformat(),
+            'planImport': _redact_plan_import_for_training(plan_import),
+        })
+        return create_response(data={'sample_id': doc_ref.id}, message='Reviewed itinerary sample collected')
+    except Exception as e:
+        logger.error('evo_plan_import_training error: %s', e)
+        return create_response(success=False, message='Collection failed', error='EVO could not collect that sample right now.', status_code=500)
+
+
 @https_fn.on_request(memory=1024, max_instances=3, timeout_sec=120, cpu=1, secrets=_LLM_SECRETS)
 def evo_coach_chat(req: https_fn.Request) -> https_fn.Response:
     """Text-chat coach with the SAME tool surface as the realtime voice assistant.
@@ -10135,6 +11196,22 @@ def evo_coach_chat(req: https_fn.Request) -> https_fn.Response:
             )
 
         data = req.get_json(silent=True) or {}
+        uid, tier = _verify_coach_tier(req)
+        if not uid:
+            return create_response(
+                success=False,
+                message='Sign in required',
+                error='A valid EVO session is required',
+                status_code=401,
+            )
+        coach_cap = _COACH_CHAT_RATE_PAID_MAX if tier in {'plus', 'premium'} else _COACH_CHAT_RATE_FREE_MAX
+        if not _rate_allow(_coach_chat_rate_state, uid, coach_cap):
+            return create_response(
+                success=False,
+                message='Too many messages',
+                error='Please wait a few minutes before sending more messages.',
+                status_code=429,
+            )
         language = str(data.get('language') or data.get('languageSelected') or 'english').strip().lower()
         is_thai = language in {'thai', 'th', 'ไทย'}
 
@@ -10146,6 +11223,16 @@ def evo_coach_chat(req: https_fn.Request) -> https_fn.Response:
                 error='messages must include at least one user message',
                 status_code=400
             )
+
+        image_parts = _sanitize_coach_chat_images(data.get('images'))
+        if image_parts:
+            # The model receives image bytes only in this request. The client persists
+            # thumbnail URIs for the conversation, never base64 image data.
+            for message in reversed(messages):
+                if message.get('role') == 'user':
+                    text_part = str(message.get('content') or '')
+                    message['content'] = [{"type": "text", "text": text_part}] + image_parts
+                    break
 
         # Prefer the client's local date/time (device truth); mirror evo_realtime_session.
         today_str = str(data.get('today') or data.get('todayYmd') or '').strip()[:10]
@@ -10161,7 +11248,29 @@ def evo_coach_chat(req: https_fn.Request) -> https_fn.Response:
                 today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
         now_time = str(data.get('now_time') or data.get('nowTime') or '').strip()[:5]
 
-        instructions = _realtime_instructions(is_thai, today_str, tz_label, now_time) + _COACH_CHAT_TEXT_MODE
+        # Same compact prompt + on-demand capability packs as realtime voice. The full
+        # instruction set with every tool schema was ~5x the tokens, re-sent on every
+        # round of the tool loop, and a 55-tool menu also makes tool choice worse.
+        from realtime_capabilities import (
+            coach_chat_capability_payload,
+            compact_realtime_instructions,
+            loaded_packs_from_history,
+        )
+
+        context_flags = data.get('context_flags') if isinstance(data.get('context_flags'), dict) else {}
+        loaded_packs = loaded_packs_from_history(messages)
+        # An image import is told to call generate_plan straight away, which lives in the
+        # planning pack — preload it so the model does not burn a round discovering that.
+        if image_parts and 'planning' not in loaded_packs:
+            loaded_packs.append('planning')
+        chat_tools, pack_instructions = coach_chat_capability_payload(
+            _realtime_voice_tool_specs(),
+            loaded_packs,
+            is_host=context_flags.get('is_host') is not False,
+        )
+        instructions = compact_realtime_instructions(is_thai, today_str, tz_label, now_time) + _COACH_CHAT_TEXT_MODE
+        if pack_instructions:
+            instructions = f"{instructions} {pack_instructions}"
 
         context_hint = str(data.get('context') or data.get('contextHint') or '').strip()
         if context_hint:
@@ -10174,6 +11283,8 @@ def evo_coach_chat(req: https_fn.Request) -> https_fn.Response:
         first_user_text = str((first_user or {}).get('content') or '')
         if first_user_text.startswith('[proactive-checkin]'):
             instructions = instructions + _PROACTIVE_CHECKIN_INSTRUCTION
+        if image_parts:
+            instructions = instructions + _COACH_CHAT_IMAGE_IMPORT_INSTRUCTION
 
         model = str(data.get('model') or '').strip()
         if model not in _COACH_CHAT_MODELS:
@@ -10189,7 +11300,7 @@ def evo_coach_chat(req: https_fn.Request) -> https_fn.Response:
             'max_tokens': 900,
         }
         if not final_round:
-            request_kwargs['tools'] = _coach_chat_tool_specs()
+            request_kwargs['tools'] = _coach_chat_tool_specs(chat_tools)
             request_kwargs['tool_choice'] = 'auto'
 
         completion = client.chat.completions.create(**request_kwargs)

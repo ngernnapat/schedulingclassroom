@@ -1165,6 +1165,8 @@ class PlannerUtils:
         morning_mode: Optional[str] = "todo_coach",
         week_tasks: Optional[List[Dict[str, Any]]] = None,
         today_date: Optional[str] = None,
+        coach_continuity: Optional[str] = None,
+        weather_context: Optional[str] = None,
     ) -> Optional[str]:
         """
         Generate a compact morning push message. ``morning_mode`` rotates personality:
@@ -1262,6 +1264,26 @@ class PlannerUtils:
                 id_block = _format_identity_context(identity_context)
                 if id_block.strip():
                     grounding_lines.append("Identity profile:\n" + id_block[:600])
+            # Continuity with yesterday (weigh-in, progress photo, completions)
+            # — makes the morning message feel like the SAME coach who saw
+            # last night's dinner, not a fresh bot each day.
+            if isinstance(coach_continuity, str) and coach_continuity.strip():
+                grounding_lines.append(
+                    "Yesterday's signals: " + coach_continuity.strip()[:400]
+                    + " — naturally reference ONE of these (the most meaningful) "
+                    "in your message, like the coach who was there yesterday. "
+                    "Never list them all."
+                )
+            # Local weather — lets the morning line feel grounded in their real
+            # day (a warm nudge to get outside, or an indoor/rain-aware tweak).
+            if isinstance(weather_context, str) and weather_context.strip():
+                grounding_lines.append(
+                    weather_context.strip()[:200]
+                    + " — weave the weather in briefly and naturally ONLY if it "
+                    "fits (e.g. nudge outdoor tasks when it's nice, suggest an "
+                    "indoor option or a better window when it's rainy/extreme). "
+                    "Skip it if it doesn't add anything; never just recite the forecast."
+                )
             if grounding_lines:
                 user_prompt = "\n".join(grounding_lines) + "\n\n" + user_prompt
 
@@ -2435,6 +2457,8 @@ def message_in_the_morning(
     morning_mode: Optional[str] = "todo_coach",
     week_tasks: Optional[List[Dict[str, Any]]] = None,
     today_date: Optional[str] = None,
+    coach_continuity: Optional[str] = None,
+    weather_context: Optional[str] = None,
 ) -> Optional[str]:
     """Backward compatibility function for message in the morning"""
     planner = get_default_planner()
@@ -2449,6 +2473,8 @@ def message_in_the_morning(
         morning_mode=morning_mode,
         week_tasks=week_tasks,
         today_date=today_date,
+        coach_continuity=coach_continuity,
+        weather_context=weather_context,
     )
 
 

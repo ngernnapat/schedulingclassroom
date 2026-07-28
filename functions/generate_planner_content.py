@@ -18,7 +18,11 @@ except ImportError:
     https_fn = None
     print("Note: Firebase modules not available - running in local mode")
 
-from pydantic import BaseModel, Field, ValidationError, conint, constr, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationError, conint, confloat, constr, field_validator, model_validator
+
+# Shared with main.py's itinerary image import so both producers of a plan task
+# agree on what a clock time is (see plan_time.py for why this matters).
+from plan_time import normalize_clock_time
 
 # ---- Initialize Firebase Admin (safe if called multiple times) ----
 if FIREBASE_AVAILABLE:
@@ -60,6 +64,66 @@ def get_openai_client():
 # defaults lookups. Do NOT reintroduce a strict Literal here — it made pydantic
 # reject any plan outside the original seven domains.
 KNOWN_PLAN_CATEGORIES = ("learning", "exercise", "travel", "finance", "health", "personal_development", "other")
+
+
+PLAN_INTENT_TYPES = (
+    "learning",
+    "itinerary",
+    "workout",
+    "financial",
+    "wellness",
+    "routine",
+    "project",
+    "event",
+    "preparation",
+    "other",
+)
+
+
+def infer_plan_intent(category: object, plan_name: object = "", detail_prompt: object = "") -> str:
+    """Resolve what the plan is *for*, independently from its display category.
+
+    Categories select visual/domain defaults; intent controls the actual daily
+    experience. In particular, a travel itinerary is an execution schedule,
+    not a course about planning travel.
+    """
+    cat = sanitize_plan_category(category)
+    blob = " ".join(str(value or "") for value in (category, plan_name, detail_prompt)).lower()
+
+    if cat == "travel" or re.search(r"\b(travel|trip|itinerary|vacation|holiday)\b|ทริป|เที่ยว|เดินทาง", blob):
+        explicit_preparation = re.search(
+            r"\b(prepare|preparation|packing|book flights?|visa application|research destinations?)\b"
+            r"|เตรียม(?:ตัว|ของ|ทริป)|จัดกระเป๋า|ขอวีซ่า|จองตั๋ว",
+            blob,
+        )
+        itinerary_signal = re.search(
+            r"\b(itinerary|day[- ]by[- ]day|sightseeing|visit|tour|vacation|holiday)\b"
+            r"|กำหนดการ|แพลนเที่ยว|สถานที่เที่ยว|เที่ยว",
+            blob,
+        )
+        return "preparation" if explicit_preparation and not itinerary_signal else "itinerary"
+    if cat == "learning" or re.search(
+        r"\b(learn|study|course|language|exam|certification|curriculum)\b|เรียน|ศึกษา|สอบ|ภาษา",
+        blob,
+    ):
+        return "learning"
+    if cat == "exercise" or re.search(r"\b(workout|fitness|training|run|strength|yoga)\b|ออกกำลัง|ฟิตเนส|วิ่ง", blob):
+        return "workout"
+    if cat == "finance" or re.search(r"\b(budget|saving|finance|debt|invest)\b|การเงิน|งบประมาณ|ออม|ลงทุน", blob):
+        return "financial"
+    if cat == "health" or re.search(r"\b(health|wellness|sleep|nutrition|recovery)\b|สุขภาพ|นอน|โภชนาการ", blob):
+        return "wellness"
+    if re.search(
+        r"\b(event|conference|wedding|party|festival|meeting|workshop|seminar|offsite)\b"
+        r"|งานแต่ง|อีเวนต์|งานประชุม|ประชุม|เวิร์กช็อป|สัมมนา",
+        blob,
+    ):
+        return "event"
+    if re.search(r"\b(build|create|launch|project|renovate|organize)\b|สร้าง|ทำโปรเจกต์|เปิดตัว|จัดระเบียบ", blob):
+        return "project"
+    if cat == "personal_development":
+        return "routine"
+    return "other"
 
 
 def sanitize_plan_category(value: object) -> str:
@@ -307,12 +371,21 @@ class Task(BaseModel):
     text: constr(strip_whitespace=True, min_length=1)
     done: bool = False
     duration_min: Optional[conint(ge=0, le=600)] = None   # optional per-task duration
+    estimatedCost: confloat(ge=0, le=1_000_000_000) = Field(
+        0,
+        description="Estimated cost of this activity in the plan currency; use 0 when free",
+    )
     time: Optional[str] = Field(None, description="HH:MM local start time — travel itineraries / scheduled days")
     note: Optional[str] = None
     link: Optional[constr(strip_whitespace=True, min_length=1)] = Field(None, description="Optional helpful link or resource for this task")
     # Post-generation enrichment (real API data) — never produced by the LLM itself.
     video: Optional[TaskVideo] = None
     place: Optional[TaskPlace] = None
+
+    @field_validator("time", mode="before")
+    @classmethod
+    def coerce_time(cls, value):
+        return normalize_clock_time(value)
 
 class DayPlan(BaseModel):
     id: constr(strip_whitespace=True, min_length=1) = Field(default_factory=lambda: uuid.uuid4().hex[:8])
@@ -371,8 +444,14 @@ class PlannerSummary(BaseModel):
 class PlannerContent(FreeFormCategoryMixin, BaseModel):
     planName: constr(strip_whitespace=True, min_length=1)
     category: str
+    intentType: Optional[str] = Field(
+        None,
+        description="Execution intent such as itinerary, learning, workout, project, or routine",
+    )
     totalDays: conint(ge=1, le=90) = 30
     minutesPerDay: Optional[conint(ge=10, le=480)] = None
+    currency: constr(strip_whitespace=True, min_length=3, max_length=3) = "THB"
+    totalBudget: confloat(ge=0, le=90_000_000_000) = 0
     coverImage: Optional[str] = None
     coverImageUrl: Optional[str] = None
     createdAt: TimeStamp
@@ -384,6 +463,20 @@ class PlannerContent(FreeFormCategoryMixin, BaseModel):
     tags: Optional[List[str]] = Field(None, description="Relevant tags for categorization and search")
     difficultyLevel: Optional[str] = Field(None, description="Overall difficulty level (beginner, intermediate, advanced)")
     estimatedCompletionRate: Optional[str] = Field(None, description="Expected completion rate with consistent effort")
+
+    @field_validator("currency", mode="before")
+    @classmethod
+    def normalize_currency(cls, value):
+        cleaned = re.sub(r"[^A-Za-z]", "", str(value or "THB")).upper()[:3]
+        return cleaned if len(cleaned) == 3 else "THB"
+
+    @model_validator(mode="after")
+    def calculate_total_budget(self) -> "PlannerContent":
+        self.totalBudget = round(
+            sum(float(task.estimatedCost or 0) for day in self.days for task in day.tasks),
+            2,
+        )
+        return self
 
 # -------- Request --------
 class GeneratePlannerRequest(FreeFormCategoryMixin, BaseModel):
@@ -441,6 +534,17 @@ class GeneratePlannerRequest(FreeFormCategoryMixin, BaseModel):
         default="en",
         description="Output language for the generated content"
     )
+
+    currency: constr(strip_whitespace=True, min_length=3, max_length=3) = Field(
+        default="THB",
+        description="ISO 4217 currency used for all activity costs in this plan",
+    )
+
+    @field_validator("currency", mode="before")
+    @classmethod
+    def normalize_request_currency(cls, value):
+        cleaned = re.sub(r"[^A-Za-z]", "", str(value or "THB")).upper()[:3]
+        return cleaned if len(cleaned) == 3 else "THB"
     
     # Additional optional fields for better customization
     startDate: Optional[str] = Field(
@@ -942,6 +1046,7 @@ class ChatWrapper:
         )
         use_model = self.config.fast_model if req.fastMode else self.config.extraction_model
         lang_note = "Write in Thai." if req.language == "th" else "Write in English."
+        intent_type = infer_plan_intent(req.category, req.planName, req.detailPrompt)
         context_bits = []
         if extracted_context and extracted_context.goals.primary_goal:
             context_bits.append(f"Primary goal: {extracted_context.goals.primary_goal}")
@@ -996,13 +1101,20 @@ class ChatWrapper:
         user_msg = (
             f"{lang_note}\n"
             f"Category: {req.category}\n"
+            f"Execution intent: {intent_type}\n"
             f"Plan: {req.planName}\n"
             f"Total days: {req.totalDays}\n"
             f"Intensity: {req.intensity or 'moderate'}\n"
             f"Minutes per day: {req.minutesPerDay or 'flexible'}\n"
             + ("\n".join(context_bits) if context_bits else "")
-            + "\n\nCreate a logical outline with phases covering all days 1.."
-            f"{req.totalDays} without gaps. Include appropriate rest/light days."
+            + "\n\nCreate a logical outline covering all days 1.."
+            f"{req.totalDays} without gaps. Match the execution intent exactly. "
+            + (
+                "For an itinerary, each phase/day represents the trip itself; do not turn it "
+                "into lessons, quizzes, travel research, or a pre-trip preparation course."
+                if intent_type == "itinerary"
+                else "Include rest/light days only when the domain genuinely benefits from them."
+            )
         )
 
         try:
@@ -1013,9 +1125,11 @@ class ChatWrapper:
                     {
                         "role": "system",
                         "content": (
-                            "You are an expert curriculum and habit-plan designer. "
+                            "You are an expert intent-aware planner. A plan may be an itinerary, "
+                            "workout schedule, project, event, routine, financial action plan, or curriculum. "
                             "Output only JSON matching the schema. Phases must cover every day "
-                            "from 1 to totalDays with no overlaps or gaps."
+                            "from 1 to totalDays with no overlaps or gaps. Never force lessons, "
+                            "practice exercises, reflection, or quizzes onto a non-learning plan."
                         ),
                     },
                     {"role": "user", "content": user_msg},
@@ -1279,15 +1393,21 @@ class ChatWrapper:
         
         elif req.category == "travel":
             analysis["progression_type"] = "thematic"
-            if req.totalDays >= 21:
+            intent_type = infer_plan_intent(req.category, req.planName, req.detailPrompt)
+            if intent_type == "preparation":
                 analysis["phases"] = [
                     {"name": "Planning", "focus": "Research, booking, and preparation"},
                     {"name": "Preparation", "focus": "Final preparations and logistics"},
-                    {"name": "Execution", "focus": "Travel activities and experiences"}
                 ]
             else:
                 analysis["phases"] = [
-                    {"name": "Travel", "focus": "Planning and preparation activities"}
+                    {
+                        "name": "Itinerary",
+                        "focus": (
+                            "Execute the trip day by day with geographically coherent stops, "
+                            "meals, transport, reservations, and recovery time"
+                        ),
+                    }
                 ]
         
         elif req.category == "finance":
@@ -1459,23 +1579,17 @@ class ChatWrapper:
                 ]
         
         elif req.category == "travel":
-            if progression_level == "beginner":
+            if infer_plan_intent(req.category, req.planName, req.detailPrompt) == "preparation":
                 goals = [
                     "Research destinations and create itinerary",
                     "Plan logistics and make bookings",
                     "Prepare travel documents and essentials"
                 ]
-            elif progression_level == "intermediate":
+            else:
                 goals = [
-                    "Finalize travel arrangements",
-                    "Prepare for cultural experiences",
-                    "Plan activities and experiences"
-                ]
-            else:  # advanced
-                goals = [
-                    "Execute travel plans and activities",
-                    "Adapt to local conditions and culture",
-                    "Document and reflect on experiences"
+                    "Follow a realistic chronological itinerary",
+                    "Minimize backtracking with geographically grouped stops",
+                    "Include named places, transport, meals, reservations, costs, and useful buffers",
                 ]
         
         elif req.category == "finance":
@@ -1582,8 +1696,18 @@ class ChatWrapper:
             instructions.append("Include proper warm-up and cool-down for each day.")
             instructions.append("Ensure progressive overload while maintaining safety.")
         elif req.category == "travel":
-            instructions.append("Consider practical logistics and realistic timelines.")
-            instructions.append("Include cultural awareness and local customs.")
+            if infer_plan_intent(req.category, req.planName, req.detailPrompt) == "itinerary":
+                instructions.append(
+                    "These are trip days, not lessons about travel: provide a chronological itinerary "
+                    "with specific named places, HH:MM start times, realistic durations, transport between "
+                    "areas, meal/rest windows, reservation or ticket notes, and approximate costs when useful."
+                )
+                instructions.append(
+                    "Never add quizzes, study exercises, generic destination research, packing tasks, "
+                    "journaling homework, or skill-practice language unless the user explicitly asks."
+                )
+            else:
+                instructions.append("Consider practical logistics, bookings, documents, and realistic deadlines.")
         elif req.category == "finance":
             instructions.append("Include practical, actionable financial tasks.")
             instructions.append("Ensure tasks are relevant to the user's financial situation.")
@@ -1621,8 +1745,10 @@ class ChatWrapper:
         category: str,
         extracted_context: Optional[ExtractedUserContext] = None,
         refinement_mode: bool = False,
+        intent_type: Optional[str] = None,
     ) -> str:
         """Build a personalized system prompt based on category and extracted context"""
+        intent_type = intent_type or infer_plan_intent(category)
         
         if refinement_mode:
             base_prompt = (
@@ -1634,8 +1760,9 @@ class ChatWrapper:
             )
         else:
             base_prompt = (
-                "You are an expert planner-content generator for a lifestyle planner app. "
+                "You are an expert intent-aware planner-content generator for a lifestyle planner app. "
                 "Generate structured daily plans with clear titles, concise summaries, and actionable tasks. "
+                f"The resolved execution intent is '{intent_type}'. Match that experience exactly. "
             )
         
         # Category-specific expertise
@@ -1662,14 +1789,17 @@ class ChatWrapper:
             "travel": (
                 "You are an experienced travel planner who understands logistics and local experiences. "
                 "Design travel itineraries that:\n"
+                "- Treat every generated day as a day of the actual trip unless the user explicitly asks for pre-trip preparation\n"
                 "- Fill each day with a realistic schedule using most of the user's daily time budget "
                 "(typically several hours: sightseeing blocks, meals, transit, and short rest breaks)\n"
                 "- Group activities by geographic proximity to minimize backtracking\n"
                 "- Balance busy exploration days with lighter recovery days\n"
-                "- Include practical logistics (transport, timing, reservations, opening hours)\n"
-                "- Suggest local experiences and hidden gems\n"
-                "- Account for weather, seasons, and local events\n"
+                "- Name exact venues/areas so Google Places enrichment can attach maps, addresses, coordinates, and ratings\n"
+                "- Include practical logistics in task notes: transport mode and duration, reservation/ticket needs, "
+                "approximate cost, accessibility, and a fallback when it materially helps\n"
+                "- Use realistic chronological HH:MM task times; include arrival/check-in, meals, and transfers when present\n"
                 "- Include buffer time for unexpected discoveries\n"
+                "- Never add quizzes, study drills, generic research homework, packing, or reflection exercises unless explicitly requested\n"
             ),
             "finance": (
                 "You are a financial literacy expert who understands budgeting, saving, and investing. "
@@ -1939,11 +2069,20 @@ GENERATION RULES:
 3) Titles should be short, motivating, and reflect the day's focus
 4) Never invent unsafe or extreme advice; prefer safe defaults
 5) CRITICAL: Output MUST be valid JSON matching the exact schema provided
-6) Include ALL required fields: planName, category, totalDays, createdAt, days, summary, tags, difficultyLevel, estimatedCompletionRate
+6) Include ALL required fields: planName, category, totalDays, currency, totalBudget, createdAt, days, summary, tags, difficultyLevel, estimatedCompletionRate
 7) ABSOLUTE REQUIREMENT: The 'days' array MUST contain EXACTLY the number of days specified in totalDays
 8) TIME ALLOCATION: If minutesPerDay is specified, allocate time based on task complexity (±20% flexibility)
 9) DAY NUMBERING: dayNumber must start from 1 and increment sequentially
 10) DETAILED TASKS: Each task MUST include comprehensive, actionable instructions
+11) INTENT FIRST: Do not force every plan into learning, practice, habit-building, reflection, or quiz form.
+    Use itinerary stops for trips, sessions for workouts, deliverables for projects, logistics for events,
+    transactions/checks for finance, and lessons/exercises only for true learning plans.
+12) QUIZZES: Planner content never contains quiz-like questions unless the resolved intent is learning and
+    the user would genuinely benefit from recall. Travel, exercise, event, project, finance, and routine plans
+    must not contain quizzes.
+13) UNIVERSAL BUDGET: Every task in every intent carries `estimatedCost` in the single plan currency.
+    Use 0 for free activities. This includes meetings, events, projects, workouts, learning, errands, and travel.
+    For event/meeting plans, include relevant venue, AV, catering, material, transport, and service costs.
 
 PLAN SUMMARY REQUIREMENTS (REQUIRED):
 You MUST include a comprehensive 'summary' object with these fields:
@@ -1974,8 +2113,10 @@ TASK QUALITY REQUIREMENTS:
 TASK EXAMPLES:
 ✅ GOOD: 'Practice Python variables: Create 5 different variable types (string, integer, float, boolean, list). Write a simple program that uses each type and prints the results. Focus on proper naming conventions and data type understanding.'
 ✅ GOOD: 'Morning cardio workout: Do 20 minutes of moderate-intensity exercise (brisk walking, jogging, or cycling). Start with 5-minute warm-up, maintain steady pace for 15 minutes, finish with 5-minute cool-down.'
+✅ GOOD TRAVEL: '09:00 — Wat Mahathat: explore the central ruins for 75 minutes; arrive by tuk-tuk from the hotel (15 minutes). Note ticket requirements and keep the official place name for Maps.'
 ❌ BAD: 'Learn Python' (too vague)
 ❌ BAD: 'Do some exercise' (not specific enough)
+❌ BAD TRAVEL: 'Research the destination and take a quiz about local culture' (this is not an itinerary)
 """
         
         return base_prompt + category_expertise.get(category, category_expertise["other"]) + personalization_section + rules
@@ -2217,8 +2358,10 @@ TASK EXAMPLES:
         final_content = PlannerContent(
             planName=req.planName,
             category=req.category,
+            intentType=infer_plan_intent(req.category, req.planName, req.detailPrompt),
             totalDays=req.totalDays,
             minutesPerDay=req.minutesPerDay,
+            currency=req.currency,
             coverImage=None,
             coverImageUrl=None,
             createdAt={"seconds": now_s, "nanoseconds": 0},
@@ -2332,6 +2475,7 @@ TASK EXAMPLES:
                     {
                         "text": (t.text or "")[:task_limit],
                         "duration_min": t.duration_min,
+                        "estimatedCost": t.estimatedCost,
                     }
                     for t in (day.tasks or [])[:6]
                 ],
@@ -2340,8 +2484,11 @@ TASK EXAMPLES:
         return {
             "planName": content.planName,
             "category": content.category,
+            "intentType": content.intentType,
             "totalDays": content.totalDays,
             "minutesPerDay": content.minutesPerDay,
+            "currency": content.currency,
+            "totalBudget": content.totalBudget,
             "difficultyLevel": content.difficultyLevel,
             "summary": {
                 "overview": summary.overview if summary else None,
@@ -2417,6 +2564,7 @@ TASK EXAMPLES:
             detailPrompt=refine_detail[:1000],
             refinementContext=draft_json,
             minutesPerDay=req.minutesPerDay or existing.minutesPerDay,
+            currency=existing.currency,
             intensity=req.intensity,
             language=req.language,
             fastMode=req.fastMode,
@@ -2447,8 +2595,14 @@ TASK EXAMPLES:
             result = PlannerContent(
                 planName=existing.planName,
                 category=existing.category,
+                intentType=existing.intentType or infer_plan_intent(
+                    existing.category,
+                    existing.planName,
+                    req.refinementPrompt,
+                ),
                 totalDays=existing.totalDays,
                 minutesPerDay=req.minutesPerDay or existing.minutesPerDay,
+                currency=existing.currency,
                 coverImage=existing.coverImage,
                 coverImageUrl=existing.coverImageUrl,
                 createdAt=created_at,
@@ -2469,6 +2623,8 @@ TASK EXAMPLES:
             # (mirrors the partial branch, which carries it via PlannerContent()).
             result.coverImage = existing.coverImage
             result.coverImageUrl = existing.coverImageUrl
+            result.currency = existing.currency
+            result = PlannerContent.model_validate(result.model_dump())
 
         # Enrich only tasks the refinement touched (existing video/place survive
         # PlannerContent.model_validate above because the fields live on Task).
@@ -2590,6 +2746,7 @@ TASK EXAMPLES:
         payload = {
             "planName": req.planName,
             "category": req.category,
+            "intentType": infer_plan_intent(req.category, req.planName, req.detailPrompt),
             "totalDays": req.totalDays,
             "minutesPerDay": req.minutesPerDay,
             "intensity": req.intensity,
@@ -2608,9 +2765,25 @@ TASK EXAMPLES:
                 "additionalProperties": False,
                 "properties": {
                     "planName": {"type": "string"},
-                    "category": {"type": "string", "enum": ["learning", "exercise", "travel", "finance", "health", "personal_development", "other"]},
+                    "category": {"type": "string"},
+                    "intentType": {
+                        "type": ["string", "null"],
+                        "enum": [*PLAN_INTENT_TYPES, None],
+                        "description": "Resolved execution intent; controls how the plan should behave in the app",
+                    },
                     "totalDays": {"type": "integer", "minimum": 1, "maximum": 90},
                     "minutesPerDay": {"type": ["integer", "null"], "minimum": 10, "maximum": 480},
+                    "currency": {
+                        "type": "string",
+                        "minLength": 3,
+                        "maxLength": 3,
+                        "description": "One ISO 4217 currency code for all activity estimates",
+                    },
+                    "totalBudget": {
+                        "type": "number",
+                        "minimum": 0,
+                        "description": "Sum of activity estimatedCost values; server recalculates this value",
+                    },
                     "coverImage": {"type": ["string", "null"]},
                     "coverImageUrl": {"type": ["string", "null"]},
                     "createdAt": {
@@ -2665,11 +2838,17 @@ TASK EXAMPLES:
                                             "text": {"type": "string"},
                                             "done": {"type": "boolean"},
                                             "duration_min": {"type": ["integer", "null"], "minimum": 0, "maximum": 600},
+                                            "estimatedCost": {
+                                                "type": "number",
+                                                "minimum": 0,
+                                                "maximum": 1000000000,
+                                                "description": "Realistic activity estimate in plan currency; 0 if free",
+                                            },
                                             "time": {"type": ["string", "null"], "description": "HH:MM start time — REQUIRED for travel itinerary days, chronological"},
                                             "note": {"type": ["string", "null"]},
                                             "link": {"type": "string"},
                                         },
-                                        "required": ["id", "text", "done", "link"]
+                                        "required": ["id", "text", "done", "estimatedCost", "link"]
                                     }
                                 },
                                 "tips": {"type": ["string", "array", "null"], "items": {"type": "string"}},
@@ -2692,7 +2871,7 @@ TASK EXAMPLES:
                         }
                     }
                 },
-                "required": ["planName", "category", "totalDays", "createdAt", "days", "summary", "tags", "difficultyLevel", "estimatedCompletionRate"]
+                "required": ["planName", "category", "totalDays", "currency", "totalBudget", "createdAt", "days", "summary", "tags", "difficultyLevel", "estimatedCompletionRate"]
             }
         }
 
@@ -2755,6 +2934,7 @@ TASK EXAMPLES:
         user_msg_parts = [
             lang_note,
             f"Category: {req.category}",
+            f"Execution intent: {infer_plan_intent(req.category, req.planName, req.detailPrompt)}",
             f"Plan name: {req.planName}",
             f"Total days: {req.totalDays}",
         ]
@@ -2872,7 +3052,15 @@ TASK EXAMPLES:
         # Add category hints
         user_msg_parts.extend([
             "",
-            category_hints[req.category],
+            category_hints.get(req.category, category_hints["other"]),
+            "",
+            "BUDGETS APPLY TO EVERY PLAN TYPE — not only travel. For every task in a trip, "
+            "event, meeting, conference, workout, learning plan, project, routine, errand, or "
+            "other custom plan, provide a realistic numeric `estimatedCost` in the single plan "
+            f"currency `{req.currency}`. Use 0 when the activity is free. Include venue, catering, "
+            "tickets, transport, materials, subscriptions, equipment, service, and preparation "
+            "costs when relevant; do not invent a charge for genuinely free personal effort. "
+            "Return `currency` and `totalBudget`; the server will recalculate the total from tasks.",
             "",
             "Output a JSON object that strictly matches the provided schema. "
             "Use short, punchy titles; concise summaries; and 3–6 actionable tasks per day. "
@@ -2894,7 +3082,10 @@ TASK EXAMPLES:
 
         # Build personalized system prompt using extracted context
         system_prompt = self._build_system_prompt(
-            req.category, extracted_context, refinement_mode=is_refinement
+            req.category,
+            extracted_context,
+            refinement_mode=is_refinement,
+            intent_type=infer_plan_intent(req.category, req.planName, req.detailPrompt),
         )
         
         # Response format with JSON schema enforcement
@@ -3033,6 +3224,14 @@ TASK EXAMPLES:
                     
                     # Set link field to None since we're not using external links
                     t["link"] = None
+
+                    # Budget is universal across plan intents. Keep bad model
+                    # values from breaking totals; free activities are 0.
+                    try:
+                        estimated_cost = float(t.get("estimatedCost", 0) or 0)
+                        t["estimatedCost"] = round(max(0, estimated_cost), 2)
+                    except (TypeError, ValueError):
+                        t["estimatedCost"] = 0
                     
                     # Validate task text quality - ensure it's detailed and actionable
                     task_text = t.get("text", "")
@@ -3104,6 +3303,20 @@ TASK EXAMPLES:
         data.setdefault("tags", None)
         data.setdefault("difficultyLevel", None)
         data.setdefault("estimatedCompletionRate", None)
+        data["currency"] = req.currency
+        data["totalBudget"] = round(
+            sum(
+                float(task.get("estimatedCost", 0) or 0)
+                for day in data.get("days", [])
+                for task in day.get("tasks", [])
+            ),
+            2,
+        )
+        # Category/intent come from validated request context, not model
+        # improvisation. Persisting this lets dateFullScreen choose itinerary,
+        # workout, project, or learning affordances deterministically.
+        data["category"] = req.category
+        data["intentType"] = infer_plan_intent(req.category, req.planName, req.detailPrompt)
         
         print(f"DEBUG: Final data keys before validation: {list(data.keys())}")
 
@@ -3122,12 +3335,25 @@ TASK EXAMPLES:
                 # Ensure all required fields are present
                 data.setdefault("planName", req.planName)
                 data.setdefault("category", req.category)
+                data.setdefault(
+                    "intentType",
+                    infer_plan_intent(req.category, req.planName, req.detailPrompt),
+                )
                 data.setdefault("totalDays", req.totalDays)
                 data.setdefault("createdAt", {"seconds": int(time.time()), "nanoseconds": 0})
                 data.setdefault("summary", None)
                 data.setdefault("tags", None)
                 data.setdefault("difficultyLevel", None)
                 data.setdefault("estimatedCompletionRate", None)
+                data.setdefault("currency", req.currency)
+                data["totalBudget"] = round(
+                    sum(
+                        float(task.get("estimatedCost", 0) or 0)
+                        for day in data.get("days", [])
+                        for task in day.get("tasks", [])
+                    ),
+                    2,
+                )
                 
                 # If days is still missing or invalid, fail with proper error
                 if "days" not in data or not isinstance(data.get("days"), list) or len(data["days"]) == 0:
