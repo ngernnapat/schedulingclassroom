@@ -10507,6 +10507,15 @@ _PLAN_IMAGE_IMPORT_BUCKETS = {
     "evoforluanching.firebasestorage.app",
 }
 _PLAN_IMAGE_IMPORT_MAX_BYTES = 2_500_000
+# Pasted text alternative to photos: a 7-day itinerary post runs ~6k chars, so
+# 20k leaves room for the longest realistic paste while bounding prompt cost.
+_PLAN_TEXT_IMPORT_MAX_CHARS = 20_000
+_PLAN_TEXT_IMPORT_MIN_CHARS = 40
+# PDF plans (creator itineraries, Canva exports). OpenAI accepts PDFs as file
+# parts up to ~32MB/100 pages per request; 8MB keeps download + base64 fast
+# inside this function's timeout while covering real itinerary files.
+_PLAN_PDF_IMPORT_MAX_BYTES = 8_000_000
+_PLAN_PDF_IMPORT_MAX_FILES = 2
 _coach_chat_rate_state = {}
 _plan_image_import_rate_state = {}
 _plan_import_training_rate_state = {}
@@ -10683,24 +10692,37 @@ def _largest_resized_variant_blob(gcs_bucket, object_path: str):
     return best
 
 
-def _download_plan_image_import_urls(url_parts: list, firebase_id_token: str = "") -> tuple:
-    """Download allowlisted temporary images and pass bounded bytes to OpenAI.
+def _download_plan_image_import_urls(url_parts: list, firebase_id_token: str = "", kind: str = "image") -> tuple:
+    """Download allowlisted temporary import inputs and pass bounded bytes to OpenAI.
 
     Fetching here gives deterministic size/type validation and avoids relying
     on OpenAI to follow Firebase Storage token URLs.
 
-    The bucket-wide storage-resize-images extension deletes each uploaded
-    original and leaves `_<W>x<H>` variants, so the original is usually gone by
-    read time; the Admin path falls back to the largest variant (see
-    `_largest_resized_variant_blob`).
+    ``kind`` is ``"image"`` or ``"pdf"``: same auth/lifecycle path, different
+    mime/size limits and OpenAI part shape (``image_url`` vs ``file``). The
+    bucket-wide storage-resize-images extension deletes each uploaded image
+    original and leaves `_<W>x<H>` variants, so an image original is usually
+    gone by read time; the Admin path falls back to the largest variant (see
+    `_largest_resized_variant_blob`). PDFs are ignored by the extension, so
+    their originals survive and the fallback naturally never fires.
 
     Returns ``(downloaded, skipped)``. A single-use temp object that is already
     gone at read time (no readable original AND no resized variant) surfaces as a
     404 and is SKIPPED, not fatal:
-    extraction is best-effort over 1-4 images, so one missing page must not kill
+    extraction is best-effort over several files, so one missing page must not kill
     the whole import. Real input errors (too large / unsupported type) still
     raise ValueError so the caller can tell the user to reselect that file.
     """
+    if kind == "pdf":
+        allowed_mime_types = {"application/pdf"}
+        max_bytes = _PLAN_PDF_IMPORT_MAX_BYTES
+        too_large_error = "One selected PDF is too large. Please pick a file under 8 MB."
+        unsupported_error = "The selected file is not a PDF."
+    else:
+        allowed_mime_types = _COACH_CHAT_IMAGE_MIME_TYPES
+        max_bytes = _PLAN_IMAGE_IMPORT_MAX_BYTES
+        too_large_error = "One selected image is too large. Please select it again."
+        unsupported_error = "The selected file is not a supported image."
     downloaded = []
     skipped = 0
     for part in url_parts:
@@ -10732,14 +10754,14 @@ def _download_plan_image_import_urls(url_parts: list, firebase_id_token: str = "
                         "EVO plan import: original gone, using resized variant %s",
                         blob.name,
                     )
-                if int(blob.size or 0) > _PLAN_IMAGE_IMPORT_MAX_BYTES:
-                    raise ValueError("One selected image is too large. Please select it again.")
+                if int(blob.size or 0) > max_bytes:
+                    raise ValueError(too_large_error)
                 mime_type = str(blob.content_type or "").split(";", 1)[0].lower()
-                if mime_type not in _COACH_CHAT_IMAGE_MIME_TYPES:
-                    raise ValueError("The selected file is not a supported image.")
+                if mime_type not in allowed_mime_types:
+                    raise ValueError(unsupported_error)
                 image_bytes = blob.download_as_bytes(timeout=15)
-                if len(image_bytes) > _PLAN_IMAGE_IMPORT_MAX_BYTES:
-                    raise ValueError("One selected image is too large. Please select it again.")
+                if len(image_bytes) > max_bytes:
+                    raise ValueError(too_large_error)
             except ValueError:
                 raise
             except Exception as exc:
@@ -10790,16 +10812,16 @@ def _download_plan_image_import_urls(url_parts: list, firebase_id_token: str = "
                     ) as response:
                         response.raise_for_status()
                         mime_type = str(response.headers.get("content-type") or "").split(";", 1)[0].lower()
-                        if mime_type not in _COACH_CHAT_IMAGE_MIME_TYPES:
-                            raise ValueError("The selected file is not a supported image.")
+                        if mime_type not in allowed_mime_types:
+                            raise ValueError(unsupported_error)
                         chunks = []
                         total = 0
                         for chunk in response.iter_content(chunk_size=64 * 1024):
                             if not chunk:
                                 continue
                             total += len(chunk)
-                            if total > _PLAN_IMAGE_IMPORT_MAX_BYTES:
-                                raise ValueError("One selected image is too large. Please select it again.")
+                            if total > max_bytes:
+                                raise ValueError(too_large_error)
                             chunks.append(chunk)
                         image_bytes = b"".join(chunks)
                     break
@@ -10847,13 +10869,22 @@ def _download_plan_image_import_urls(url_parts: list, firebase_id_token: str = "
                     object_path,
                 )
         encoded = base64.b64encode(image_bytes).decode("ascii")
-        downloaded.append({
-            "type": "image_url",
-            "image_url": {
-                "url": f"data:{mime_type};base64,{encoded}",
-                "detail": "high",
-            },
-        })
+        if kind == "pdf":
+            downloaded.append({
+                "type": "file",
+                "file": {
+                    "filename": f"imported-plan-{len(downloaded) + 1}.pdf",
+                    "file_data": f"data:application/pdf;base64,{encoded}",
+                },
+            })
+        else:
+            downloaded.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime_type};base64,{encoded}",
+                    "detail": "high",
+                },
+            })
     return downloaded, skipped
 
 
@@ -10899,11 +10930,20 @@ def _sanitize_plan_image_import(raw: Any, language: str) -> Dict[str, Any]:
             # strict HH:MM, so anything else read off the image would vanish
             # from the day it was extracted for. `25:00` is rejected outright.
             time_value = normalize_clock_time(_safe_import_text(raw_entry.get("time"), 16)) or ""
+            # Per-entry price in the plan's main currency; feeds the mobile
+            # budget totals and the day-timeline cost column.
+            try:
+                cost_value = round(float(raw_entry.get("cost")), 2)
+            except (TypeError, ValueError):
+                cost_value = 0
+            if not (0 < cost_value <= 9_999_999):
+                cost_value = 0
             entries.append({
                 **({"time": time_value} if time_value else {}),
                 "text": text or place,
                 **({"place": place} if place else {}),
                 **({"note": note} if note else {}),
+                **({"cost": cost_value} if cost_value else {}),
             })
         if not entries:
             continue
@@ -10927,6 +10967,9 @@ def _sanitize_plan_image_import(raw: Any, language: str) -> Dict[str, Any]:
     start_date = _safe_import_text(data.get("trip_start_date"), 10)
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", start_date):
         start_date = ""
+    currency = _safe_import_text(data.get("currency"), 3).upper()
+    if not re.fullmatch(r"[A-Z]{3}", currency):
+        currency = ""
     uncertainties = [
         _safe_import_text(item, 180)
         for item in (data.get("uncertainties") if isinstance(data.get("uncertainties"), list) else [])[:8]
@@ -10941,6 +10984,7 @@ def _sanitize_plan_image_import(raw: Any, language: str) -> Dict[str, Any]:
         "total_days": len(days),
         "minutes_per_day": min(480, max(60, minutes_per_day)),
         **({"trip_start_date": start_date} if start_date else {}),
+        **({"currency": currency} if currency else {}),
         "days": days,
         "uncertainties": [item for item in uncertainties if item],
     }
@@ -10968,6 +11012,7 @@ def _redact_plan_import_for_training(plan_import: Dict[str, Any]) -> Dict[str, A
                 'text': _redact_training_text(entry.get('text'), 180),
                 **({'place': _redact_training_text(entry['place'], 120)} if entry.get('place') else {}),
                 **({'note': _redact_training_text(entry['note'], 240)} if entry.get('note') else {}),
+                **({'cost': entry['cost']} if entry.get('cost') else {}),
             })
         days.append({
             'day_number': day['day_number'],
@@ -10983,6 +11028,7 @@ def _redact_plan_import_for_training(plan_import: Dict[str, Any]) -> Dict[str, A
         'total_days': len(days),
         'minutes_per_day': plan['minutes_per_day'],
         **({'trip_start_date': plan['trip_start_date']} if plan.get('trip_start_date') else {}),
+        **({'currency': plan['currency']} if plan.get('currency') else {}),
         'days': days,
         'uncertainties': [_redact_training_text(item, 180) for item in plan.get('uncertainties', [])],
     }
@@ -11004,13 +11050,14 @@ Return ONLY valid JSON with this shape:
   "plan_name": "string",
   "category": "travel",
   "trip_start_date": "YYYY-MM-DD or null",
+  "currency": "ISO 4217 code of the plan's main currency (THB, CNY, JPY, USD...) or null",
   "minutes_per_day": 240,
   "days": [{
     "day_number": 1,
     "date_label": "source date text or null",
     "title": "short day title",
     "summary": "one sentence",
-    "entries": [{"time": "HH:MM or null", "text": "activity", "place": "place or null", "note": "source note or null"}],
+    "entries": [{"time": "HH:MM or null", "text": "activity", "place": "place or null", "note": "source note or null", "cost": number or null}],
     "notes": ["other source notes"]
   }],
   "uncertainties": ["only details that are illegible, ambiguous, or missing a year"]
@@ -11026,13 +11073,63 @@ Precision rules:
 - Normalize a time to 24-hour HH:MM only when the source is clear. Preserve ambiguous time text in note and add an uncertainty.
 - `text` states the concrete action or transport leg. `place` contains the exact, searchable venue/area proper name only.
 - Preserve FROM → TO transport, flight/train numbers, check-in/out, meals, reservation/ticket notes, and costs in `text` or `note`.
+- `cost` is the numeric price of THAT entry (ticket, fare, meal, room) ONLY when the source states it AND it is in the
+  plan's main `currency`. An amount in another currency, a range, or a shared total stays in `note` with cost null.
+  Set `currency` once, to the currency most prices use; null when no prices appear.
 - Keep day titles factual and destination-specific, not motivational.
 - Do not translate or respell proper nouns unless the image itself provides both forms.
 - Cross-check day count, chronological order, and entries against every image before replying.
 Never invent a year, booking, address, opening hour, cost, or missing activity. Use trip_start_date only when an explicit full year is visible. Keep original-language names and notes when useful."""
 
 
-@https_fn.on_request(memory=1024, max_instances=5, timeout_sec=60, cpu=1, secrets=_LLM_SECRETS)
+# Same contract as the image prompt, retargeted at pasted text. Real pastes are
+# messy social-media posts: budget lists, tips, URLs, and thank-yous surround
+# the day-by-day schedule, and Thai posts use Buddhist-era years (2569 = 2026).
+_PLAN_TEXT_IMPORT_PROMPT = """You extract a travel itinerary from text the user pasted into EVO.
+Return ONLY valid JSON with this shape:
+{
+  "plan_name": "string",
+  "category": "travel",
+  "trip_start_date": "YYYY-MM-DD or null",
+  "currency": "ISO 4217 code of the plan's main currency (THB, CNY, JPY, USD...) or null",
+  "minutes_per_day": 240,
+  "days": [{
+    "day_number": 1,
+    "date_label": "source date text or null",
+    "title": "short day title",
+    "summary": "one sentence",
+    "entries": [{"time": "HH:MM or null", "text": "activity", "place": "place or null", "note": "source note or null", "cost": number or null}],
+    "notes": ["other source notes"]
+  }],
+  "uncertainties": ["only details that are ambiguous or missing a year"]
+}
+Read the whole text before answering. Preserve the source order, place names, transport legs, meals, and timing faithfully.
+Day coverage comes first: headings like "DAY 1", a weekday name, a date line ("22 มีนาคม 69", "26/07"), or "วันที่..."
+all start a new day. Emit one object in `days` for EVERY day the text describes — stopping after the first day loses
+the rest of the user's trip and is the most damaging error you can make here.
+Precision rules:
+- Pasted posts often carry a preamble (budget breakdowns, packing tips, links, acknowledgements) before or after the
+  schedule. Keep useful trip-wide facts (total cost, "things to know" lists) as day `notes` on the day they apply to or
+  as `uncertainties` context — never turn them into activity entries, and never let them displace real days.
+- Produce one entry per source bullet or clearly distinct stop; never collapse several timed stops into a vague summary.
+- Normalize a time to 24-hour HH:MM only when the source is clear ("7 โมงเช้า" = 07:00, "ตี 2" = 02:00). Preserve
+  ambiguous time text in note and add an uncertainty.
+- `text` states the concrete action or transport leg. `place` contains the exact, searchable venue/area proper name only.
+- Preserve FROM → TO transport, flight/train/metro lines and exits, check-in/out, meals, reservation/ticket notes, and costs in `text` or `note`.
+- `cost` is the numeric price of THAT entry (ticket, fare, meal, room) ONLY when the source states it AND it is in the
+  plan's main `currency`. An amount in another currency ("25 หยวน" in a THB plan), a range, or a trip-wide total stays
+  in `note` with cost null. Set `currency` once, to the currency most prices use; null when no prices appear.
+- Thai Buddhist-era years appear as "69" or "2569": convert (2569 = 2026, 69 = 2569 BE = 2026) when setting trip_start_date,
+  and note the conversion in uncertainties only if the century is genuinely ambiguous.
+- Strip tracking URLs; keep the plain site name ("trip.com") when it matters for a booking note.
+- Keep day titles factual and destination-specific, not motivational.
+- Do not translate or respell proper nouns unless the text itself provides both forms.
+- Cross-check day count, chronological order, and entries against the full text before replying.
+Never invent a year, booking, address, opening hour, cost, or missing activity. Use trip_start_date only when the text
+gives an explicit date with a year. Keep original-language names and notes when useful."""
+
+
+@https_fn.on_request(memory=1024, max_instances=5, timeout_sec=120, cpu=1, secrets=_LLM_SECRETS)
 def evo_plan_image_import(req: https_fn.Request) -> https_fn.Response:
     """One-pass, authenticated itinerary extraction for the mobile review step."""
     if req.method == 'OPTIONS':
@@ -11049,31 +11146,45 @@ def evo_plan_image_import(req: https_fn.Request) -> https_fn.Response:
             return create_response(success=False, message='Too many imports', error='Please wait a few minutes before importing more plans.', status_code=429)
 
         image_url_parts = _sanitize_plan_image_import_urls(data.get('image_urls'), uid)
+        pdf_url_parts = _sanitize_plan_image_import_urls(
+            (data.get('pdf_urls') if isinstance(data.get('pdf_urls'), list) else [])[:_PLAN_PDF_IMPORT_MAX_FILES],
+            uid,
+        )
+        plan_text = _safe_import_text(data.get('plan_text'), _PLAN_TEXT_IMPORT_MAX_CHARS)
         skipped_images = 0
-        if image_url_parts:
-            try:
-                auth_header = str(req.headers.get('Authorization') or '').strip()
-                firebase_id_token = (
-                    auth_header[7:].strip()
-                    if auth_header.lower().startswith('bearer ')
-                    else ''
-                )
+        image_parts = []
+        pdf_parts = []
+        auth_header = str(req.headers.get('Authorization') or '').strip()
+        firebase_id_token = (
+            auth_header[7:].strip()
+            if auth_header.lower().startswith('bearer ')
+            else ''
+        )
+        try:
+            if image_url_parts:
                 image_parts, skipped_images = _download_plan_image_import_urls(
                     image_url_parts,
                     firebase_id_token=firebase_id_token,
                 )
-            except ValueError as exc:
-                return create_response(
-                    success=False,
-                    message='Invalid image',
-                    error=str(exc),
-                    status_code=413,
+            if pdf_url_parts:
+                pdf_parts, skipped_pdfs = _download_plan_image_import_urls(
+                    pdf_url_parts,
+                    firebase_id_token=firebase_id_token,
+                    kind='pdf',
                 )
-        else:
+                skipped_images += skipped_pdfs
+        except ValueError as exc:
+            return create_response(
+                success=False,
+                message='Invalid file',
+                error=str(exc),
+                status_code=413,
+            )
+        if not image_url_parts and not pdf_url_parts and not plan_text:
             # Backward compatibility for older mobile builds. New builds use
             # temporary Storage URLs so large bytes never ride in this POST.
             image_parts = _sanitize_coach_chat_images(data.get('images'))
-        if not image_parts:
+        if not image_parts and not pdf_parts and not plan_text:
             # Every selected image was unreadable. If we skipped some, they were
             # present-then-gone (expired/consumed), so tell the user to reselect
             # rather than showing the generic "add valid images" hint.
@@ -11085,6 +11196,8 @@ def evo_plan_image_import(req: https_fn.Request) -> https_fn.Response:
                     status_code=410,
                 )
             return create_response(success=False, message='No valid images', error='Add one to four valid JPEG, PNG, or WebP images.', status_code=400)
+        if not image_parts and not pdf_parts and len(plan_text) < _PLAN_TEXT_IMPORT_MIN_CHARS:
+            return create_response(success=False, message='Text too short', error='Paste the full plan text so EVO can read the days.', status_code=400)
         language = str(data.get('language') or data.get('languageSelected') or 'english').strip().lower()
         from openai import OpenAI
         from openai_api_key import resolve_openai_api_key
@@ -11092,30 +11205,52 @@ def evo_plan_image_import(req: https_fn.Request) -> https_fn.Response:
         if not api_key:
             return create_response(success=False, message='Import unavailable', error='OpenAI API key is not configured', status_code=503)
 
-        client = OpenAI(api_key=api_key, timeout=45)
+        reply_language = 'Thai' if language in {'thai', 'th', 'ไทย'} else 'English'
+        visual_parts = image_parts + pdf_parts
+        if visual_parts:
+            # The image prompt's page-coverage rules apply verbatim to PDF
+            # pages — OpenAI presents each PDF page as text + a rendered image.
+            source_hint = 'this itinerary' if image_parts else 'the itinerary in the attached PDF pages'
+            import_messages = [
+                {'role': 'system', 'content': _PLAN_IMAGE_IMPORT_PROMPT},
+                {'role': 'user', 'content': [{'type': 'text', 'text': f'Extract {source_hint}. Reply in {reply_language}.'}] + visual_parts},
+            ]
+        else:
+            import_messages = [
+                {'role': 'system', 'content': _PLAN_TEXT_IMPORT_PROMPT},
+                {'role': 'user', 'content': f'Extract the itinerary from this pasted text. Reply in {reply_language}.\n\n---\n{plan_text}'},
+            ]
+        # A multi-page PDF takes the model meaningfully longer than 1-4 photos.
+        client = OpenAI(api_key=api_key, timeout=90 if pdf_parts else 45)
         response = client.chat.completions.create(
             model=_PLAN_IMAGE_IMPORT_MODEL,
             temperature=0,
             response_format={'type': 'json_object'},
-            messages=[
-                {'role': 'system', 'content': _PLAN_IMAGE_IMPORT_PROMPT},
-                {'role': 'user', 'content': [{'type': 'text', 'text': f'Extract this itinerary. Reply in {"Thai" if language in {"thai", "th", "ไทย"} else "English"}.'}] + image_parts},
-            ],
+            messages=import_messages,
         )
         content = (response.choices[0].message.content if response.choices else '') or '{}'
         parsed = json.loads(content)
         plan_import = _sanitize_plan_image_import(parsed, language)
         if not plan_import['days']:
-            return create_response(success=False, message='Nothing readable', error='EVO could not find itinerary entries in those images.', status_code=422)
+            return create_response(
+                success=False,
+                message='Nothing readable',
+                error='EVO could not find itinerary days in that file.' if visual_parts else 'EVO could not find itinerary days in that text.',
+                status_code=422,
+            )
         return create_response(
-            data={'import': plan_import, 'skipped_images': skipped_images},
+            data={
+                'import': plan_import,
+                'skipped_images': skipped_images,
+                'source': 'image_import' if image_parts else ('pdf_import' if pdf_parts else 'text_import'),
+            },
             message='Itinerary extracted',
         )
     except json.JSONDecodeError:
-        return create_response(success=False, message='Import failed', error='EVO could not structure that itinerary. Please try clearer images.', status_code=502)
+        return create_response(success=False, message='Import failed', error='EVO could not structure that itinerary. Please try again.', status_code=502)
     except Exception as e:
         logger.error('evo_plan_image_import error: %s', e)
-        return create_response(success=False, message='Import failed', error='EVO could not import those images right now.', status_code=500)
+        return create_response(success=False, message='Import failed', error='EVO could not import that plan right now.', status_code=500)
 
 
 @https_fn.on_request(memory=512, max_instances=5, timeout_sec=30, cpu=1, secrets=[_EVO_FIREBASE_SA_SECRET])
@@ -11151,7 +11286,7 @@ def evo_plan_import_training(req: https_fn.Request) -> https_fn.Response:
         doc_ref.set({
             'schemaVersion': 1,
             'consentVersion': _safe_import_text(data.get('consent_version'), 20) or '2026-07',
-            'source': 'image_import',
+            'source': data.get('source') if data.get('source') in {'text_import', 'pdf_import'} else 'image_import',
             'language': 'th' if language in {'thai', 'th', 'ไทย'} else 'en',
             'ownerHash': owner_hash,
             'createdAt': datetime.now(timezone.utc).isoformat(),
