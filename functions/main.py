@@ -3,6 +3,7 @@
 
 import json
 import hashlib
+import hmac
 import logging
 import os
 import re
@@ -803,6 +804,13 @@ def generate_planner_content(req: https_fn.Request) -> https_fn.Response:
             status_code=405,
         )
 
+    _uid, _auth_err = _endpoint_auth(
+        req, "generate_planner_content", allow_internal=True,
+        rate_state=_PLANNER_GENERATE_RATE, rate_cap=20,
+    )
+    if _auth_err is not None:
+        return _auth_err
+
     try:
         gpc = get_generate_planner_content()
         payload = req.get_json() or {}
@@ -875,6 +883,13 @@ def refine_planner_content(req: https_fn.Request) -> https_fn.Response:
             error='Only POST method is allowed',
             status_code=405,
         )
+
+    _uid, _auth_err = _endpoint_auth(
+        req, "refine_planner_content", allow_internal=True,
+        rate_state=_PLANNER_REFINE_RATE, rate_cap=30,
+    )
+    if _auth_err is not None:
+        return _auth_err
 
     try:
         gpc = get_generate_planner_content()
@@ -1046,6 +1061,76 @@ def _verify_coach_tier(req: https_fn.Request) -> Tuple[Optional[str], str]:
         return (None, "free")
 
     return (uid, _coach_tier_for_uid(uid))
+
+
+# ---------------------------------------------------------------------------
+# Endpoint auth gate for formerly-open endpoints.
+#
+# Two credential kinds:
+#   * X-Evo-Internal-Secret header — server-to-server calls from the Node
+#     backend (planner generation/refine/images, nightly memory synthesis,
+#     suggestion re-ranking). Compared in constant time against
+#     EVO_INTERNAL_API_SECRET.
+#   * Firebase Auth ID token — app calls (realtime session, voice chat, TTS,
+#     daily brief, client-triggered refine). Verified cross-project via
+#     _verify_coach_tier and burst-limited per uid.
+#
+# Rollout: shipped app builds do not attach tokens to these endpoints yet, so
+# EVO_ENDPOINT_AUTH_MODE defaults to "warn" (log-and-allow). After the client
+# release that sends tokens is broadly adopted, set it to "enforce" — that is
+# the actual fix; "warn" only buys migration time without breaking users.
+# ---------------------------------------------------------------------------
+_ENDPOINT_AUTH_MODE = (os.environ.get("EVO_ENDPOINT_AUTH_MODE") or "warn").strip().lower()
+_INTERNAL_API_SECRET = (os.environ.get("EVO_INTERNAL_API_SECRET") or "").strip()
+
+
+def _endpoint_auth(req: https_fn.Request, endpoint: str, *, allow_internal: bool = False,
+                   rate_state: Optional[dict] = None, rate_cap: int = 0,
+                   rate_window: int = 3600) -> Tuple[Optional[str], Optional[https_fn.Response]]:
+    """Returns (uid, error_response). Internal calls yield (None, None).
+
+    Order matters: a valid internal secret short-circuits (no rate limit — the
+    Node backend already batches). A valid user token applies the per-uid
+    burst guard. Anything else is rejected in enforce mode, logged in warn mode.
+    """
+    if allow_internal and _INTERNAL_API_SECRET:
+        supplied = (req.headers.get("X-Evo-Internal-Secret") or "").strip()
+        if supplied and hmac.compare_digest(supplied, _INTERNAL_API_SECRET):
+            return (None, None)
+
+    uid, _tier = _verify_coach_tier(req)
+    if uid:
+        if rate_state is not None and rate_cap and not _rate_allow(rate_state, uid, rate_cap, rate_window):
+            logger.warning("%s: rate limit hit for uid=%s (cap=%s/%ss)", endpoint, uid, rate_cap, rate_window)
+            return (None, create_response(
+                success=False,
+                message="Rate limit exceeded",
+                error="Too many requests — please try again later.",
+                status_code=429,
+            ))
+        return (uid, None)
+
+    if _ENDPOINT_AUTH_MODE == "enforce":
+        return (None, create_response(
+            success=False,
+            message="Unauthorized",
+            error="A valid Firebase Auth token is required.",
+            status_code=401,
+        ))
+    logger.warning("%s: unauthenticated call allowed (EVO_ENDPOINT_AUTH_MODE=warn)", endpoint)
+    return (None, None)
+
+
+# Per-endpoint in-memory burst buckets (per warm instance; see _rate_allow).
+_REALTIME_SESSION_RATE: dict = {}
+_VOICE_CHAT_RATE: dict = {}
+_VOICE_SYNTHESIS_RATE: dict = {}
+_DAILY_BRIEF_RATE: dict = {}
+_PLANNER_GENERATE_RATE: dict = {}
+_PLANNER_REFINE_RATE: dict = {}
+_PLANNER_IMAGES_RATE: dict = {}
+_MEMORY_SYNTHESIS_RATE: dict = {}
+_SUGGEST_CONTENT_RATE: dict = {}
 
 
 @https_fn.on_request(
@@ -3788,7 +3873,16 @@ def _evo_task_content_db():
 
 
 def _coach_tier_for_uid(uid: str) -> str:
-    """Read coachSubscription from the EVO app Firestore project."""
+    """Read coachSubscription from the EVO app Firestore project.
+
+    TEMPORARY: when COACH_PREMIUM_UNLOCKED_FOR_ALL is True, every signed-in
+    user is treated as Premium (App Store billing / upsell paused). Keep in
+    sync with EVOforluanching/src/config/premiumAccess.js.
+    """
+    # Flip to False when monetization / App Store billing is ready again.
+    COACH_PREMIUM_UNLOCKED_FOR_ALL = True
+    if COACH_PREMIUM_UNLOCKED_FOR_ALL and uid:
+        return "premium"
     if not uid:
         return "free"
     try:
@@ -5947,6 +6041,13 @@ def suggest_personalized_content(req: https_fn.Request) -> https_fn.Response:
             status_code=405
         )
 
+    _uid, _auth_err = _endpoint_auth(
+        req, "suggest_personalized_content", allow_internal=True,
+        rate_state=_SUGGEST_CONTENT_RATE, rate_cap=30,
+    )
+    if _auth_err is not None:
+        return _auth_err
+
     try:
         data = req.get_json() or {}
         booking_candidates = data.get('booking_candidates')
@@ -6036,6 +6137,13 @@ def synthesize_user_memory(req: https_fn.Request) -> https_fn.Response:
             error='Only POST method is allowed',
             status_code=405
         )
+
+    _uid, _auth_err = _endpoint_auth(
+        req, "synthesize_user_memory", allow_internal=True,
+        rate_state=_MEMORY_SYNTHESIS_RATE, rate_cap=10,
+    )
+    if _auth_err is not None:
+        return _auth_err
 
     try:
         data = req.get_json() or {}
@@ -7956,6 +8064,13 @@ def generate_planner_images(req: https_fn.Request) -> https_fn.Response:
             status_code=405
         )
 
+    _uid, _auth_err = _endpoint_auth(
+        req, "generate_planner_images", allow_internal=True,
+        rate_state=_PLANNER_IMAGES_RATE, rate_cap=10,
+    )
+    if _auth_err is not None:
+        return _auth_err
+
     try:
         data = req.get_json() or {}
         plan_name = str(data.get('planName') or '').strip()
@@ -8316,6 +8431,13 @@ def evo_voice_chat(req: https_fn.Request) -> https_fn.Response:
             error='Only POST method is allowed',
             status_code=405
         )
+
+    _uid, _auth_err = _endpoint_auth(
+        req, "evo_voice_chat",
+        rate_state=_VOICE_CHAT_RATE, rate_cap=60,
+    )
+    if _auth_err is not None:
+        return _auth_err
 
     try:
         data = req.get_json() or {}
@@ -10225,6 +10347,15 @@ def evo_realtime_session(req: https_fn.Request) -> https_fn.Response:
             status_code=405
         )
 
+    # Mints provider tokens and runs always-warm — the most cost-exposed
+    # endpoint here. Client-only (no internal path).
+    _uid, _auth_err = _endpoint_auth(
+        req, "evo_realtime_session",
+        rate_state=_REALTIME_SESSION_RATE, rate_cap=30,
+    )
+    if _auth_err is not None:
+        return _auth_err
+
     try:
         import requests
 
@@ -11495,6 +11626,13 @@ def evo_voice_synthesis(req: https_fn.Request) -> https_fn.Response:
             status_code=405
         )
 
+    _uid, _auth_err = _endpoint_auth(
+        req, "evo_voice_synthesis",
+        rate_state=_VOICE_SYNTHESIS_RATE, rate_cap=120,
+    )
+    if _auth_err is not None:
+        return _auth_err
+
     try:
         data = req.get_json() or {}
         text = data.get('text') or data.get('message') or data.get('assistant_text')
@@ -11548,6 +11686,13 @@ def evo_daily_brief(req: https_fn.Request) -> https_fn.Response:
     if req.method != 'POST':
         return create_response(success=False, message='Method not allowed',
                                error='Only POST method is allowed', status_code=405)
+
+    _uid, _auth_err = _endpoint_auth(
+        req, "evo_daily_brief",
+        rate_state=_DAILY_BRIEF_RATE, rate_cap=30,
+    )
+    if _auth_err is not None:
+        return _auth_err
 
     try:
         from chatgpt_wrapper import RateLimitExceededError

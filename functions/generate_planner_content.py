@@ -342,6 +342,38 @@ class TimeStamp(BaseModel):
     seconds: int = Field(..., description="Unix seconds")
     nanoseconds: int = Field(..., ge=0, lt=1_000_000_000, description="0..999,999,999")
 
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_timestamp(cls, value):
+        """Accept the shapes createdAt actually arrives in, not just the canonical one.
+
+        Plan-image-import drafts store an ISO-8601 string (client writes
+        new Date().toISOString()), and Firestore Timestamps serialized through
+        JSON become {_seconds, _nanoseconds}. Before this coercion, refine_plan
+        raised ValidationError on any imported plan — which then re-labeled a
+        working, calendar-applied plan as a failed draft.
+        """
+        if isinstance(value, str):
+            from datetime import datetime, timezone as _tz
+            raw = value.strip()
+            try:
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_tz.utc)
+                epoch = dt.timestamp()
+                return {"seconds": int(epoch), "nanoseconds": int(round((epoch % 1) * 1e9)) % 1_000_000_000}
+            except ValueError:
+                return value  # let the normal field validation report it
+        if isinstance(value, (int, float)):
+            return {"seconds": int(value), "nanoseconds": 0}
+        if isinstance(value, dict):
+            if "seconds" not in value and "_seconds" in value:
+                return {
+                    "seconds": value.get("_seconds", 0),
+                    "nanoseconds": value.get("_nanoseconds", 0) or 0,
+                }
+        return value
+
 class TaskVideo(BaseModel):
     """Real YouTube video attached post-generation (planner_enrichment.py). Not part of the LLM schema."""
     videoId: str
